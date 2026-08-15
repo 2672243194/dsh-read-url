@@ -1,0 +1,23 @@
+{
+  "name": "dsh-read-url",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness URL reader: fetch any webpage, auto-detect encoding (GBK/UTF-8), extract clean main content, output compact Markdown/text to save tokens.",
+  "type": "module",
+  "main": "index.js",
+  "dsh": {
+    "bundle": "cordis.patch.yml"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "readability",
+    "web",
+    "markdown",
+    "reader"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}
