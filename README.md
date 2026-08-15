@@ -149,6 +149,16 @@ npx @deepseek-ai/dsh --profile headless "用 read_url 读取 https://example.com
 
 已通过 DSH v0.1.0-rc.6 真实运行验证：插件加载、`read_url` 注册、模型调用、真实页面返回全部正常。
 
+## 支持
+
+如果 dsh-read-url 对你有帮助，欢迎在 [GitHub](https://github.com/2672243194/dsh-read-url) 点个 ⭐ Star。
+
+- 完全免费开源（MIT），零依赖、免 API key、纯本地处理、不收集任何数据；
+- 独立开发维护，Star 数量是我判断是否继续投入迭代的直接依据；
+- 用的人越多，功能越完善——下一个功能很可能就是你需要的那个。
+
+一个 Star 不花一分钱，但能让这个项目走得更远。谢谢 ⭐
+
 ## License
 
 MIT
