@@ -380,6 +380,8 @@ export function apply(ctx) {
   // Temporal composability: unload must fully revert side effects.
   ctx.effect(() => () => cache.clear())
 
+  console.log('[dsh-read-url] plugin loaded; tool read_url registered')
+
   ctx.tools.register({
     name: 'read_url',
     description:
@@ -390,14 +392,37 @@ export function apply(ctx) {
       'Repeated reads within 5 minutes are served from cache. ' +
       'For reading articles, docs and news pages. Not for login-walled or JS-rendered pages.',
     parameters: {
-      url: { type: 'string', required: true, description: 'http(s) URL to read' },
-      maxChars: { type: 'number', description: `Max characters to return (default ${DEFAULT_MAX_CHARS}, range 500-20000)` },
-      mode: { type: 'string', enum: ['text', 'markdown'], description: 'text = plain (token-efficient, default); markdown = structured' },
-      includeLinks: { type: 'boolean', description: 'Also return up to 20 page links (title+url)' },
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        url: { type: 'string', description: 'http(s) URL to read' },
+        maxChars: { type: 'number', description: `Max characters to return (default ${DEFAULT_MAX_CHARS}, range 500-20000)` },
+        mode: { type: 'string', enum: ['text', 'markdown'], description: 'text = plain (token-efficient, default); markdown = structured' },
+        includeLinks: { type: 'boolean', description: 'Also return up to 20 page links (title+url)' },
+      },
+      required: ['url'],
     },
     timeoutMs: 20000,
     output: {
-      schema: { type: 'object' },
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        properties: {
+          url: { type: 'string' },
+          title: { type: 'string' },
+          siteName: { type: 'string' },
+          lang: { type: 'string' },
+          charset: { type: 'string' },
+          mode: { type: 'string' },
+          truncated: { type: 'boolean' },
+          charsTotal: { type: 'number' },
+          charsReturned: { type: 'number' },
+          text: { type: 'string' },
+          links: { type: 'array', items: { type: 'object' } },
+          cached: { type: 'boolean' },
+          error: { type: 'string' },
+        },
+      },
       render: (_args, value) => [{ type: 'text', text: renderResult(value) }],
     },
     async execute(args, exec) {
