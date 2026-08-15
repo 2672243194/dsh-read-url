@@ -118,7 +118,13 @@ const results = await Promise.all([
 
 ```bash
 node test.mjs          # 零依赖自测（转码/提取/Markdown/截断）
+
+# 端到端验证（需已安装 DSH CLI）
+npx @deepseek-ai/dsh plugin --profile headless add .        # 在插件目录的上一级执行
+npx @deepseek-ai/dsh --profile headless "用 read_url 读取 https://example.com 并输出标题"
 ```
+
+已通过 DSH v0.1.0-rc.6 真实运行验证：插件加载、`read_url` 注册、模型调用、真实页面返回全部正常。
 
 ## License
 
