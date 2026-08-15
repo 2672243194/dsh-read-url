@@ -1,3 +1,9 @@
 - insert:
     - id: dsh-read-url
       name: dsh-read-url
+      config:
+        timeoutMs: 15000
+        maxBytes: 3145728
+        maxChars: 6000
+        maxLinks: 20
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'

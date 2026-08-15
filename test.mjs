@@ -1,6 +1,7 @@
 // dsh-read-url self-test — zero-dependency, run: node test.mjs
 import assert from 'node:assert/strict'
-import { decodeBuffer, extract, smartTruncate, blockMd, inlineMd } from './index.js'
+import * as m from './index.js'
+const { decodeBuffer, extract, smartTruncate, blockMd, inlineMd } = m
 
 let passed = 0
 function ok(name, fn) {
@@ -111,6 +112,25 @@ ok('markdown mode also strips hidden style containers', () => {
   assert.ok(r.text.includes('# 标题'))
   assert.ok(!r.text.includes('display:none'))
   assert.ok(!r.text.includes('.x{'))
+})
+
+console.log('config / tool registration')
+ok('apply merges config and registers both tools', () => {
+  const tools = []
+  const fakeCtx = {
+    tools: { register: (t) => tools.push(t) },
+    effect: () => {},
+    get: () => undefined,
+  }
+  m.apply(fakeCtx, { maxChars: 8000, maxLinks: 5, timeoutMs: 9000 })
+  const names = tools.map((t) => t.name)
+  assert.ok(names.includes('read_url'), `expected read_url, got ${names.join(',')}`)
+  assert.ok(names.includes('read_url_links'), `expected read_url_links, got ${names.join(',')}`)
+  const read = tools.find((t) => t.name === 'read_url')
+  assert.ok(read.parameters.properties.maxChars.description.includes('8000'), 'read_url maxChars default should reflect custom config')
+  const links = tools.find((t) => t.name === 'read_url_links')
+  assert.ok(links.description.includes('5'), 'read_url_links description should reflect custom maxLinks')
+  assert.ok(links.parameters.properties.limit.description.includes('5'))
 })
 
 console.log(`\n${passed} assertions passed`)

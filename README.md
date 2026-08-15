@@ -52,9 +52,9 @@ npx @deepseek-ai/dsh plugin --profile web add ./dsh-read-url
 用 markdown 格式读 https://docs.example.org/guide
 ```
 
-### 工具参数
+### 工具
 
-`read_url(url, maxChars?, mode?, includeLinks?)`
+**`read_url(url, maxChars?, mode?, includeLinks?)`** — 抓取并提取干净正文
 
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
@@ -62,6 +62,27 @@ npx @deepseek-ai/dsh plugin --profile web add ./dsh-read-url
 | `maxChars` | number | 6000 | 返回正文最大字符数（500–20000） |
 | `mode` | string | `text` | `text` = 纯文本（最省 token）；`markdown` = 结构化 |
 | `includeLinks` | boolean | `false` | 额外返回页面内最多 20 条链接（标题+URL） |
+
+**`read_url_links(url, limit?)`** — 只列出页面链接清单，不返回正文（更轻，适合找来源/摸站点结构）
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `url` | string | 必填 | http(s) URL |
+| `limit` | number | 20 | 最多返回链接数（1–50） |
+
+### 配置（可选）
+
+插件级配置通过 profile 的 `cordis.patch.yml` 覆盖（默认值见插件自带 `cordis.patch.yml`）：
+
+```yaml
+- id: dsh-read-url
+  config:
+    timeoutMs: 15000      # 单请求超时
+    maxBytes: 3145728     # 响应体上限（字节）
+    maxChars: 6000        # 默认正文截断
+    maxLinks: 20          # read_url_links 默认条数
+    userAgent: '...'      # 请求 UA
+```
 
 ### 输出结构（紧凑）
 
@@ -106,11 +127,11 @@ const results = await Promise.all([
 - **正文提取**：优先 `<article>` / `role="main"`，剥离 `nav/footer/header/aside/form/iframe` 及广告类容器，启发式回归到 `<body>`；
 - **Markdown**：自研轻量标签状态机（标题/段落/列表/引用/代码块/表格/行内加粗斜体链接），零依赖；
 - **安全**：仅 http/https；不执行页面脚本；响应超 3MB 拒绝；15s 超时；错误信息结构化返回（HTTP 状态/超时/类型不支持）；
+- **可选增强（Firefox Reader Mode 算法）**：在 DSH profile 目录执行 `npm i @mozilla/readability happy-dom` 后自动启用，正文提取升级为 `@mozilla/readability`（MPL-2.0，引用不改写），未安装时回退内置启发式提取器，核心保持零依赖；
 - **边界**：登录墙、JS 动态渲染（SPA）页面无法读取——这是同类插件的共同边界。
 
 ## Roadmap
 
-- [ ] 可选集成 `@mozilla/readability`（Firefox Reader Mode 同款算法，安装后自动启用，质量再升一档）
 - [ ] SPA 页面按需渲染（接入 Playwright，保持可选）
 - [ ] 单页多段续读（`offset` 参数）
 

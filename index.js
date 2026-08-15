@@ -16,11 +16,14 @@ import { TextDecoder } from 'node:util'
 export const name = 'dsh-read-url'
 export const inject = ['tools']
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
-const FETCH_TIMEOUT_MS = 15000
-const MAX_BYTES = 3 * 1024 * 1024
-const DEFAULT_MAX_CHARS = 6000
-const MAX_LINKS = 20
+// Plugin-level configuration (overridable via cordis.patch.yml `config:` row).
+const DEFAULTS = {
+  timeoutMs: 15000,
+  maxBytes: 3 * 1024 * 1024,
+  maxChars: 6000,
+  maxLinks: 20,
+  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+}
 const CACHE_TTL_MS = 300000
 const CACHE_MAX = 32
 
@@ -67,14 +70,14 @@ export function decodeBuffer(buffer, contentType) {
   return { text, charset: enc }
 }
 
-async function fetchPage(url, externalSignal) {
-  const timeoutSignal = AbortSignal.timeout(FETCH_TIMEOUT_MS)
+async function fetchPage(url, externalSignal, cfg) {
+  const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs)
   const signal = externalSignal ? AbortSignal.any([externalSignal, timeoutSignal]) : timeoutSignal
   try {
     const res = await fetch(url, {
       redirect: 'follow',
       signal,
-      headers: { 'user-agent': UA, accept: 'text/html,application/xhtml+xml,*/*;q=0.8' },
+      headers: { 'user-agent': cfg.userAgent, accept: 'text/html,application/xhtml+xml,*/*;q=0.8' },
     })
     if (!res.ok) return { error: `HTTP ${res.status} ${res.statusText}` }
     const contentType = res.headers.get('content-type') || ''
@@ -85,13 +88,13 @@ async function fetchPage(url, externalSignal) {
     let size = 0
     for await (const chunk of res.body) {
       size += chunk.length
-      if (size > MAX_BYTES) return { error: `Page exceeds ${MAX_BYTES} bytes` }
+      if (size > cfg.maxBytes) return { error: `Page exceeds ${cfg.maxBytes} bytes` }
       chunks.push(chunk)
     }
     return { buffer: Buffer.concat(chunks), contentType, finalUrl: res.url }
   } catch (e) {
     if (e.name === 'AbortError' || e.name === 'TimeoutError') {
-      return { error: `Timeout after ${FETCH_TIMEOUT_MS}ms or cancelled` }
+      return { error: `Timeout after ${cfg.timeoutMs}ms or cancelled` }
     }
     return { error: `Fetch failed: ${e.message}` }
   }
@@ -270,9 +273,9 @@ export function blockMd(html) {
 export function extract(html, mode) {
   const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html) || /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i.exec(html)
   const siteName = /<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']+)["']/i.exec(html)
-    const langMatch = /<html[^>]+lang=["']([\w-]+)["']/i.exec(html)
-    let main = stripNoise(pickMain(html))
-    main = stripNoise(revealEscapedTags(main))
+  const langMatch = /<html[^>]+lang=["']([\w-]+)["']/i.exec(html)
+  let main = stripNoise(pickMain(html))
+  main = stripNoise(revealEscapedTags(main))
   let bodyText
   if (mode === 'markdown') {
     bodyText = blockMd(main).replace(/\n{3,}/g, '\n\n').trim()
@@ -285,6 +288,30 @@ export function extract(html, mode) {
     lang: langMatch ? langMatch[1] : '',
     text: bodyText,
   }
+}
+
+// Optional enhancement: when @mozilla/readability + happy-dom are installed
+// inside the DSH profile (npm i @mozilla/readability happy-dom), extraction
+// upgrades to the Firefox Reader Mode algorithm. Falls back to the built-in
+// heuristic extractor when absent. MPL-2.0 / MIT libraries, used as-is.
+let readabilityReady = null
+async function getReadabilityExtractor() {
+  if (readabilityReady !== null) return readabilityReady
+  try {
+    const [{ Readability }, { Window }] = await Promise.all([
+      import('@mozilla/readability'),
+      import('happy-dom'),
+    ])
+    readabilityReady = (html, url) => {
+      const window = new Window({ url })
+      window.document.write(html)
+      const article = new Readability(window.document).parse()
+      return article ? article.content : null
+    }
+  } catch {
+    readabilityReady = false
+  }
+  return readabilityReady
 }
 
 export function smartTruncate(text, maxChars) {
@@ -319,10 +346,10 @@ function hostOf(url) {
   }
 }
 
-export async function readUrl(args, ctx, externalSignal) {
+export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   const url = String(args.url || '').trim()
   if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
-  const maxChars = Math.max(500, Math.min(20000, Number(args.maxChars) || DEFAULT_MAX_CHARS))
+  const maxChars = Math.max(500, Math.min(20000, Number(args.maxChars) || cfg.maxChars))
   const mode = args.mode === 'markdown' ? 'markdown' : 'text'
 
   const cacheKey = `${url}|${mode}|${maxChars}`
@@ -338,7 +365,7 @@ export async function readUrl(args, ctx, externalSignal) {
     finalUrl = viaSeam.finalUrl
     charset = 'provider-decoded'
   } else {
-    const page = await fetchPage(url, externalSignal)
+    const page = await fetchPage(url, externalSignal, cfg)
     if (page.error) return { error: page.error }
     const decoded = decodeBuffer(page.buffer, page.contentType)
     html = decoded.text
@@ -347,6 +374,20 @@ export async function readUrl(args, ctx, externalSignal) {
   }
 
   const extracted = extract(html, mode)
+  // Optional readability upgrade: cleaner article extraction when installed.
+  const ext = await getReadabilityExtractor()
+  if (ext) {
+    try {
+      const clean = ext(html, url)
+      if (clean && clean.length > 0) {
+        extracted.text = mode === 'markdown'
+          ? blockMd(clean).replace(/\n{3,}/g, '\n\n').trim()
+          : textOnly(clean).replace(/ +/g, ' ').trim()
+      }
+    } catch {
+      // keep heuristic result
+    }
+  }
   const truncated = smartTruncate(extracted.text, maxChars)
 
   const result = {
@@ -361,7 +402,7 @@ export async function readUrl(args, ctx, externalSignal) {
     charsReturned: truncated.charsReturned,
     text: truncated.text,
   }
-  if (args.includeLinks) result.links = extractLinks(html, MAX_LINKS)
+  if (args.includeLinks) result.links = extractLinks(html, cfg.maxLinks)
 
   if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value)
   cache.set(cacheKey, { time: Date.now(), result })
@@ -393,11 +434,75 @@ function renderResult(value) {
   return lines.join('\n')
 }
 
-export function apply(ctx) {
+function renderLinks(value) {
+  if (typeof value === 'string') return value
+  const r = value || {}
+  if (r.error) return `Error: ${r.error}`
+  if (!Array.isArray(r.links) || r.links.length === 0) return `No links found on ${r.url}`
+  const lines = [`${r.count} link(s) on ${r.url}:`]
+  for (const l of r.links) lines.push(`- ${l.title || l.url} — ${l.url}`)
+  return lines.join('\n')
+}
+
+function readLinksTool(ctx, cfg) {
+  return {
+    name: 'read_url_links',
+    description:
+      'List the links (visible text + URL) found on a webpage, without returning body text. ' +
+      'Lighter than read_url for mapping what a page points to or finding source links. ' +
+      `Returns up to ${cfg.maxLinks} links. Read-only, no credentials sent.`,
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        url: { type: 'string', description: 'http(s) URL to scan for links' },
+        limit: { type: 'number', description: `Max links to return (default ${cfg.maxLinks}, max 50)` },
+      },
+      required: ['url'],
+    },
+    timeoutMs: 20000,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        properties: {
+          url: { type: 'string' },
+          count: { type: 'number' },
+          links: { type: 'array', items: { type: 'object' } },
+          error: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: renderLinks(value) }],
+    },
+    async execute(args, exec) {
+      const url = String(args.url || '').trim()
+      if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
+      const limit = Math.max(1, Math.min(50, Number(args.limit) || cfg.maxLinks))
+      const viaSeam = await fetchViaWebSeam(ctx, url, exec && exec.signal)
+      let html, finalUrl
+      if (viaSeam) {
+        html = viaSeam.html
+        finalUrl = viaSeam.finalUrl
+      } else {
+        const page = await fetchPage(url, exec && exec.signal, cfg)
+        if (page.error) return { error: page.error }
+        html = decodeBuffer(page.buffer, page.contentType).text
+        finalUrl = page.finalUrl || url
+      }
+      const links = extractLinks(html, limit)
+      return { url: finalUrl, count: links.length, links }
+    },
+  }
+}
+
+export function apply(ctx, config) {
+  // Plugin-level config from cordis.patch.yml (config row), merged over defaults.
+  const cfg = { ...DEFAULTS, ...(config || {}) }
+
   // Temporal composability: unload must fully revert side effects.
   ctx.effect(() => () => cache.clear())
 
-  console.log('[dsh-read-url] plugin loaded; tool read_url registered')
+  console.log('[dsh-read-url] plugin loaded; tools read_url, read_url_links registered')
 
   ctx.tools.register({
     name: 'read_url',
@@ -413,13 +518,13 @@ export function apply(ctx) {
       additionalProperties: false,
       properties: {
         url: { type: 'string', description: 'http(s) URL to read' },
-        maxChars: { type: 'number', description: `Max characters to return (default ${DEFAULT_MAX_CHARS}, range 500-20000)` },
+        maxChars: { type: 'number', description: `Max characters to return (default ${cfg.maxChars}, range 500-20000)` },
         mode: { type: 'string', enum: ['text', 'markdown'], description: 'text = plain (token-efficient, default); markdown = structured' },
-        includeLinks: { type: 'boolean', description: 'Also return up to 20 page links (title+url)' },
+        includeLinks: { type: 'boolean', description: `Also return up to ${cfg.maxLinks} page links (title+url)` },
       },
       required: ['url'],
     },
-    timeoutMs: 20000,
+    timeoutMs: Math.max(5000, cfg.timeoutMs + 5000),
     output: {
       schema: {
         type: 'object',
@@ -443,7 +548,9 @@ export function apply(ctx) {
       render: (_args, value) => [{ type: 'text', text: renderResult(value) }],
     },
     async execute(args, exec) {
-      return readUrl(args, ctx, exec && exec.signal)
+      return readUrl(args, ctx, exec && exec.signal, cfg)
     },
   })
+
+  ctx.tools.register(readLinksTool(ctx, cfg))
 }

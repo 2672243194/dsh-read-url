@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0] - 2026-08-15
+
+### 新增
+
+- **`read_url_links` 独立工具**：只返回页面链接清单（标题+URL），不返回正文，适合找来源/摸站点结构；
+- **插件级配置**：`timeoutMs` / `maxBytes` / `maxChars` / `maxLinks` / `userAgent` 可通过 profile 的 `cordis.patch.yml` 覆盖；
+- **可选正文提取增强**：安装 `@mozilla/readability` + `happy-dom` 后自动启用 Firefox Reader Mode 算法，未安装回退内置启发式（核心保持零依赖）。
+
 ## [0.1.1] - 2026-08-15
 
 ### 修复
