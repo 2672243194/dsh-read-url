@@ -22,10 +22,10 @@ const DEFAULTS = {
   maxBytes: 3 * 1024 * 1024,
   maxChars: 6000,
   maxLinks: 20,
+  cacheTtlMs: 300000,
+  cacheMax: 32,
   userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
 }
-const CACHE_TTL_MS = 300000
-const CACHE_MAX = 32
 
 const cache = new Map()
 const decoders = new Map()
@@ -354,7 +354,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
 
   const cacheKey = `${url}|${mode}|${maxChars}`
   const hit = cache.get(cacheKey)
-  if (hit && Date.now() - hit.time < CACHE_TTL_MS) {
+  if (hit && Date.now() - hit.time < cfg.cacheTtlMs) {
     return { ...hit.result, cached: true }
   }
 
@@ -404,7 +404,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   }
   if (args.includeLinks) result.links = extractLinks(html, cfg.maxLinks)
 
-  if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value)
+  if (cache.size >= cfg.cacheMax) cache.delete(cache.keys().next().value)
   cache.set(cacheKey, { time: Date.now(), result })
   return result
 }
@@ -415,8 +415,9 @@ function renderResult(value) {
   if (r.error) return `Error: ${r.error}`
   const lines = []
   if (r.title) lines.push(`title: ${r.title}`)
+  const host = hostOf(r.url || '')
   const meta = []
-  if (r.siteName) meta.push(r.siteName)
+  if (r.siteName && r.siteName !== host) meta.push(r.siteName)
   if (r.lang) meta.push(r.lang)
   if (r.charset) meta.push(`charset ${r.charset}`)
   if (meta.length) lines.push(meta.join(' · '))
@@ -450,13 +451,13 @@ function readLinksTool(ctx, cfg) {
     description:
       'List the links (visible text + URL) found on a webpage, without returning body text. ' +
       'Lighter than read_url for mapping what a page points to or finding source links. ' +
-      `Returns up to ${cfg.maxLinks} links. Read-only, no credentials sent.`,
+      'Read-only, no credentials sent.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         url: { type: 'string', description: 'http(s) URL to scan for links' },
-        limit: { type: 'number', description: `Max links to return (default ${cfg.maxLinks}, max 50)` },
+        limit: { type: 'number', description: 'Max links to return (range 1-50, default from plugin config)' },
       },
       required: ['url'],
     },
@@ -518,9 +519,9 @@ export function apply(ctx, config) {
       additionalProperties: false,
       properties: {
         url: { type: 'string', description: 'http(s) URL to read' },
-        maxChars: { type: 'number', description: `Max characters to return (default ${cfg.maxChars}, range 500-20000)` },
+        maxChars: { type: 'number', description: 'Max characters of body text to return (range 500-20000, default from plugin config)' },
         mode: { type: 'string', enum: ['text', 'markdown'], description: 'text = plain (token-efficient, default); markdown = structured' },
-        includeLinks: { type: 'boolean', description: `Also return up to ${cfg.maxLinks} page links (title+url)` },
+        includeLinks: { type: 'boolean', description: 'Also return a bounded list of page links (title+url)' },
       },
       required: ['url'],
     },

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1] - 2026-08-15
+
+### 优化（DeepSeek 成本特调）
+
+- **KV Cache 友好**：工具 schema/description 静态化，不再嵌入配置值——配置变更不影响 prompt 前缀复用，KV 缓存持续命中（DeepSeek 缓存命中 token 约 1/10 价格）；
+- **render 元数据精简**：`siteName` 与域名相同时省略；
+- **缓存参数可配置**：`cacheTtlMs` / `cacheMax` 加入插件级配置。
+
 ## [0.2.0] - 2026-08-15
 
 ### 新增

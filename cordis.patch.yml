@@ -6,4 +6,6 @@
         maxBytes: 3145728
         maxChars: 6000
         maxLinks: 20
+        cacheTtlMs: 300000
+        cacheMax: 32
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
