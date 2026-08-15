@@ -35,7 +35,7 @@ DSH 的 Agent 能搜索（返回链接和片段），但缺"把 URL 读成干净
 
 ```bash
 # 从 GitHub（推荐，便于更新）
-npx @deepseek-ai/dsh plugin --profile web add github:<你的用户名>/dsh-read-url
+npx @deepseek-ai/dsh plugin --profile web add github:2672243194/dsh-read-url
 
 # 本地开发
 npx @deepseek-ai/dsh plugin --profile web add ./dsh-read-url
