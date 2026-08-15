@@ -94,4 +94,23 @@ ok('escapes special chars in plain text', () => {
   assert.equal(inlineMd('a *b* and `c`'), 'a \\*b\\* and \\`c\\`')
 })
 
+console.log('noise stripping / hidden containers')
+ok('removes entity-escaped style inside textarea (baidu pattern)', () => {
+  const html = '<html><head><title>测试</title></head><body><textarea id="s_is_result_css" style="display:none;">&lt;style data-for=&quot;result&quot;&gt;html{font-size:100px}body{color:#333}.foo{color:red}&lt;/style&gt;</textarea><article><h1>真标题</h1><p>真实正文段落。</p></article></body></html>'
+  const r = extract(html, 'text')
+  assert.ok(r.text.includes('真标题'), 'real content must survive')
+  assert.ok(r.text.includes('真实正文段落'))
+  assert.ok(!r.text.includes('font-size'), `CSS noise must be gone, got: ${r.text.slice(0, 200)}`)
+  assert.ok(!r.text.includes('color:#333'))
+  assert.ok(r.text.length < 200, 'noise-free output must be small')
+})
+
+ok('markdown mode also strips hidden style containers', () => {
+  const html = '<html><head><title>测试</title></head><body><textarea>&lt;style&gt;.x{display:none}&lt;/style&gt;</textarea><article><h1>标题</h1><p>正文</p></article></body></html>'
+  const r = extract(html, 'markdown')
+  assert.ok(r.text.includes('# 标题'))
+  assert.ok(!r.text.includes('display:none'))
+  assert.ok(!r.text.includes('.x{'))
+})
+
 console.log(`\n${passed} assertions passed`)

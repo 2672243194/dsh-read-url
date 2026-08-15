@@ -117,6 +117,7 @@ function textOnly(html) {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<textarea[\s\S]*?<\/textarea\s*>/gi, ' ')
     .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
     .replace(/[ \t\r\n]+/g, ' ')
@@ -145,8 +146,19 @@ export function pickMain(html) {
   return html
 }
 
+// Some sites (e.g. baidu.com) ship CSS/HTML inside hidden <textarea> with
+// entity-escaped tags (&lt;style&gt;...). Reveal them so noise rules can strip
+// them; then run noise removal again.
+function revealEscapedTags(html) {
+  return html
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+}
+
 function stripNoise(mainHtml) {
   return mainHtml
+    .replace(/<(textarea|style|script|noscript|template)[\s>][\s\S]*?<\/\1\s*>/gi, ' ')
     .replace(/<(nav|footer|header|aside|form|iframe|svg|canvas|dialog)[\s>][\s\S]*?<\/\1>/gi, ' ')
     .replace(/<([a-z][a-z0-9]*)[^>]+class=["'][^"']*(ad-|ads|advert|banner|sidebar|social|share|comment|popup|modal|cookie)[^"']*["'][^>]*>[\s\S]*?<\/\1>/gi, ' ')
 }
@@ -167,6 +179,7 @@ export function inlineMd(html) {
     }
     if (!m[1]) continue
     const tag = m[1].toLowerCase()
+    if (tag === 'style' || tag === 'script' || tag === 'textarea' || tag === 'template' || tag === 'noscript') continue
     const inner = inlineMd(m[3])
     if (tag === 'a') {
       const href = /href=["']([^"']+)["']/i.exec(m[2])
@@ -193,6 +206,9 @@ export function blockMd(html) {
     const tag = m[1].toLowerCase()
     const attrs = m[2] || ''
     const inner = m[3]
+    if (tag === 'style' || tag === 'script' || tag === 'textarea' || tag === 'template' || tag === 'noscript') {
+      continue
+    }
     if (tag === 'h1' || tag === 'h2' || tag === 'h3' || tag === 'h4' || tag === 'h5' || tag === 'h6') {
       const level = '#'.repeat(Number(tag[1]))
       out += `\n\n${level} ${inlineMd(inner)}`
@@ -254,8 +270,9 @@ export function blockMd(html) {
 export function extract(html, mode) {
   const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html) || /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i.exec(html)
   const siteName = /<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']+)["']/i.exec(html)
-  const langMatch = /<html[^>]+lang=["']([\w-]+)["']/i.exec(html)
-  const main = stripNoise(pickMain(html))
+    const langMatch = /<html[^>]+lang=["']([\w-]+)["']/i.exec(html)
+    let main = stripNoise(pickMain(html))
+    main = stripNoise(revealEscapedTags(main))
   let bodyText
   if (mode === 'markdown') {
     bodyText = blockMd(main).replace(/\n{3,}/g, '\n\n').trim()
