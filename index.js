@@ -116,30 +116,45 @@ async function fetchViaWebSeam(ctx, url, externalSignal) {
   }
 }
 
+// Decode common HTML entities in already-stripped text (&nbsp;/&amp;/&lt;/&gt;/
+// &quot;/&#39;/numeric). Runs AFTER tag stripping so escaped tags stay visible
+// to the stripper and only remaining text is decoded.
+const ENTITIES = { nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }
+export function decodeTextEntities(text) {
+  if (!text.includes('&')) return text
+  return text.replace(/&(?:#(\d+)|#x([0-9a-fA-F]+)|([a-z][a-z0-9]{1,7}));?/gi, (m, dec, hex, name) => {
+    if (dec !== undefined) {
+      const c = Number(dec)
+      return c > 0x10ffff ? m : String.fromCodePoint(c)
+    }
+    if (hex !== undefined) {
+      const c = Number.parseInt(hex, 16)
+      return c > 0x10ffff ? m : String.fromCodePoint(c)
+    }
+    const n = (name || '').toLowerCase()
+    return Object.prototype.hasOwnProperty.call(ENTITIES, n) ? ENTITIES[n] : m
+  })
+}
+
 function textOnly(html) {
-  return html
+  return decodeTextEntities(html
+    .replace(/<!--[\s\S]*?-->/g, ' ')
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
     .replace(/<textarea[\s\S]*?<\/textarea\s*>/gi, ' ')
     .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
     .replace(/[ \t\r\n]+/g, ' ')
-    .trim()
+    .trim())
 }
 
 export function pickMain(html) {
-  let main = null
-  const article = /<article[\s>]/i.exec(html)
-  const mainTag = /<(main|div)[^>]*role=["']main["'][\s>]/i.exec(html)
-  const start = article || mainTag
-  if (start) {
-    const from = start.index
-    const tag = /^<([a-zA-Z0-9]+)/.exec(html.slice(from))[1].toLowerCase()
-    const close = new RegExp(`</${tag}>`, 'i')
-    const match = html.slice(from).match(close)
-    if (match) main = html.slice(from, from + match.index + close.source.length)
-  }
-  if (main) return main
+  // Aggregation pages (e.g. blog homepages) have one <article> per item:
+  // collect all of them instead of only the first.
+  const articles = [...html.matchAll(/<article[\s>][\s\S]*?<\/article\s*>/gi)]
+  if (articles.length) return articles.map((a) => a[0]).join('\n')
+  const mainTag = /<(main|div)[^>]*role=["']main["'][\s>][\s\S]*?<\/\1\s*>/i.exec(html)
+  if (mainTag) return mainTag[0]
   const body = /<body[\s>]/i.exec(html)
   if (body) {
     const after = html.slice(body.index)
@@ -161,6 +176,7 @@ function revealEscapedTags(html) {
 
 function stripNoise(mainHtml) {
   return mainHtml
+    .replace(/<!--[\s\S]*?-->/g, ' ')
     .replace(/<(textarea|style|script|noscript|template)[\s>][\s\S]*?<\/\1\s*>/gi, ' ')
     .replace(/<(nav|footer|header|aside|form|iframe|svg|canvas|dialog)[\s>][\s\S]*?<\/\1>/gi, ' ')
     .replace(/<([a-z][a-z0-9]*)[^>]+class=["'][^"']*(ad-|ads|advert|banner|sidebar|social|share|comment|popup|modal|cookie)[^"']*["'][^>]*>[\s\S]*?<\/\1>/gi, ' ')
@@ -177,7 +193,7 @@ export function inlineMd(html) {
   let m
   while ((m = re.exec(html))) {
     if (m[4] !== undefined) {
-      out += escInline(m[4])
+      out += escInline(decodeTextEntities(m[4]))
       continue
     }
     if (!m[1]) continue
@@ -202,7 +218,7 @@ export function blockMd(html) {
   let m
   while ((m = re.exec(html))) {
     if (m[4] !== undefined) {
-      out += m[4]
+      out += decodeTextEntities(m[4])
       continue
     }
     if (!m[1]) continue

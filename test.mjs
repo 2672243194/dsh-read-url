@@ -106,6 +106,26 @@ ok('removes entity-escaped style inside textarea (baidu pattern)', () => {
   assert.ok(r.text.length < 200, 'noise-free output must be small')
 })
 
+ok('removes HTML comments and decodes entities', () => {
+  const html = '<html><head><title>测试</title></head><body><article><h1>标题</h1><!-- 调查 排行 --><p>价格 &nbsp; 与 &quot;质量&quot; 的对比 &amp; 分析</p></article></body></html>'
+  const r = extract(html, 'text')
+  assert.ok(!r.text.includes('调查'), 'comment text must be stripped')
+  assert.ok(!r.text.includes('-->'), 'comment markers must be stripped')
+  assert.ok(r.text.includes('价格 与 "质量" 的对比 & 分析'), `entities must decode, got: ${r.text.slice(-60)}`)
+})
+
+ok('aggregates multiple article blocks (blog homepage pattern)', () => {
+  const html = '<html><head><title>博客园</title></head><body><nav>导航</nav>' +
+    '<article class="post-item"><h1>文章A</h1><p>内容A内容A内容A</p></article>' +
+    '<article class="post-item"><h1>文章B</h1><p>内容B内容B内容B</p></article>' +
+    '<footer>页脚</footer></body></html>'
+  const r = extract(html, 'text')
+  assert.ok(r.text.includes('文章A'), 'first article must be present')
+  assert.ok(r.text.includes('文章B'), 'second article must be present')
+  assert.ok(!r.text.includes('导航'), 'nav must be stripped')
+  assert.ok(!r.text.includes('页脚'), 'footer must be stripped')
+})
+
 ok('markdown mode also strips hidden style containers', () => {
   const html = '<html><head><title>测试</title></head><body><textarea>&lt;style&gt;.x{display:none}&lt;/style&gt;</textarea><article><h1>标题</h1><p>正文</p></article></body></html>'
   const r = extract(html, 'markdown')
