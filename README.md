@@ -54,12 +54,13 @@ npx @deepseek-ai/dsh plugin --profile web add ./dsh-read-url
 
 ### 工具
 
-**`read_url(url, maxChars?, mode?, includeLinks?)`** — 抓取并提取干净正文
+**`read_url(url, maxChars?, offset?, mode?, includeLinks?)`** — 抓取并提取干净正文
 
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `url` | string | 必填 | http(s) URL |
 | `maxChars` | number | 6000 | 返回正文最大字符数（500–20000） |
+| `offset` | number | 0 | 从该字符偏移续读（长文续段，命中缓存不重复前文） |
 | `mode` | string | `text` | `text` = 纯文本（最省 token）；`markdown` = 结构化 |
 | `includeLinks` | boolean | `false` | 额外返回页面内最多 20 条链接（标题+URL） |
 
@@ -116,7 +117,7 @@ const results = await Promise.all([
 ## 省 token 设计（核心）
 
 1. **默认只给正文**——不返回 headings/keywords/images/字数统计等冗余字段，需要时按参数取；
-2. **段落级智能截断**——默认 6000 字符（约 3000 token），在段落边界截断保证语义完整，输出行注明 `chars 6000/12990` 告诉模型"还有多少没取"，需要再调一次续读（配合缓存，重复 URL 不重复烧钱）；
+2. **段落级智能截断 + offset 续读**——默认 6000 字符（约 3000 token），在段落边界截断保证语义完整，输出行注明 `chars 6000/12990` 并引导用 `offset` 续读；续读从指定偏移开始、命中缓存切片，**不重复返回已读前文**（实测 0+500 → 500+500，无重复）；
 3. **text 模式优先**——Markdown 结构按需开启；
 4. **紧凑文本 render**——模型直接看到 `title:` 头部 + 正文，无需解析 JSON；`siteName` 与域名相同时省略，元数据零冗余；
 5. **会话级缓存**——同一 URL 5 分钟内重复读取直接命中，省网络也省模型重试；

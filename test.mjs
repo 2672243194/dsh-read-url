@@ -90,6 +90,17 @@ ok('hard cut when single paragraph exceeds limit', () => {
   assert.equal(r.truncated, true)
 })
 
+ok('offset continues from paragraph boundary without repeating', () => {
+  const text = '一\n\n二二\n\n三三三\n\n四四四四'
+  const first = smartTruncate(text, 6)
+  assert.equal(first.text, '一\n\n二二')
+  assert.equal(first.charsStart, 0)
+  const second = smartTruncate(text, 6, first.text.length)
+  assert.equal(second.text, '三三三')
+  assert.equal(second.charsStart, 5)
+  assert.ok(!second.text.includes('一'), 'offset read must not repeat earlier content')
+})
+
 console.log('inline markdown')
 ok('escapes special chars in plain text', () => {
   assert.equal(inlineMd('a *b* and `c`'), 'a \\*b\\* and \\`c\\`')

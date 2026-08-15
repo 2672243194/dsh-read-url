@@ -330,17 +330,35 @@ async function getReadabilityExtractor() {
   return readabilityReady
 }
 
-export function smartTruncate(text, maxChars) {
+export function smartTruncate(text, maxChars, offset = 0) {
   const total = text.length
-  if (total <= maxChars) return { text, truncated: false, charsTotal: total, charsReturned: total }
+  if (total <= maxChars && offset === 0) {
+    return { text, truncated: false, charsTotal: total, charsReturned: total, charsStart: 0 }
+  }
   const paragraphs = text.split(/\n\n+/)
+  let pos = 0
+  let start = 0
+  for (let i = 0; i < paragraphs.length; i++) {
+    if (pos + paragraphs[i].length > offset) {
+      start = i
+      break
+    }
+    pos += paragraphs[i].length + 2
+  }
   let acc = ''
-  for (const p of paragraphs) {
-    if (acc.length + p.length + 2 > maxChars) break
+  for (let i = start; i < paragraphs.length; i++) {
+    const p = paragraphs[i]
+    if (acc.length + p.length + (acc ? 2 : 0) > maxChars) break
     acc += (acc ? '\n\n' : '') + p
   }
-  if (!acc) acc = text.slice(0, maxChars)
-  return { text: acc, truncated: true, charsTotal: total, charsReturned: acc.length }
+  if (!acc && maxChars > 0) acc = text.slice(offset, offset + maxChars)
+  return {
+    text: acc,
+    truncated: offset + acc.length < total,
+    charsTotal: total,
+    charsReturned: acc.length,
+    charsStart: offset,
+  }
 }
 
 function extractLinks(html, limit) {
@@ -362,16 +380,39 @@ function hostOf(url) {
   }
 }
 
+function sliceFrom(full, offset, maxChars) {
+  const s = smartTruncate(full.fullText, maxChars, offset)
+  const out = {
+    url: full.url,
+    title: full.title || '',
+    siteName: full.siteName || hostOf(full.url),
+    lang: full.lang || '',
+    charset: full.charset,
+    mode: full.mode,
+    truncated: s.truncated,
+    charsTotal: s.charsTotal,
+    charsReturned: s.charsReturned,
+    charsStart: s.charsStart,
+    text: s.text,
+  }
+  if (Array.isArray(full.links)) out.links = full.links
+  return out
+}
+
 export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   const url = String(args.url || '').trim()
   if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
   const maxChars = Math.max(500, Math.min(20000, Number(args.maxChars) || cfg.maxChars))
   const mode = args.mode === 'markdown' ? 'markdown' : 'text'
+  const offset = Math.max(0, Number(args.offset) || 0)
 
-  const cacheKey = `${url}|${mode}|${maxChars}`
+  // Cache stores the FULL extracted text keyed by url+mode, so continuation
+  // reads (offset) and different maxChars hit the same cache entry.
+  const cacheKey = `${url}|${mode}`
   const hit = cache.get(cacheKey)
   if (hit && Date.now() - hit.time < cfg.cacheTtlMs) {
-    return { ...hit.result, cached: true }
+    const sliced = sliceFrom(hit.full, offset, maxChars)
+    return { ...sliced, cached: true }
   }
 
   let html, finalUrl, charset
@@ -404,25 +445,21 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
       // keep heuristic result
     }
   }
-  const truncated = smartTruncate(extracted.text, maxChars)
 
-  const result = {
+  const full = {
     url: finalUrl,
     title: extracted.title || '',
-    siteName: extracted.siteName || hostOf(finalUrl),
+    siteName: extracted.siteName || '',
     lang: extracted.lang || '',
     charset,
     mode,
-    truncated: truncated.truncated,
-    charsTotal: truncated.charsTotal,
-    charsReturned: truncated.charsReturned,
-    text: truncated.text,
+    fullText: extracted.text,
+    links: args.includeLinks ? extractLinks(html, cfg.maxLinks) : undefined,
   }
-  if (args.includeLinks) result.links = extractLinks(html, cfg.maxLinks)
 
   if (cache.size >= cfg.cacheMax) cache.delete(cache.keys().next().value)
-  cache.set(cacheKey, { time: Date.now(), result })
-  return result
+  cache.set(cacheKey, { time: Date.now(), full })
+  return sliceFrom(full, offset, maxChars)
 }
 
 function renderResult(value) {
@@ -437,13 +474,16 @@ function renderResult(value) {
   if (r.lang) meta.push(r.lang)
   if (r.charset) meta.push(`charset ${r.charset}`)
   if (meta.length) lines.push(meta.join(' · '))
-  if (r.truncated) {
-    lines.push(`(chars ${r.charsReturned}/${r.charsTotal} — truncated. Raise maxChars or read the rest in a follow-up call.)`)
+  if (r.charsStart > 0) {
+    lines.push(`(chars ${r.charsStart}+${r.charsReturned}/${r.charsTotal} — continuing from offset. Increase offset and/or maxChars in a follow-up call to read more.)`)
+  } else if (r.truncated) {
+    lines.push(`(chars ${r.charsReturned}/${r.charsTotal} — truncated. Read the rest via offset or a larger maxChars in a follow-up call.)`)
   } else if (typeof r.charsTotal === 'number') {
     lines.push(`(chars ${r.charsTotal})`)
   }
   if (r.cached) lines.push('(cached)')
-  lines.push('', r.text || '(no readable content)')
+  if (!r.text) lines.push('(no readable content — may be a login wall, JS-rendered page, or empty body)')
+  lines.push('', r.text || '')
   if (Array.isArray(r.links) && r.links.length) {
     lines.push('', 'links:')
     for (const l of r.links) lines.push(`- ${l.title} — ${l.url}`)
@@ -536,6 +576,7 @@ export function apply(ctx, config) {
       properties: {
         url: { type: 'string', description: 'http(s) URL to read' },
         maxChars: { type: 'number', description: 'Max characters of body text to return (range 500-20000, default from plugin config)' },
+        offset: { type: 'number', description: 'Start reading from this character offset (for continuing a long page). Default 0. Served from cache.' },
         mode: { type: 'string', enum: ['text', 'markdown'], description: 'text = plain (token-efficient, default); markdown = structured' },
         includeLinks: { type: 'boolean', description: 'Also return a bounded list of page links (title+url)' },
       },
