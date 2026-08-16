@@ -165,6 +165,23 @@ const results = await Promise.all([
 - **Safety**: http/https only; no page scripts executed; responses over 3 MB rejected; 15s timeout; structured errors (HTTP status / timeout / unsupported type);
 - **Optional enhancement 1 (Firefox Reader Mode algorithm)**: run `npm i @mozilla/readability happy-dom` in the DSH profile directory to auto-enable `@mozilla/readability` (MPL-2.0, referenced unmodified) for higher-quality extraction; falls back to the built-in heuristic when not installed — the core stays zero-dependency;
 - **Optional enhancement 2 (SPA page rendering)**: run `npm i playwright && npx playwright install chromium` in the DSH profile directory to auto-enable it. When the extracted body is empty and the page is script-heavy (likely Vue/React client-rendered), the plugin automatically renders it with headless Chromium before extracting (a `rendered` flag tells the model); when not installed it degrades with a clear install hint, never errors — the core stays zero-dependency;
+- **Boundaries**: login-walled pages are not readable; SPA pages need the Playwright enhancement; **structured data (e.g. which like-count belongs to which comment) is out of text-extraction scope** — this plugin flattens HTML into readable text, so exact field↔value associations are lost; for precise fields, intercept the page's actual data API (see "Real-world validation" below).
+
+## Real-world validation (2026-08-16)
+
+| Category | Sites | Result |
+|---|---|---|
+| Portal navigation cleaning | Baidu / QQ / NetEase | ✅ clean nav + hot searches, no CSS noise |
+| Multi-article aggregation | Cnblogs / Ruan Yifeng blog | ✅ 3,580+ chars across articles |
+| Encoding detection | People's Daily (UTF-8) / legacy GBK sites | ✅ correct detection, no mojibake |
+| Login wall / 404 / image / PDF | Zhihu / Baidu / W3C | ✅ clear errors (403 / 404 / type block) |
+| **SPA rendering** | Xiaoheihe / Juejin (JS-only) | ✅ `rendered` flag + post-JS body |
+| **offset continuation** | Sina News (12,359 chars) | ✅ 800→800+6000 seamless, no repeat, cache hit |
+| **Batch + failure isolation** | 3-URL mix | ✅ 2/3 ok, 403 isolated, cache reused |
+| **Site crawl** | Ruan Yifeng blog | ✅ 8/8 pages tree map |
+
+- **27 zero-dep assertions** + **10 SPA-test assertions** all green;
+- Real case: on a Xiaoheihe post, comment like-counts (`up` field) could not be attributed from flattened text — **precise fields should come from the page's underlying data API** (e.g. `/bbs/app/link/tree` JSON). This is a shared boundary of text extractors, not a defect.
 - **Boundaries**: login-walled pages can't be read; SPA pages need the Playwright enhancement to be rendered (a clear hint is returned when it isn't installed).
 
 ## Roadmap
