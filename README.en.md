@@ -1,5 +1,7 @@
 # dsh-read-url
 
+![dsh-read-url](docs/banner.svg)
+
 URL reader plugin for DeepSeek Harness: fetch any webpage, **auto-detect encoding (GBK/GB2312/UTF-8/Big5)**, extract the clean main content, and return **token-efficient compact text or structured Markdown**.
 
 Zero dependencies (Node 20+ built-ins), no API key, no server side — install and use.

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1e3a8a"/>
+    </linearGradient>
+    <linearGradient id="acc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#60a5fa"/>
+      <stop offset="100%" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <circle cx="1150" cy="120" r="230" fill="#ffffff" opacity="0.04"/>
+  <circle cx="150" cy="580" r="190" fill="#ffffff" opacity="0.04"/>
+  <text x="80" y="200" font-family="'Segoe UI', system-ui, sans-serif" font-size="72" font-weight="700" fill="#f8fafc">dsh-read-url</text>
+  <text x="82" y="290" font-family="'Segoe UI', system-ui, sans-serif" font-size="32" fill="#94a3b8">Fetch any URL → clean main content for DeepSeek Harness</text>
+  <text x="82" y="360" font-family="'Segoe UI', system-ui, sans-serif" font-size="26" fill="#cbd5e1">Auto charset (GBK/GB2312/UTF-8/Big5) · token-efficient · zero deps · no API key</text>
+  <rect x="80" y="440" width="250" height="56" rx="28" fill="none" stroke="url(#acc)" stroke-width="2"/>
+  <text x="205" y="478" text-anchor="middle" font-family="'Segoe UI', system-ui, sans-serif" font-size="24" fill="#60a5fa">DeepSeek Harness</text>
+  <rect x="350" y="440" width="130" height="56" rx="28" fill="none" stroke="url(#acc)" stroke-width="2"/>
+  <text x="415" y="478" text-anchor="middle" font-family="'Segoe UI', system-ui, sans-serif" font-size="24" fill="#60a5fa">MIT</text>
+  <rect x="500" y="440" width="210" height="56" rx="28" fill="none" stroke="url(#acc)" stroke-width="2"/>
+  <text x="605" y="478" text-anchor="middle" font-family="'Segoe UI', system-ui, sans-serif" font-size="24" fill="#60a5fa">Zero deps</text>
+</svg>
