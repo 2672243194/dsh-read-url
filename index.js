@@ -457,9 +457,11 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   // extraction found almost nothing, try headless rendering (playwright).
   let rendered = false
   let spaHint = ''
+  let renderedHtml = null
   if (cfg.spaRender !== false && looksLikeSpa(html) && (!extracted.text || extracted.text.length < 200)) {
     const rr = await renderPage(finalUrl || url, externalSignal)
     if (rr.html) {
+      renderedHtml = rr.html
       const r2 = upgrade(extract(rr.html, mode), rr.html)
       if (r2.text && r2.text.length > extracted.text.length + 50) {
         extracted = r2
@@ -481,7 +483,9 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     fullText: extracted.text,
     rendered,
     spaHint,
-    links: args.includeLinks ? extractLinks(html, cfg.maxLinks) : undefined,
+    // Links come from the rendered DOM when available — otherwise the SPA
+    // chain (content -> links -> next page) would break for JS-only pages.
+    links: args.includeLinks ? extractLinks(renderedHtml || html, cfg.maxLinks) : undefined,
   }
 
   if (cache.size >= cfg.cacheMax) cache.delete(cache.keys().next().value)
@@ -539,6 +543,7 @@ function readLinksTool(ctx, cfg) {
     description:
       'List the links (visible text + URL) found on a webpage, without returning body text. ' +
       'Lighter than read_url for mapping what a page points to or finding source links. ' +
+      'Renders JS-only (SPA) pages when playwright is installed. ' +
       'Read-only, no credentials sent.',
     parameters: {
       type: 'object',
@@ -579,6 +584,18 @@ function readLinksTool(ctx, cfg) {
         finalUrl = page.finalUrl || url
       }
       const links = extractLinks(html, limit)
+      // SPA fallback: a JS-only page yields no links from its static HTML;
+      // render it and re-extract when the static result looks empty.
+      if (links.length < 3 && cfg.spaRender !== false && looksLikeSpa(html)) {
+        const rr = await renderPage(finalUrl || url, exec && exec.signal)
+        if (rr.html) {
+          const rl = extractLinks(rr.html, limit)
+          if (rl.length > links.length) {
+            links = rl
+            finalUrl = rr.finalUrl || finalUrl
+          }
+        }
+      }
       return { url: finalUrl, count: links.length, links }
     },
   }

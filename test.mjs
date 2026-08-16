@@ -189,4 +189,16 @@ ok('readUrl on SPA page without playwright degrades gracefully with hint', async
   assert.ok(r.spaHint || !r.text, `should carry spaHint or empty text, got hint=${r.spaHint}`)
 })
 
+ok('read_url_links on SPA page without playwright falls back to static links', async () => {
+  const html = '<html><head><title>SPA</title></head><body><div id="app"></div>' + '<script src="/x.js"></script>'.repeat(8) + '</body></html>'
+  const fakeSeam = { fetch: async (u) => ({ content: html, url: u }) }
+  const fakeCtx = { tools: { register: () => {} }, effect: () => {}, get: (k) => (k === 'web' ? fakeSeam : undefined) }
+  const tools = []
+  m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: fakeCtx.get }, {})
+  const linksTool = tools.find((t) => t.name === 'read_url_links')
+  const r = await linksTool.execute({ url: 'https://spa.example.com' })
+  assert.ok(!r.error, 'must not throw when playwright missing')
+  assert.equal(r.count, 0, 'static SPA skeleton has no links; fallback hint path taken')
+})
+
 console.log(`\n${passed} assertions passed`)
