@@ -1,5 +1,7 @@
 # dsh-read-url
 
+🌐 **English** | 中文
+
 DeepSeek Harness 的 URL 阅读插件：抓取任意网页，**自动识别编码（GBK/GB2312/UTF-8/Big5）**，提取干净正文，输出**省 token 的紧凑文本或结构化 Markdown**。
 
 零依赖（Node 20+ 内置能力），免 API key，免服务端，装完即用。
@@ -137,8 +139,8 @@ const results = await Promise.all([
 
 ## Roadmap
 
+- [x] 单页多段续读（`offset` 参数）
 - [ ] SPA 页面按需渲染（接入 Playwright，保持可选）
-- [ ] 单页多段续读（`offset` 参数）
 
 ## 开发
 
