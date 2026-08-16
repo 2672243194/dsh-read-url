@@ -336,6 +336,9 @@ async function getReadabilityExtractor() {
 
 export function smartTruncate(text, maxChars, offset = 0) {
   const total = text.length
+  if (offset >= total) {
+    return { text: '', truncated: false, charsTotal: total, charsReturned: 0, charsStart: offset }
+  }
   if (total <= maxChars && offset === 0) {
     return { text, truncated: false, charsTotal: total, charsReturned: total, charsStart: 0 }
   }
@@ -425,11 +428,18 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   // Cache stores the FULL extracted text keyed by url+mode+includeLinks, so
   // continuation reads (offset) and different maxChars hit the same entry —
   // but a links-request must not be served from a links-less cached copy.
-  const cacheKey = `${url}|${mode}|${args.includeLinks ? 'links' : 'no-links'}`
+  const cacheKey = `${url}|${mode}|${args.includeLinks === true ? 'links' : 'no-links'}`
   const hit = cache.get(cacheKey)
-  if (hit && Date.now() - hit.time < cfg.cacheTtlMs) {
-    const sliced = sliceFrom(hit.full, offset, maxChars)
-    return { ...sliced, cached: true }
+  if (hit) {
+    // Failed fetches are cached briefly so the model doesn't re-request a
+    // broken URL in a loop (token + latency saver).
+    if (hit.error) {
+      if (Date.now() - hit.time < 30000) return { error: hit.error, cached: true }
+      cache.delete(cacheKey)
+    } else if (Date.now() - hit.time < cfg.cacheTtlMs) {
+      const sliced = sliceFrom(hit.full, offset, maxChars)
+      return { ...sliced, cached: true }
+    }
   }
 
   let html, finalUrl, charset
@@ -440,7 +450,13 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     charset = 'provider-decoded'
   } else {
     const page = await fetchPage(url, externalSignal, cfg)
-    if (page.error) return { error: page.error }
+    if (page.error) {
+      // Brief error cache: a failing URL usually stays failing for a while,
+      // so serve the same error from cache instead of re-fetching.
+      if (cache.size >= cfg.cacheMax) cache.delete(cache.keys().next().value)
+      cache.set(cacheKey, { time: Date.now(), error: page.error })
+      return { error: page.error }
+    }
     const decoded = decodeBuffer(page.buffer, page.contentType)
     html = decoded.text
     finalUrl = page.finalUrl || url
@@ -498,7 +514,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     spaHint,
     // Links come from the rendered DOM when available — otherwise the SPA
     // chain (content -> links -> next page) would break for JS-only pages.
-    links: args.includeLinks ? extractLinks(renderedHtml || html, cfg.maxLinks, finalUrl) : undefined,
+    links: args.includeLinks === true ? extractLinks(renderedHtml || html, cfg.maxLinks, finalUrl) : undefined,
   }
 
   if (cache.size >= cfg.cacheMax) cache.delete(cache.keys().next().value)
@@ -519,18 +535,18 @@ function renderResult(value) {
   if (r.charset) meta.push(`charset ${r.charset}`)
   if (meta.length) lines.push(meta.join(' · '))
   if (r.charsStart > 0) {
-    lines.push(`(chars ${r.charsStart}+${r.charsReturned}/${r.charsTotal} — continuing from offset. Increase offset and/or maxChars in a follow-up call to read more.)`)
+    lines.push(`(chars ${r.charsStart}+${r.charsReturned}/${r.charsTotal} — offset 续读)`)
   } else if (r.truncated) {
-    lines.push(`(chars ${r.charsReturned}/${r.charsTotal} — truncated. Read the rest via offset or a larger maxChars in a follow-up call.)`)
+    lines.push(`(chars ${r.charsReturned}/${r.charsTotal} — 截断，offset 续读)`)
   } else if (typeof r.charsTotal === 'number') {
     lines.push(`(chars ${r.charsTotal})`)
   }
   if (r.cached) lines.push('(cached)')
-  if (r.rendered) lines.push('(rendered with headless browser — JS-executed content)')
+  if (r.rendered) lines.push('(rendered — JS 执行后内容)')
   if (!r.text) {
     lines.push(r.spaHint
-      ? `(no readable content — ${r.spaHint})`
-      : '(no readable content — may be a login wall, JS-rendered (SPA) page, or empty body. For SPA pages: install playwright in the DSH profile to enable rendering)')
+      ? `(无可读内容 — ${r.spaHint})`
+      : '(无可读内容 — 登录墙 / SPA 页 / 空页面；SPA 需安装 playwright)')
   }
   lines.push('', r.text || '')
   if (Array.isArray(r.links) && r.links.length) {

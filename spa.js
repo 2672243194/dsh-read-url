@@ -35,7 +35,7 @@ export async function renderPage(url, externalSignal) {
   } catch {
     return {
       error:
-        'SPA rendering requires playwright — run `npm i playwright && npx playwright install chromium` in the DSH profile directory to enable it',
+        'SPA 渲染需 playwright — DSH profile 内执行 `npm i playwright && npx playwright install chromium` 后重试',
     }
   }
   let page

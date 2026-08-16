@@ -102,6 +102,13 @@ ok('offset continues from paragraph boundary without repeating', () => {
   assert.ok(!second.text.includes('一'), 'offset read must not repeat earlier content')
 })
 
+ok('offset beyond end returns empty, never repeats the head', () => {
+  const r = smartTruncate('一二三四五', 10, 999)
+  assert.equal(r.text, '')
+  assert.equal(r.charsReturned, 0)
+  assert.equal(r.truncated, false)
+})
+
 console.log('inline markdown')
 ok('escapes special chars in plain text', () => {
   assert.equal(inlineMd('a *b* and `c`'), 'a \\*b\\* and \\`c\\`')
@@ -260,6 +267,20 @@ console.log('read_url_batch (local server, real fetch)')
     assert.equal(r.total, 10, 'only first 10 URLs are read')
     passed++
     console.log('  ok - caps url list at 10')
+  }
+
+  {
+    // Error caching: a failing URL must be served from cache on repeat (30s TTL),
+    // so the model never loops re-fetching a broken URL. Use a fresh path so the
+    // earlier batch test (which already fetched /missing) doesn't pre-warm it.
+    const bad = `${base}/missing2`
+    const e1 = await m.readUrl({ url: bad, maxChars: 300 }, undefined, undefined, undefined)
+    assert.ok(e1.error, 'first hit errors')
+    assert.ok(!e1.cached, 'first hit is not cached')
+    const e2 = await m.readUrl({ url: bad, maxChars: 300 }, undefined, undefined, undefined)
+    assert.ok(e2.error && e2.cached === true, `repeat hit served from cache: ${JSON.stringify(e2)}`)
+    passed++
+    console.log('  ok - failed URLs are served from error cache (no re-fetch loop)')
   }
 
   server.close()
