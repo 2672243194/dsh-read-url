@@ -614,6 +614,107 @@ function readLinksTool(ctx, cfg) {
   }
 }
 
+// Run async tasks with a concurrency cap (avoids hammering a site / getting
+// rate-limited when reading many URLs at once).
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length)
+  let idx = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (idx < items.length) {
+      const i = idx++
+      out[i] = await fn(items[i], i)
+    }
+  })
+  await Promise.all(workers)
+  return out
+}
+
+function renderBatch(value) {
+  if (typeof value === 'string') return value
+  const v = value || {}
+  if (v.error) return `Error: ${v.error}`
+  const lines = [`读取 ${v.succeeded}/${v.total} 页成功${v.failed ? `，${v.failed} 页失败` : ''}`]
+  for (const p of v.pages) {
+    if (p.error) {
+      lines.push('', `[失败] ${p.url} — ${p.error}`)
+      continue
+    }
+    const head = p.title || p.url
+    lines.push('', `--- ${head} (${p.chars} 字符${p.cached ? ' · cached' : ''}) ---`, p.text || '(no readable content)')
+    if (Array.isArray(p.links) && p.links.length) {
+      lines.push(`links: ${p.links.map((l) => l.title + ' — ' + l.url).join(' | ')}`)
+    }
+  }
+  return lines.join('\n')
+}
+
+function readUrlBatchTool(ctx, cfg) {
+  return {
+    name: 'read_url_batch',
+    description:
+      'Read multiple URLs in parallel and return each page\'s clean main content as a compact block. ' +
+      'Uses the same extraction as read_url (charset auto-detect, noise stripping, optional readability/SPA rendering) and the same session cache. ' +
+      'Per-page failures are isolated: one broken URL does not affect the others, and each result is tagged with its URL. ' +
+      'For research / comparison tasks that need several pages at once. ' +
+      'Max 10 URLs; per-page output capped at maxChars to keep token usage low.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        urls: { type: 'array', items: { type: 'string' }, description: 'List of http(s) URLs to read (1-10)' },
+        maxChars: { type: 'number', description: 'Max characters per page (range 500-20000, default 3000)' },
+        mode: { type: 'string', enum: ['text', 'markdown'], description: 'text = plain (token-efficient, default); markdown = structured' },
+        includeLinks: { type: 'boolean', description: 'Also return a bounded list of links per page (title+url)' },
+      },
+      required: ['urls'],
+    },
+    timeoutMs: Math.max(30000, cfg.timeoutMs + 15000),
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        properties: {
+          total: { type: 'number' },
+          succeeded: { type: 'number' },
+          failed: { type: 'number' },
+          pages: { type: 'array', items: { type: 'object' } },
+          error: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: renderBatch(value) }],
+    },
+    async execute(args, exec) {
+      const urls = (Array.isArray(args.urls) ? args.urls : []).map((u) => String(u).trim()).filter(Boolean)
+      if (!urls.length) return { error: 'urls array is required (1-10 http(s) URLs)' }
+      const list = urls.slice(0, 10)
+      const perMax = Math.max(500, Math.min(20000, Number(args.maxChars) || 3000))
+      const mode = args.mode === 'markdown' ? 'markdown' : 'text'
+      const signal = exec && exec.signal
+      const pages = await mapLimit(list, 4, (u) =>
+        readUrl({ url: u, maxChars: perMax, mode, includeLinks: args.includeLinks === true }, ctx, signal, cfg),
+      )
+      const ok = pages.filter((p) => !p.error)
+      return {
+        total: list.length,
+        succeeded: ok.length,
+        failed: list.length - ok.length,
+        pages: pages.map((p, i) => {
+          if (p.error) return { url: list[i], error: p.error }
+          const out = {
+            url: p.url,
+            title: p.title || '',
+            chars: p.charsReturned,
+            cached: p.cached === true,
+            text: p.text,
+          }
+          if (Array.isArray(p.links) && p.links.length) out.links = p.links
+          return out
+        }),
+      }
+    },
+  }
+}
+
 export function apply(ctx, config) {
   // Plugin-level config from cordis.patch.yml (config row), merged over defaults.
   const cfg = { ...DEFAULTS, ...(config || {}) }
@@ -624,7 +725,7 @@ export function apply(ctx, config) {
     closeBrowser().catch(() => {})
   })
 
-  console.log('[dsh-read-url] plugin loaded; tools read_url, read_url_links registered')
+  console.log('[dsh-read-url] plugin loaded; tools read_url, read_url_batch, read_url_links registered')
 
   ctx.tools.register({
     name: 'read_url',
@@ -677,4 +778,5 @@ export function apply(ctx, config) {
   })
 
   ctx.tools.register(readLinksTool(ctx, cfg))
+  ctx.tools.register(readUrlBatchTool(ctx, cfg))
 }

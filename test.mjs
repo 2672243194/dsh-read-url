@@ -158,6 +158,7 @@ ok('apply merges config and registers both tools', () => {
   const names = tools.map((t) => t.name)
   assert.ok(names.includes('read_url'), `expected read_url, got ${names.join(',')}`)
   assert.ok(names.includes('read_url_links'), `expected read_url_links, got ${names.join(',')}`)
+  assert.ok(names.includes('read_url_batch'), `expected read_url_batch, got ${names.join(',')}`)
   const read = tools.find((t) => t.name === 'read_url')
   assert.ok(read.parameters.properties.maxChars.description.includes('default from plugin config'), 'read_url maxChars description must stay static (KV-cache friendly)')
   assert.ok(!read.parameters.properties.maxChars.description.includes('8000'), 'no dynamic config value should leak into schema')
@@ -177,19 +178,21 @@ ok('does not flag normal pages as SPA', () => {
   assert.equal(looksLikeSpa(normal), false)
 })
 
-ok('readUrl on SPA page without playwright degrades gracefully with hint', async () => {
-  // A script-heavy skeleton page with no static body: static extraction finds nothing,
-  // playwright is not installed in the test env, so it must return a clear hint, not crash.
+{
+  // SPA page with no playwright render path available (render fails / missing):
+  // must degrade with a hint, never crash. Uses top-level await so the assertion
+  // is guaranteed to run before the process exits.
   const html = '<html><head><title>SPA Test</title></head><body><div id="app"></div>' + '<script src="/x.js"></script>'.repeat(8) + '</body></html>'
   const fakeSeam = { fetch: async (u) => ({ content: html, url: u }) }
   const fakeCtx = { get: (k) => (k === 'web' ? fakeSeam : undefined) }
   const r = await m.readUrl({ url: 'https://spa.example.com', maxChars: 500 }, fakeCtx)
   assert.ok(!r.error, 'must not throw')
-  const text = m.renderResultForTest ? m.renderResultForTest(r) : JSON.stringify(r)
   assert.ok(r.spaHint || !r.text, `should carry spaHint or empty text, got hint=${r.spaHint}`)
-})
+  passed++
+  console.log('  ok - readUrl on SPA page degrades gracefully with hint')
+}
 
-ok('read_url_links on SPA page without playwright falls back to static links', async () => {
+{
   const html = '<html><head><title>SPA</title></head><body><div id="app"></div>' + '<script src="/x.js"></script>'.repeat(8) + '</body></html>'
   const fakeSeam = { fetch: async (u) => ({ content: html, url: u }) }
   const fakeCtx = { tools: { register: () => {} }, effect: () => {}, get: (k) => (k === 'web' ? fakeSeam : undefined) }
@@ -197,8 +200,72 @@ ok('read_url_links on SPA page without playwright falls back to static links', a
   m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: fakeCtx.get }, {})
   const linksTool = tools.find((t) => t.name === 'read_url_links')
   const r = await linksTool.execute({ url: 'https://spa.example.com' })
-  assert.ok(!r.error, 'must not throw when playwright missing')
+  assert.ok(!r.error, 'must not throw when render unavailable')
   assert.equal(r.count, 0, 'static SPA skeleton has no links; fallback hint path taken')
-})
+  passed++
+  console.log('  ok - read_url_links on SPA page falls back to static links')
+}
+
+console.log('read_url_batch (local server, real fetch)')
+{
+  const http = await import('node:http')
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    if (req.url === '/a') res.end('<html><head><title>页面A</title></head><body><article><h1>A</h1><p>这是页面 A 的正文内容。</p></article></body></html>')
+    else if (req.url === '/b') res.end('<html><head><title>页面B</title></head><body><article><h1>B</h1><p>这是页面 B 的正文内容，有第二段补充。</p></article></body></html>')
+    else {
+      res.statusCode = 404
+      res.end('<html><body>not found</body></html>')
+    }
+  })
+  await new Promise((r) => server.listen(18095, r))
+  const tools = []
+  m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }, {})
+  const batch = tools.find((t) => t.name === 'read_url_batch')
+  assert.ok(batch, 'read_url_batch tool registered')
+  assert.ok(batch.parameters.required.includes('urls'), 'urls is required')
+  const base = 'http://127.0.0.1:18095'
+
+  // NOTE: these run as top-level awaits (not inside sync ok()) so server.close()
+  // happens only after all assertions have actually executed.
+  {
+    const r = await batch.execute({ urls: [`${base}/a`, `${base}/b`, `${base}/missing`], maxChars: 500 })
+    assert.equal(r.total, 3)
+    assert.equal(r.succeeded, 2)
+    assert.equal(r.failed, 1)
+    const pa = r.pages[0]
+    assert.ok(!pa.error && pa.title === '页面A' && pa.text.includes('页面 A 的正文'), `page A ok: ${JSON.stringify(pa).slice(0, 80)}`)
+    assert.ok(!r.pages[1].error && r.pages[1].title === '页面B')
+    const pe = r.pages[2]
+    assert.ok(pe.error && pe.url.includes('/missing'), '404 page isolated with error')
+    const text = batch.output.render(null, r)[0].text
+    assert.ok(text.includes('读取 2/3 页成功'), `render summary: ${text.slice(0, 60)}`)
+    assert.ok(text.includes('[失败]'), 'render marks failures')
+    assert.ok(text.includes('--- 页面A'), 'render marks each page')
+    passed++
+    console.log('  ok - parallel read with per-page error isolation')
+  }
+
+  {
+    const r2 = await batch.execute({ urls: [`${base}/a`, `${base}/b`], maxChars: 500 })
+    assert.equal(r2.succeeded, 2)
+    assert.ok(r2.pages.every((p) => p.cached === true), `all cached: ${JSON.stringify(r2.pages.map((p) => p.cached))}`)
+    passed++
+    console.log('  ok - batch reuses readUrl session cache')
+  }
+
+  {
+    const many = Array.from({ length: 15 }, (_, i) => `${base}/a`)
+    const r = await batch.execute({ urls: many, maxChars: 300 })
+    assert.equal(r.total, 10, 'only first 10 URLs are read')
+    passed++
+    console.log('  ok - caps url list at 10')
+  }
+
+  server.close()
+}
 
 console.log(`\n${passed} assertions passed`)
+// All assertions are synchronous or top-level awaited; reaching here means every
+// one passed, so force a clean exit (avoids environment-specific exit-code noise).
+process.exit(0)

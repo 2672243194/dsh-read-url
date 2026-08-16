@@ -69,6 +69,18 @@ Read https://docs.example.org/guide in markdown mode
 | `mode` | string | `text` | `text` = plain (most token-efficient); `markdown` = structured |
 | `includeLinks` | boolean | `false` | Also return up to 20 page links (title+URL) |
 
+**`read_url_batch(urls, maxChars?, mode?, includeLinks?)`** — read multiple URLs (1–10) in parallel, each cleaned individually, merged into one compact report
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `urls` | string[] | required | http(s) URL list (1–10) |
+| `maxChars` | number | 3000 | Max body characters per page (500–20000) |
+| `mode` | string | `text` | `text` = plain; `markdown` = structured |
+| `includeLinks` | boolean | `false` | Also return links per page (title+URL) |
+
+- Concurrency capped at 4 (avoids rate-limiting); a failing page is **isolated** (`[失败]` + reason in the output) and does not affect the others;
+- Reuses every `read_url` capability and the session cache (encoding, cleaning, SPA rendering, 5-min cache — repeat batches hit the cache).
+
 **`read_url_links(url, limit?)`** — list the page's links without returning body text (lighter; good for sourcing / mapping a site)
 
 | Param | Type | Default | Description |

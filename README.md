@@ -57,6 +57,7 @@ npx @deepseek-ai/dsh plugin --profile web add ./dsh-read-url
 ```
 帮我读一下 https://example.com/article 并总结要点
 用 markdown 格式读 https://docs.example.org/guide
+同时读一下这几个网址，对比它们的观点：<url1> <url2> <url3>
 ```
 
 ### 工具
@@ -70,6 +71,18 @@ npx @deepseek-ai/dsh plugin --profile web add ./dsh-read-url
 | `offset` | number | 0 | 从该字符偏移续读（长文续段，命中缓存不重复前文） |
 | `mode` | string | `text` | `text` = 纯文本（最省 token）；`markdown` = 结构化 |
 | `includeLinks` | boolean | `false` | 额外返回页面内最多 20 条链接（标题+URL） |
+
+**`read_url_batch(urls, maxChars?, mode?, includeLinks?)`** — 批量读多个 URL（1–10 个），并行、逐页净化，合并成一个紧凑报告
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `urls` | string[] | 必填 | http(s) URL 列表（1–10 个） |
+| `maxChars` | number | 3000 | 每页返回正文最大字符数（500–20000） |
+| `mode` | string | `text` | `text` = 纯文本；`markdown` = 结构化 |
+| `includeLinks` | boolean | `false` | 每页额外返回链接（标题+URL） |
+
+- 并发 4 限制（防目标站限流），单页失败**不影响其他页**（结果里标注 `[失败]` + 原因）；
+- 复用 `read_url` 的全部能力与缓存：编码识别、正文净化、SPA 渲染、5 分钟缓存（重复批量读直接命中）。
 
 **`read_url_links(url, limit?)`** — 只列出页面链接清单，不返回正文（更轻，适合找来源/摸站点结构）
 
@@ -145,11 +158,13 @@ const results = await Promise.all([
 
 - [x] 单页多段续读（`offset` 参数）
 - [x] SPA 页面按需渲染（可选 Playwright 增强，装浏览器后自动启用）
+- [x] 批量读取（`read_url_batch`）
+- [ ] 整站递归爬取（入口 URL 自动发现站内链接逐页爬取，汇总站点结构）
 
 ## 开发
 
 ```bash
-node test.mjs          # 零依赖自测（转码/提取/Markdown/截断）
+node test.mjs          # 零依赖自测（转码/提取/Markdown/截断/批量/缓存隔离）
 
 # SPA 渲染真实测试（需 playwright 已安装，未装自动 SKIP）
 node test-spa.mjs      # 10 断言：JS 正文/渲染后链接/工具不崩溃/缓存隔离
