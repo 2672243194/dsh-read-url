@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0] - 2026-08-16
+
+### 新增（SPA 页面渲染增强，Roadmap 收官）
+
+- **可选 Playwright 渲染**：在 DSH profile 目录 `npm i playwright && npx playwright install chromium` 后自动启用——检测到正文为空且页面脚本密集（疑似 Vue/React 客户端渲染）时，自动用无头 Chromium 渲染后再提取，返回结果带 `rendered` 标记（模型可知内容来自 JS 执行）；未安装时优雅降级：返回明确安装提示、不报错，核心保持零依赖；
+- **SPA 检测启发式**：`<script>` 标签数量 ≥5 且正文提取 <200 字符 → 疑似 SPA（独立 `spa.js` 模块，`looksLikeSpa` 可测）；
+- **渲染生命周期合规**：浏览器实例模块级单例复用（多次调用不重复启动），插件卸载时经 `ctx.effect` 关闭；
+- 新配置项 `spaRender`（默认 `true`，可关闭）。
+
+### 测试
+
+- 17 个零依赖断言（新增 SPA 检测 / 正常页不误判 / 未装 playwright 优雅降级）；真实链路验证降级提示。
+
 ## [0.2.3] - 2026-08-15
 
 ### 新增（模型后续处理便捷性特调）

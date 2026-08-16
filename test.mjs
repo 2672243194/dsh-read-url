@@ -1,6 +1,7 @@
 // dsh-read-url self-test — zero-dependency, run: node test.mjs
 import assert from 'node:assert/strict'
 import * as m from './index.js'
+import { looksLikeSpa } from './spa.js'
 const { decodeBuffer, extract, smartTruncate, blockMd, inlineMd } = m
 
 let passed = 0
@@ -163,6 +164,29 @@ ok('apply merges config and registers both tools', () => {
   const links = tools.find((t) => t.name === 'read_url_links')
   assert.ok(links.parameters.properties.limit.description.includes('default from plugin config'))
   assert.ok(!links.parameters.properties.limit.description.includes('default 5'))
+})
+
+console.log('SPA detection')
+ok('detects script-heavy SPA skeleton', () => {
+  const spa = '<html><head></head><body><div id="app"></div>' + '<script src="/a.js"></script>'.repeat(8) + '</body></html>'
+  assert.equal(looksLikeSpa(spa), true)
+})
+
+ok('does not flag normal pages as SPA', () => {
+  const normal = '<html><body><article><h1>Title</h1><p>Body text.</p></article><script src="/s.js"></script></body></html>'
+  assert.equal(looksLikeSpa(normal), false)
+})
+
+ok('readUrl on SPA page without playwright degrades gracefully with hint', async () => {
+  // A script-heavy skeleton page with no static body: static extraction finds nothing,
+  // playwright is not installed in the test env, so it must return a clear hint, not crash.
+  const html = '<html><head><title>SPA Test</title></head><body><div id="app"></div>' + '<script src="/x.js"></script>'.repeat(8) + '</body></html>'
+  const fakeSeam = { fetch: async (u) => ({ content: html, url: u }) }
+  const fakeCtx = { get: (k) => (k === 'web' ? fakeSeam : undefined) }
+  const r = await m.readUrl({ url: 'https://spa.example.com', maxChars: 500 }, fakeCtx)
+  assert.ok(!r.error, 'must not throw')
+  const text = m.renderResultForTest ? m.renderResultForTest(r) : JSON.stringify(r)
+  assert.ok(r.spaHint || !r.text, `should carry spaHint or empty text, got hint=${r.spaHint}`)
 })
 
 console.log(`\n${passed} assertions passed`)

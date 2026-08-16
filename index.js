@@ -12,6 +12,7 @@
 //   - HTML -> Markdown / plain text, paragraph-aligned smart truncation
 //   - session-level cache, compact text render (lowest token cost)
 import { TextDecoder } from 'node:util'
+import { looksLikeSpa, renderPage, closeBrowser } from './spa.js'
 
 export const name = 'dsh-read-url'
 export const inject = ['tools']
@@ -24,6 +25,7 @@ const DEFAULTS = {
   maxLinks: 20,
   cacheTtlMs: 300000,
   cacheMax: 32,
+  spaRender: true,
   userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
 }
 
@@ -395,6 +397,8 @@ function sliceFrom(full, offset, maxChars) {
     charsStart: s.charsStart,
     text: s.text,
   }
+  if (full.rendered) out.rendered = true
+  if (full.spaHint) out.spaHint = full.spaHint
   if (Array.isArray(full.links)) out.links = full.links
   return out
 }
@@ -430,19 +434,40 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     charset = decoded.charset
   }
 
-  const extracted = extract(html, mode)
+  let extracted = extract(html, mode)
   // Optional readability upgrade: cleaner article extraction when installed.
   const ext = await getReadabilityExtractor()
-  if (ext) {
+  const upgrade = (target, htmlText) => {
+    if (!ext) return target
     try {
-      const clean = ext(html, url)
+      const clean = ext(htmlText, url)
       if (clean && clean.length > 0) {
-        extracted.text = mode === 'markdown'
+        target.text = mode === 'markdown'
           ? blockMd(clean).replace(/\n{3,}/g, '\n\n').trim()
           : textOnly(clean).replace(/ +/g, ' ').trim()
       }
     } catch {
       // keep heuristic result
+    }
+    return target
+  }
+  extracted = upgrade(extracted, html)
+
+  // Optional SPA enhancement: if the page looks client-rendered and static
+  // extraction found almost nothing, try headless rendering (playwright).
+  let rendered = false
+  let spaHint = ''
+  if (cfg.spaRender !== false && looksLikeSpa(html) && (!extracted.text || extracted.text.length < 200)) {
+    const rr = await renderPage(finalUrl || url, externalSignal)
+    if (rr.html) {
+      const r2 = upgrade(extract(rr.html, mode), rr.html)
+      if (r2.text && r2.text.length > extracted.text.length + 50) {
+        extracted = r2
+        finalUrl = rr.finalUrl || finalUrl
+        rendered = true
+      }
+    } else {
+      spaHint = rr.error
     }
   }
 
@@ -454,6 +479,8 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     charset,
     mode,
     fullText: extracted.text,
+    rendered,
+    spaHint,
     links: args.includeLinks ? extractLinks(html, cfg.maxLinks) : undefined,
   }
 
@@ -482,7 +509,12 @@ function renderResult(value) {
     lines.push(`(chars ${r.charsTotal})`)
   }
   if (r.cached) lines.push('(cached)')
-  if (!r.text) lines.push('(no readable content — may be a login wall, JS-rendered page, or empty body)')
+  if (r.rendered) lines.push('(rendered with headless browser — JS-executed content)')
+  if (!r.text) {
+    lines.push(r.spaHint
+      ? `(no readable content — ${r.spaHint})`
+      : '(no readable content — may be a login wall, JS-rendered (SPA) page, or empty body. For SPA pages: install playwright in the DSH profile to enable rendering)')
+  }
   lines.push('', r.text || '')
   if (Array.isArray(r.links) && r.links.length) {
     lines.push('', 'links:')
@@ -557,7 +589,10 @@ export function apply(ctx, config) {
   const cfg = { ...DEFAULTS, ...(config || {}) }
 
   // Temporal composability: unload must fully revert side effects.
-  ctx.effect(() => () => cache.clear())
+  ctx.effect(() => () => {
+    cache.clear()
+    closeBrowser().catch(() => {})
+  })
 
   console.log('[dsh-read-url] plugin loaded; tools read_url, read_url_links registered')
 
@@ -569,7 +604,8 @@ export function apply(ctx, config) {
       'use mode="markdown" for structured Markdown (headings/links/tables preserved). ' +
       'Returns a compact text block (title, metadata, truncated body). ' +
       'Repeated reads within 5 minutes are served from cache. ' +
-      'For reading articles, docs and news pages. Not for login-walled or JS-rendered pages.',
+      'Handles JS-rendered (SPA) pages when playwright is installed in the DSH profile; ' +
+      'login-walled pages are not accessible.',
     parameters: {
       type: 'object',
       additionalProperties: false,

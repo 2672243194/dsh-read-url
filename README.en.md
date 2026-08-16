@@ -85,6 +85,7 @@ Plugin-level config is overridable via the profile's `cordis.patch.yml` (default
     maxBytes: 3145728     # response body cap (bytes)
     maxChars: 6000        # default body truncation
     maxLinks: 20          # read_url_links default count
+    spaRender: true       # SPA rendering enhancement (needs playwright installed; degrades with a hint otherwise)
     userAgent: '...'      # request UA
 ```
 
@@ -132,13 +133,14 @@ const results = await Promise.all([
 - **Extraction**: prefers `<article>` / `role="main"`, strips `nav/footer/header/aside/form/iframe` and ad-like containers, heuristic fallback to `<body>`;
 - **Markdown**: self-written lightweight tag state machine (headings/paragraphs/lists/blockquotes/code/tables/inline bold-italic-links), zero deps;
 - **Safety**: http/https only; no page scripts executed; responses over 3 MB rejected; 15s timeout; structured errors (HTTP status / timeout / unsupported type);
-- **Optional enhancement (Firefox Reader Mode algorithm)**: run `npm i @mozilla/readability happy-dom` in the DSH profile directory to auto-enable `@mozilla/readability` (MPL-2.0, referenced unmodified) for higher-quality extraction; falls back to the built-in heuristic when not installed — the core stays zero-dependency;
-- **Boundaries**: login-walled and JS-rendered (SPA) pages can't be read — the shared boundary of all similar plugins.
+- **Optional enhancement 1 (Firefox Reader Mode algorithm)**: run `npm i @mozilla/readability happy-dom` in the DSH profile directory to auto-enable `@mozilla/readability` (MPL-2.0, referenced unmodified) for higher-quality extraction; falls back to the built-in heuristic when not installed — the core stays zero-dependency;
+- **Optional enhancement 2 (SPA page rendering)**: run `npm i playwright && npx playwright install chromium` in the DSH profile directory to auto-enable it. When the extracted body is empty and the page is script-heavy (likely Vue/React client-rendered), the plugin automatically renders it with headless Chromium before extracting (a `rendered` flag tells the model); when not installed it degrades with a clear install hint, never errors — the core stays zero-dependency;
+- **Boundaries**: login-walled pages can't be read; SPA pages need the Playwright enhancement to be rendered (a clear hint is returned when it isn't installed).
 
 ## Roadmap
 
 - [x] Single-page continuation (`offset` parameter)
-- [ ] On-demand SPA rendering (optional Playwright integration)
+- [x] On-demand SPA rendering (optional Playwright enhancement, auto-enabled once the browser is installed)
 
 ## Development
 

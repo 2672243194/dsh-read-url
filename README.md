@@ -87,6 +87,7 @@ npx @deepseek-ai/dsh plugin --profile web add ./dsh-read-url
     maxBytes: 3145728     # 响应体上限（字节）
     maxChars: 6000        # 默认正文截断
     maxLinks: 20          # read_url_links 默认条数
+    spaRender: true       # SPA 渲染增强（需 playwright 已安装，未装自动降级提示）
     userAgent: '...'      # 请求 UA
 ```
 
@@ -134,13 +135,14 @@ const results = await Promise.all([
 - **正文提取**：优先 `<article>` / `role="main"`，剥离 `nav/footer/header/aside/form/iframe` 及广告类容器，启发式回归到 `<body>`；
 - **Markdown**：自研轻量标签状态机（标题/段落/列表/引用/代码块/表格/行内加粗斜体链接），零依赖；
 - **安全**：仅 http/https；不执行页面脚本；响应超 3MB 拒绝；15s 超时；错误信息结构化返回（HTTP 状态/超时/类型不支持）；
-- **可选增强（Firefox Reader Mode 算法）**：在 DSH profile 目录执行 `npm i @mozilla/readability happy-dom` 后自动启用，正文提取升级为 `@mozilla/readability`（MPL-2.0，引用不改写），未安装时回退内置启发式提取器，核心保持零依赖；
-- **边界**：登录墙、JS 动态渲染（SPA）页面无法读取——这是同类插件的共同边界。
+- **可选增强一（Firefox Reader Mode 算法）**：在 DSH profile 目录执行 `npm i @mozilla/readability happy-dom` 后自动启用，正文提取升级为 `@mozilla/readability`（MPL-2.0，引用不改写），未安装时回退内置启发式提取器，核心保持零依赖；
+- **可选增强二（SPA 页面渲染）**：在 DSH profile 目录执行 `npm i playwright && npx playwright install chromium` 后自动启用。检测到正文为空且页面脚本密集（疑似 Vue/React 客户端渲染）时，自动用无头 Chromium 渲染后再提取（`rendered` 标记告知模型），未安装时优雅提示安装方法、不报错——核心保持零依赖；
+- **边界**：登录墙页面无法读取；SPA 页面需安装 Playwright 增强后渲染读取（未安装时返回明确提示）。
 
 ## Roadmap
 
 - [x] 单页多段续读（`offset` 参数）
-- [ ] SPA 页面按需渲染（接入 Playwright，保持可选）
+- [x] SPA 页面按需渲染（可选 Playwright 增强，装浏览器后自动启用）
 
 ## 开发
 
