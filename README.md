@@ -84,6 +84,21 @@ npx @deepseek-ai/dsh plugin --profile web add ./dsh-read-url
 - 并发 4 限制（防目标站限流），单页失败**不影响其他页**（结果里标注 `[失败]` + 原因）；
 - 复用 `read_url` 的全部能力与缓存：编码识别、正文净化、SPA 渲染、5 分钟缓存（重复批量读直接命中）。
 
+**`read_url_site(url, maxPages?, maxDepth?, includeContent?, maxCharsPerPage?)`** — 整站递归爬取：从入口 URL 出发，BFS 发现同域名页面，返回紧凑站点地图
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `url` | string | 必填 | http(s) 入口 URL |
+| `maxPages` | number | 15 | 最多爬取页数（2–50，防 token 爆炸） |
+| `maxDepth` | number | 2 | 最大链接深度（1–5） |
+| `includeContent` | boolean | `false` | 每页附短正文摘要（默认关——结构优先，省 token） |
+| `maxCharsPerPage` | number | 500 | includeContent 时每页摘要长度（200–2000） |
+
+- **只爬同域名**；登录/API/静态资源路径自动跳过；URL 去重（去 fragment）；
+- 并发 2 对目标站友好；单页失败记录 `[失败]` 不影响整体；
+- 输出为缩进树：`[深度] 标题 (字符数) URL`；
+- **不做 SPA 渲染**（整站是轻量批量抓取，渲染每页 1s+ 太慢）——SPA 页请用 `read_url` 单读。
+
 **`read_url_links(url, limit?)`** — 只列出页面链接清单，不返回正文（更轻，适合找来源/摸站点结构）
 
 | 参数 | 类型 | 默认 | 说明 |
@@ -160,12 +175,12 @@ const results = await Promise.all([
 - [x] 单页多段续读（`offset` 参数）
 - [x] SPA 页面按需渲染（可选 Playwright 增强，装浏览器后自动启用）
 - [x] 批量读取（`read_url_batch`）
-- [ ] 整站递归爬取（入口 URL 自动发现站内链接逐页爬取，汇总站点结构）
+- [x] 整站递归爬取（`read_url_site`）
 
 ## 开发
 
 ```bash
-node test.mjs          # 零依赖自测（转码/提取/Markdown/截断/批量/缓存隔离）
+node test.mjs          # 零依赖自测（转码/提取/Markdown/截断/批量/站点爬取/缓存隔离）
 
 # SPA 渲染真实测试（需 playwright 已安装，未装自动 SKIP）
 node test-spa.mjs      # 10 断言：JS 正文/渲染后链接/工具不崩溃/缓存隔离

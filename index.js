@@ -731,6 +731,165 @@ function readUrlBatchTool(ctx, cfg) {
   }
 }
 
+function normalizeUrl(url) {
+  try {
+    const u = new URL(url)
+    u.hash = ''
+    return u.href
+  } catch {
+    return null
+  }
+}
+
+// b is a bare hostname (hostOf() output) — must NOT be passed to new URL()
+// as a full URL (that throws and would make every link look external).
+function sameHost(a, b) {
+  try {
+    return new URL(a).hostname === b
+  } catch {
+    return false
+  }
+}
+
+// URLs not worth crawling: static assets, login/auth paths, feeds, sitemaps.
+const NOISE_EXT = /\.(png|jpe?g|gif|svg|webp|ico|bmp|css|js|json|xml|pdf|zip|gz|tar|7z|mp3|mp4|avi|mov|webm|woff2?|ttf|eot|map)(\?|#|$)/i
+const NOISE_PATH = /(\/login|\/signin|\/register|\/logout|\/signup|\/api\/|\/admin|\/wp-admin|\/wp-login|\/feed|\/rss|\/sitemap|\/robots\.txt|\/cdn-cgi)/i
+function isNoiseUrl(url) {
+  return NOISE_EXT.test(url) || NOISE_PATH.test(url)
+}
+
+// BFS crawl of a single site. Only same-host http(s) pages are followed;
+// static assets / auth paths are skipped; visited URLs are deduped; a per-page
+// failure is recorded and does not abort the crawl. No SPA rendering here —
+// that is read_url's job; crawling favors speed and breadth.
+async function crawlSite(entryUrl, cfg, opts, externalSignal) {
+  const { maxPages, maxDepth, includeContent, perMax } = opts
+  const host = hostOf(entryUrl)
+  const visited = new Set()
+  const pages = []
+  const failures = []
+  const queue = [{ url: entryUrl, depth: 0 }]
+  while (queue.length && pages.length < maxPages) {
+    // Never overshoot the page budget within a batch round.
+    const batch = queue.splice(0, Math.min(2, maxPages - pages.length, queue.length))
+    const results = await Promise.all(
+      batch.map(async ({ url, depth }) => {
+        const norm = normalizeUrl(url)
+        if (!norm || visited.has(norm)) return null
+        visited.add(norm)
+        const page = await fetchPage(url, externalSignal, cfg)
+        if (page.error) return { url, depth, error: page.error }
+        const html = decodeBuffer(page.buffer, page.contentType).text
+        const ex = extract(html, 'text')
+        const links = extractLinks(html, 100, page.finalUrl || url)
+        return {
+          url: page.finalUrl || url,
+          depth,
+          title: ex.title || '',
+          chars: ex.text.length,
+          text: includeContent ? smartTruncate(ex.text, perMax).text : undefined,
+          links,
+        }
+      }),
+    )
+    for (const r of results) {
+      if (!r) continue
+      if (r.error) {
+        failures.push({ url: r.url, error: r.error })
+        continue
+      }
+      pages.push(r)
+      if (r.depth + 1 <= maxDepth) {
+        for (const l of r.links) {
+          if (!sameHost(l.url, host) || isNoiseUrl(l.url)) continue
+          const n = normalizeUrl(l.url)
+          if (n && !visited.has(n)) queue.push({ url: l.url, depth: r.depth + 1 })
+        }
+      }
+    }
+  }
+  return { host, pages, failures }
+}
+
+function renderSite(value) {
+  if (typeof value === 'string') return value
+  const v = value || {}
+  if (v.error) return `Error: ${v.error}`
+  const lines = [`站点: ${v.host} · 爬取 ${v.succeeded}/${v.total} 页${v.failed ? ` · ${v.failed} 页失败` : ''}`]
+  for (const p of v.pages) {
+    const indent = '  '.repeat(p.depth)
+    const head = p.title || p.url
+    lines.push(`${indent}[${p.depth}] ${head} (${p.chars} 字符)  ${p.url}`)
+    if (p.text) lines.push(`${indent}   ${p.text.slice(0, 80)}`)
+  }
+  for (const f of v.failures) lines.push(`[失败] ${f.url} — ${f.error}`)
+  return lines.join('\n')
+}
+
+function readUrlSiteTool(ctx, cfg) {
+  return {
+    name: 'read_url_site',
+    description:
+      'Crawl a website starting from one URL: discover same-host pages breadth-first, dedupe, and return a compact site map (title + depth + size per page). ' +
+      'Only same-domain http(s) pages are followed; login/auth paths and static assets are skipped; depth and page-count are capped to bound output. ' +
+      'Per-page failures are isolated and listed at the end. ' +
+      'Use includeContent=true to attach a short body summary per page (default off to save tokens). ' +
+      'For mapping a site structure or finding what pages exist. Does not render SPA pages (use read_url for that).',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        url: { type: 'string', description: 'http(s) entry URL of the site to crawl' },
+        maxPages: { type: 'number', description: 'Max pages to crawl (range 2-50, default 15)' },
+        maxDepth: { type: 'number', description: 'Max link depth from the entry page (range 1-5, default 2)' },
+        includeContent: { type: 'boolean', description: 'Also return a short body summary per page (default false — structure only, token-efficient)' },
+        maxCharsPerPage: { type: 'number', description: 'Summary length per page when includeContent=true (range 200-2000, default 500)' },
+      },
+      required: ['url'],
+    },
+    timeoutMs: 120000,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        properties: {
+          host: { type: 'string' },
+          total: { type: 'number' },
+          succeeded: { type: 'number' },
+          failed: { type: 'number' },
+          pages: { type: 'array', items: { type: 'object' } },
+          failures: { type: 'array', items: { type: 'object' } },
+          error: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: renderSite(value) }],
+    },
+    async execute(args, exec) {
+      const url = String(args.url || '').trim()
+      if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
+      const maxPages = Math.max(2, Math.min(50, Number(args.maxPages) || 15))
+      const maxDepth = Math.max(1, Math.min(5, Number(args.maxDepth) || 2))
+      const includeContent = args.includeContent === true
+      const perMax = Math.max(200, Math.min(2000, Number(args.maxCharsPerPage) || 500))
+      const { host, pages, failures } = await crawlSite(
+        url, cfg, { maxPages, maxDepth, includeContent, perMax }, exec && exec.signal,
+      )
+      return {
+        host,
+        total: pages.length + failures.length,
+        succeeded: pages.length,
+        failed: failures.length,
+        pages: pages.map((p) => {
+          const o = { url: p.url, depth: p.depth, title: p.title || '', chars: p.chars }
+          if (p.text) o.text = p.text
+          return o
+        }),
+        failures,
+      }
+    },
+  }
+}
+
 export function apply(ctx, config) {
   // Plugin-level config from cordis.patch.yml (config row), merged over defaults.
   const cfg = { ...DEFAULTS, ...(config || {}) }
@@ -741,7 +900,7 @@ export function apply(ctx, config) {
     closeBrowser().catch(() => {})
   })
 
-  console.log('[dsh-read-url] plugin loaded; tools read_url, read_url_batch, read_url_links registered')
+  console.log('[dsh-read-url] plugin loaded; tools read_url, read_url_batch, read_url_links, read_url_site registered')
 
   ctx.tools.register({
     name: 'read_url',
@@ -795,4 +954,5 @@ export function apply(ctx, config) {
 
   ctx.tools.register(readLinksTool(ctx, cfg))
   ctx.tools.register(readUrlBatchTool(ctx, cfg))
+  ctx.tools.register(readUrlSiteTool(ctx, cfg))
 }

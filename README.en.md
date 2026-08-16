@@ -81,6 +81,21 @@ Read https://docs.example.org/guide in markdown mode
 - Concurrency capped at 4 (avoids rate-limiting); a failing page is **isolated** (`[失败]` + reason in the output) and does not affect the others;
 - Reuses every `read_url` capability and the session cache (encoding, cleaning, SPA rendering, 5-min cache — repeat batches hit the cache).
 
+**`read_url_site(url, maxPages?, maxDepth?, includeContent?, maxCharsPerPage?)`** — recursive site crawl: BFS from the entry URL across same-host pages, returns a compact site map
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `url` | string | required | http(s) entry URL |
+| `maxPages` | number | 15 | Max pages to crawl (2–50; bounds output) |
+| `maxDepth` | number | 2 | Max link depth from entry (1–5) |
+| `includeContent` | boolean | `false` | Attach a short body summary per page (default off — structure first, token-efficient) |
+| `maxCharsPerPage` | number | 500 | Summary length per page when includeContent=true (200–2000) |
+
+- **Same-host only**; login/API/static-asset paths are skipped; URLs deduped (fragment stripped);
+- Concurrency 2 (gentle on the target site); per-page failures recorded as `[失败]` without aborting;
+- Output is an indented tree: `[depth] title (chars) URL`;
+- **No SPA rendering here** (crawling favors speed/breadth) — use `read_url` for JS-only pages.
+
 **`read_url_links(url, limit?)`** — list the page's links without returning body text (lighter; good for sourcing / mapping a site)
 
 | Param | Type | Default | Description |
@@ -156,6 +171,8 @@ const results = await Promise.all([
 
 - [x] Single-page continuation (`offset` parameter)
 - [x] On-demand SPA rendering (optional Playwright enhancement, auto-enabled once the browser is installed)
+- [x] Batch reading (`read_url_batch`)
+- [x] Recursive site crawl (`read_url_site`)
 
 ## Development
 

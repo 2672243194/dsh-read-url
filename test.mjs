@@ -286,6 +286,84 @@ console.log('read_url_batch (local server, real fetch)')
   server.close()
 }
 
+console.log('read_url_site (local multi-page site, real fetch)')
+{
+  // Small local site: / links to /a, /b and an external + noise links;
+  // /a links deeper to /c; /broken 404s. Tests scope/dedup/noise/max/depth.
+  const http = await import('node:http')
+  const page = (title, body, extra = '') =>
+    `<html><head><title>${title}</title></head><body><h1>${title}</h1><p>${body}</p>${extra}</body></html>`
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    if (req.url === '/') res.end(page('首页', '站点入口页。', '<a href="/a">去A</a> <a href="/b">去B</a> <a href="https://external.com/x">站外</a> <a href="/login">登录(噪音)</a> <a href="/logo.png">图片(噪音)</a>'))
+    else if (req.url === '/a') res.end(page('页面A', 'A 的内容。', '<a href="/c">去C</a> <a href="/">回首页</a>'))
+    else if (req.url === '/b') res.end(page('页面B', 'B 的内容。', '<a href="/">回首页</a>'))
+    else if (req.url === '/c') res.end(page('页面C', 'C 的内容，在深度2。', '<a href="/b">去B</a>'))
+    else if (req.url === '/login') res.end(page('登录', '登录页'))
+    else { res.statusCode = 404; res.end('<html><body>not found</body></html>') }
+  })
+  await new Promise((r) => server.listen(18096, r))
+  const tools = []
+  m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }, {})
+  const site = tools.find((t) => t.name === 'read_url_site')
+  assert.ok(site, 'read_url_site tool registered')
+  const base = 'http://127.0.0.1:18096'
+
+  {
+    // Default: maxPages 15, depth 2. Discovers /, /a, /b, /c; skips external,
+    // /login (noise), /logo.png (noise); /broken is not linked so never hit.
+    const r = await site.execute({ url: `${base}/`, includeContent: true })
+    assert.equal(r.error, undefined, `no error: ${JSON.stringify(r).slice(0, 120)}`)
+    const urls = r.pages.map((p) => p.url)
+    assert.ok(urls.includes(`${base}/`), `entry crawled: ${urls.join(',')}`)
+    assert.ok(urls.includes(`${base}/a`) && urls.includes(`${base}/b`), 'siblings crawled')
+    assert.ok(urls.includes(`${base}/c`), 'depth-2 page crawled')
+    assert.ok(!urls.some((u) => u.includes('external.com')), 'external link not followed')
+    assert.ok(!urls.some((u) => u.includes('/login')), 'auth noise path skipped')
+    assert.ok(!urls.some((u) => u.includes('.png')), 'asset noise skipped')
+    assert.equal(r.failed, 0)
+    const pageC = r.pages.find((p) => p.url.endsWith('/c'))
+    assert.equal(pageC.depth, 2)
+    const home = r.pages.find((p) => p.url === `${base}/`)
+    assert.ok(home.text && home.text.length > 0, 'includeContent attaches summary')
+    const text = site.output.render(null, r)[0].text
+    assert.ok(text.includes('爬取 4/4 页'), `render summary: ${text.slice(0, 40)}`)
+    assert.ok(text.includes('[2] 页面C'), 'render shows depth')
+    passed++
+    console.log('  ok - site crawl: scope/dedup/noise/depth/includeContent/render')
+  }
+
+  {
+    // maxPages cap: force a tiny cap so the crawl stops early.
+    const r = await site.execute({ url: `${base}/`, maxPages: 2 })
+    assert.ok(r.succeeded <= 2, `capped at maxPages: ${r.succeeded}`)
+    assert.equal(r.total, r.succeeded, 'no failures in capped run')
+    passed++
+    console.log('  ok - site crawl honors maxPages')
+  }
+
+  {
+    // maxDepth=1: entry + direct links only, no /c.
+    const r = await site.execute({ url: `${base}/`, maxDepth: 1 })
+    assert.ok(!r.pages.some((p) => p.url.endsWith('/c')), 'depth cap stops at 1')
+    assert.ok(r.pages.some((p) => p.url.endsWith('/b')), 'direct links crawled')
+    passed++
+    console.log('  ok - site crawl honors maxDepth')
+  }
+
+  {
+    // Failure isolation: entry that 404s is recorded, not fatal.
+    const r = await site.execute({ url: `${base}/broken`, maxPages: 5 })
+    assert.equal(r.succeeded, 0)
+    assert.equal(r.failed, 1)
+    assert.ok(r.failures[0].url.endsWith('/broken'), 'failure recorded with url')
+    passed++
+    console.log('  ok - site crawl isolates failures')
+  }
+
+  server.close()
+}
+
 console.log(`\n${passed} assertions passed`)
 // All assertions are synchronous or top-level awaited; reaching here means every
 // one passed, so force a clean exit (avoids environment-specific exit-code noise).

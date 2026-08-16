@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.0] - 2026-08-16
+
+### 新增（Roadmap 收官）
+
+- **`read_url_site`** — 整站递归爬取（BFS）：从入口 URL 发现同域名页面，返回紧凑站点地图
+  - 只爬同域名；登录/API/静态资源路径自动跳过（`isNoiseUrl`）；URL 去重（去 fragment）
+  - `maxPages`（2–50，默认 15）/ `maxDepth`（1–5，默认 2）双重上限防 token 爆炸；**batch 轮次不超发页数预算**
+  - `includeContent` 附每页摘要（默认关，结构优先省 token）；输出缩进树 `[深度] 标题 (字符数) URL`
+  - 并发 2 对目标站友好；单页失败 `[失败]` 隔离不中断
+  - **不做 SPA 渲染**（批量轻量抓取优先速度，SPA 单读用 `read_url`）
+
+### 修复
+
+- `sameHost` 对裸 hostname 误判（`new URL(hostname)` 抛错 → 所有链接被当站外）——改为 `new URL(url).hostname === hostname`
+
+### 测试
+
+- test.mjs 23 → **27 断言**（站点爬取：范围/去重/噪音跳过/深度/maxPages 上限/失败隔离/includeContent/render）；真实站点验证：阮一峰博客 8/8 页树状输出
+
 ## [0.3.4] - 2026-08-16
 
 ### 省 token 特调（核心原则复审）+ 修复
