@@ -151,6 +151,9 @@ const results = await Promise.all([
 ```bash
 node test.mjs          # 零依赖自测（转码/提取/Markdown/截断）
 
+# SPA 渲染真实测试（需 playwright 已安装，未装自动 SKIP）
+node test-spa.mjs      # 10 断言：JS 正文/渲染后链接/工具不崩溃/缓存隔离
+
 # 端到端验证（需已安装 DSH CLI）
 npx @deepseek-ai/dsh plugin --profile headless add .        # 在插件目录的上一级执行
 npx @deepseek-ai/dsh --profile headless "用 read_url 读取 https://example.com 并输出标题"

@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.2] - 2026-08-16
+
+### 修复（playwright 就绪后的真实 SPA 验证发现的 bug）
+
+- **SPA 渲染等待不足**：`renderPage` 用 `networkidle` 后立即取 DOM，但 JS 异步渲染（setTimeout/fetch 回调）常在其后完成——拿到的是渲染前占位内容。现在 networkidle 后额外等待 `SETTLE_MS=1000ms` 让 SPA 完成绘制；
+- **`read_url_links` 崩溃**：SPA 兜底分支 `const links` 被重新赋值导致 `TypeError: Assignment to constant variable`（v0.3.1 引入）。改为 `let`；
+- **缓存键不含 `includeLinks`**：先读（无链接）再读（带链接）会命中旧缓存返回空链接。缓存键加入 links 变体；
+- **相对链接被丢弃**：`extractLinks` 只匹配 `https?://` 绝对链接，页面内相对路径（`/page2`、`../x`）全部丢失——套娃入口不完整。现支持 base URL resolve 成绝对链接。
+
+### 测试
+
+- 新增 **`test-spa.mjs`**：本地起 SPA 服务（骨架 HTML + JS 异步渲染正文和链接），验证渲染触发/JS 正文/渲染后链接提取/工具不崩溃/缓存隔离——**10 断言**（需 playwright，缺失时自动 SKIP）；
+- 原有 18 断言回归通过。
+
 ## [0.3.1] - 2026-08-16
 
 ### 修复（SPA 套娃链路补全）

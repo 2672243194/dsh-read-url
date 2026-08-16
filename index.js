@@ -13,6 +13,8 @@
 //   - session-level cache, compact text render (lowest token cost)
 import { TextDecoder } from 'node:util'
 import { looksLikeSpa, renderPage, closeBrowser } from './spa.js'
+// Re-export for tests / programmatic (PTC) cleanup.
+export { closeBrowser, renderPage, looksLikeSpa } from './spa.js'
 
 export const name = 'dsh-read-url'
 export const inject = ['tools']
@@ -363,13 +365,23 @@ export function smartTruncate(text, maxChars, offset = 0) {
   }
 }
 
-function extractLinks(html, limit) {
+function extractLinks(html, limit, baseUrl) {
   const links = []
-  const re = /<a[^>]+href=["'](https?:\/\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi
+  // Accept relative hrefs too — most real pages link internally with relative
+  // paths — and resolve them against the page URL so the model can follow them.
+  const re = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi
   let m
   while ((m = re.exec(html)) && links.length < limit) {
+    const href = m[1].trim()
+    if (!href || /^(javascript|mailto|tel|data):/i.test(href)) continue
+    let url
+    try {
+      url = baseUrl ? new URL(href, baseUrl).href : new URL(href).href
+    } catch {
+      continue
+    }
     const t = textOnly(m[2])
-    if (t) links.push({ title: t.slice(0, 80), url: m[1] })
+    if (t) links.push({ title: t.slice(0, 80), url })
   }
   return links
 }
@@ -410,9 +422,10 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   const mode = args.mode === 'markdown' ? 'markdown' : 'text'
   const offset = Math.max(0, Number(args.offset) || 0)
 
-  // Cache stores the FULL extracted text keyed by url+mode, so continuation
-  // reads (offset) and different maxChars hit the same cache entry.
-  const cacheKey = `${url}|${mode}`
+  // Cache stores the FULL extracted text keyed by url+mode+includeLinks, so
+  // continuation reads (offset) and different maxChars hit the same entry —
+  // but a links-request must not be served from a links-less cached copy.
+  const cacheKey = `${url}|${mode}|${args.includeLinks ? 'links' : 'no-links'}`
   const hit = cache.get(cacheKey)
   if (hit && Date.now() - hit.time < cfg.cacheTtlMs) {
     const sliced = sliceFrom(hit.full, offset, maxChars)
@@ -485,7 +498,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     spaHint,
     // Links come from the rendered DOM when available — otherwise the SPA
     // chain (content -> links -> next page) would break for JS-only pages.
-    links: args.includeLinks ? extractLinks(renderedHtml || html, cfg.maxLinks) : undefined,
+    links: args.includeLinks ? extractLinks(renderedHtml || html, cfg.maxLinks, finalUrl) : undefined,
   }
 
   if (cache.size >= cfg.cacheMax) cache.delete(cache.keys().next().value)
@@ -583,13 +596,13 @@ function readLinksTool(ctx, cfg) {
         html = decodeBuffer(page.buffer, page.contentType).text
         finalUrl = page.finalUrl || url
       }
-      const links = extractLinks(html, limit)
+      let links = extractLinks(html, limit, finalUrl)
       // SPA fallback: a JS-only page yields no links from its static HTML;
       // render it and re-extract when the static result looks empty.
       if (links.length < 3 && cfg.spaRender !== false && looksLikeSpa(html)) {
         const rr = await renderPage(finalUrl || url, exec && exec.signal)
         if (rr.html) {
-          const rl = extractLinks(rr.html, limit)
+          const rl = extractLinks(rr.html, limit, rr.finalUrl || finalUrl)
           if (rl.length > links.length) {
             links = rl
             finalUrl = rr.finalUrl || finalUrl

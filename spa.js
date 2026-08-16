@@ -5,6 +5,11 @@
 
 let browserPromise = null
 
+// After the network goes idle, async JS (timers, deferred rendering, fetch
+// callbacks) may still be pending. networkidle alone does NOT guarantee the
+// DOM is populated — wait a beat so the SPA actually paints its content.
+const SETTLE_MS = 1000
+
 // Heuristic: a page whose HTML carries many <script> tags is likely a
 // client-rendered SPA (Vue/React) whose body lives only after JS execution.
 export function looksLikeSpa(html) {
@@ -37,6 +42,9 @@ export async function renderPage(url, externalSignal) {
   try {
     page = await browser.newPage()
     await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 })
+    // networkidle only means no in-flight requests; client-rendered content
+    // (setTimeout chains, fetch().then(render)) often lands just after it.
+    await page.waitForTimeout(SETTLE_MS)
     const html = await page.content()
     const finalUrl = page.url()
     return { html, finalUrl }
