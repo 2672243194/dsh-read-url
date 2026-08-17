@@ -5,11 +5,6 @@
 
 let browserPromise = null
 
-// After the network goes idle, async JS (timers, deferred rendering, fetch
-// callbacks) may still be pending. networkidle alone does NOT guarantee the
-// DOM is populated — wait a beat so the SPA actually paints its content.
-const SETTLE_MS = 1000
-
 // Heuristic: a page whose HTML carries many <script> tags is likely a
 // client-rendered SPA (Vue/React) whose body lives only after JS execution.
 export function looksLikeSpa(html) {
@@ -33,18 +28,27 @@ export async function renderPage(url, externalSignal) {
   try {
     browser = await getBrowser()
   } catch {
-    return {
-      error:
-        'SPA 渲染需 playwright — DSH profile 内执行 `npm i playwright && npx playwright install chromium` 后重试',
-    }
+    return { error: 'SPA 渲染需 playwright（npm i playwright && npx playwright install chromium）' }
   }
   let page
   try {
     page = await browser.newPage()
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 })
-    // networkidle only means no in-flight requests; client-rendered content
-    // (setTimeout chains, fetch().then(render)) often lands just after it.
-    await page.waitForTimeout(SETTLE_MS)
+    // 'domcontentloaded' instead of 'networkidle': heartbeat-polling sites
+    // (qq-news, juejin) never go idle and would time out at 30s. Instead wait
+    // for the DOM to stabilize (content stops growing) up to 10s — SPA paint
+    // usually lands within a couple of seconds of DOM-ready.
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    const t0 = Date.now()
+    let prevLen = -1
+    for (;;) {
+      await page.waitForTimeout(500)
+      const len = await page
+        .evaluate(() => (document.body ? document.body.innerHTML.length : 0))
+        .catch(() => -1)
+      if (Date.now() - t0 > 10000) break
+      if (len > 0 && len === prevLen) break
+      prevLen = len
+    }
     const html = await page.content()
     const finalUrl = page.url()
     return { html, finalUrl }

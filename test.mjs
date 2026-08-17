@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import * as m from './index.js'
 import { looksLikeSpa } from './spa.js'
-const { decodeBuffer, extract, smartTruncate, blockMd, inlineMd } = m
+const { decodeBuffer, extract, smartTruncate, blockMd, inlineMd, decodeTextEntities } = m
 
 let passed = 0
 function ok(name, fn) {
@@ -153,6 +153,17 @@ ok('markdown mode also strips hidden style containers', () => {
   assert.ok(!r.text.includes('.x{'))
 })
 
+console.log('entities / extended named decoding')
+ok('decodes extended named entities (dashes, quotes, symbols)', () => {
+  assert.equal(decodeTextEntities('A &mdash; B &hellip; &copy; 2026'), 'A — B … © 2026')
+  assert.equal(decodeTextEntities('&ldquo;引号&rdquo; &ensp;&ensp; &middot;'), '“引号”    ·')
+  assert.equal(decodeTextEntities('100&deg;C &plusmn; 5 &times; 3 &divide; 2'), '100°C ± 5 × 3 ÷ 2')
+  assert.equal(decodeTextEntities('&sup2; &frac12; &euro;99 &yen;100'), '² ½ €99 ¥100')
+  assert.equal(decodeTextEntities('&ndash;&rsquo;&lsquo;&raquo;&laquo;'), '–\u2019\u2018»«')
+  assert.equal(decodeTextEntities('no entities here'), 'no entities here')
+  assert.equal(decodeTextEntities('&unknownxyz;'), '&unknownxyz;')
+})
+
 console.log('config / tool registration')
 ok('apply merges config and registers both tools', () => {
   const tools = []
@@ -172,6 +183,19 @@ ok('apply merges config and registers both tools', () => {
   const links = tools.find((t) => t.name === 'read_url_links')
   assert.ok(links.parameters.properties.limit.description.includes('default from plugin config'))
   assert.ok(!links.parameters.properties.limit.description.includes('default 5'))
+})
+
+ok('tool descriptions stay compact & static (KV-cache friendly)', () => {
+  const tools = []
+  const fakeCtx = { tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }
+  m.apply(fakeCtx, {})
+  let total = 0
+  for (const t of tools) {
+    assert.ok(typeof t.description === 'string' && t.description.length > 0, `${t.name} has description`)
+    assert.ok(!t.description.includes('${'), `${t.name} description must be static (no dynamic values)`)
+    total += t.description.length
+  }
+  assert.ok(total < 1150, `4 descriptions total ${total} chars (budget 1150)`)
 })
 
 console.log('SPA detection')

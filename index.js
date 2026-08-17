@@ -120,10 +120,22 @@ async function fetchViaWebSeam(ctx, url, externalSignal) {
   }
 }
 
-// Decode common HTML entities in already-stripped text (&nbsp;/&amp;/&lt;/&gt;/
-// &quot;/&#39;/numeric). Runs AFTER tag stripping so escaped tags stay visible
-// to the stripper and only remaining text is decoded.
-const ENTITIES = { nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }
+// Decode common HTML entities in already-stripped text. Runs AFTER tag
+// stripping so escaped tags stay visible to the stripper and only remaining
+// text is decoded. Covers the numeric/hex forms plus the named entities that
+// actually show up in CJK web text (spaces, dashes, quotes, symbols) —
+// undecoded leftovers would both waste tokens and read as garbage.
+const ENTITIES = {
+  nbsp: ' ', ensp: ' ', emsp: ' ', thinsp: ' ', zwnj: '', zwj: '',
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+  ndash: '–', mdash: '—', hellip: '…', middot: '·', bull: '•',
+  lsquo: '\u2018', rsquo: '\u2019', ldquo: '\u201C', rdquo: '\u201D',
+  laquo: '«', raquo: '»', copy: '©', reg: '®', trade: '™',
+  deg: '°', plusmn: '±', times: '×', divide: '÷', micro: 'µ',
+  sect: '§', para: '¶', dagger: '†', prime: '′', Prime: '″',
+  permil: '‰', euro: '€', pound: '£', yen: '¥', cent: '¢',
+  sup2: '²', sup3: '³', frac12: '½', frac14: '¼', frac34: '¾',
+}
 export function decodeTextEntities(text) {
   if (!text.includes('&')) return text
   return text.replace(/&(?:#(\d+)|#x([0-9a-fA-F]+)|([a-z][a-z0-9]{1,7}));?/gi, (m, dec, hex, name) => {
@@ -570,10 +582,8 @@ function readLinksTool(ctx, cfg) {
   return {
     name: 'read_url_links',
     description:
-      'List the links (visible text + URL) found on a webpage, without returning body text. ' +
-      'Lighter than read_url for mapping what a page points to or finding source links. ' +
-      'Renders JS-only (SPA) pages when playwright is installed. ' +
-      'Read-only, no credentials sent.',
+      'List links (text + URL) on a page without body text — lighter than read_url ' +
+      'for mapping what a page points to. Renders SPA pages when playwright installed.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -656,7 +666,7 @@ function renderBatch(value) {
       continue
     }
     const head = p.title || p.url
-    lines.push('', `--- ${head} (${p.chars} 字符${p.cached ? ' · cached' : ''}) ---`, p.text || '(no readable content)')
+    lines.push('', `--- ${head} (${p.chars} 字符${p.cached ? ' · cached' : ''}) ---`, p.text || '(无可读内容)')
     if (Array.isArray(p.links) && p.links.length) {
       lines.push(`links: ${p.links.map((l) => l.title + ' — ' + l.url).join(' | ')}`)
     }
@@ -668,11 +678,9 @@ function readUrlBatchTool(ctx, cfg) {
   return {
     name: 'read_url_batch',
     description:
-      'Read multiple URLs in parallel and return each page\'s clean main content as a compact block. ' +
-      'Uses the same extraction as read_url (charset auto-detect, noise stripping, optional readability/SPA rendering) and the same session cache. ' +
-      'Per-page failures are isolated: one broken URL does not affect the others, and each result is tagged with its URL. ' +
-      'For research / comparison tasks that need several pages at once. ' +
-      'Max 10 URLs; per-page output capped at maxChars to keep token usage low.',
+      'Read multiple URLs in parallel, each as a compact clean-content block ' +
+      '(same extraction + session cache as read_url). Per-page failures isolated and tagged. ' +
+      'Max 10 URLs, per-page capped at maxChars. For research/comparison across pages.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -830,11 +838,10 @@ function readUrlSiteTool(ctx, cfg) {
   return {
     name: 'read_url_site',
     description:
-      'Crawl a website starting from one URL: discover same-host pages breadth-first, dedupe, and return a compact site map (title + depth + size per page). ' +
-      'Only same-domain http(s) pages are followed; login/auth paths and static assets are skipped; depth and page-count are capped to bound output. ' +
-      'Per-page failures are isolated and listed at the end. ' +
-      'Use includeContent=true to attach a short body summary per page (default off to save tokens). ' +
-      'For mapping a site structure or finding what pages exist. Does not render SPA pages (use read_url for that).',
+      'Crawl a site BFS from one URL: dedupe same-host pages, return a compact site map ' +
+      '(title + depth + size). Auth/static paths skipped; depth + page count capped; failures isolated. ' +
+      'includeContent=true attaches a short summary per page (default off, token-efficient). ' +
+      'Does not render SPA pages (use read_url for that).',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -905,13 +912,10 @@ export function apply(ctx, config) {
   ctx.tools.register({
     name: 'read_url',
     description:
-      'Fetch a webpage and return its clean main content. Auto-detects encoding (GBK/GB2312/UTF-8/Big5). ' +
-      'Default mode returns plain text capped at maxChars to keep token usage low; ' +
-      'use mode="markdown" for structured Markdown (headings/links/tables preserved). ' +
-      'Returns a compact text block (title, metadata, truncated body). ' +
-      'Repeated reads within 5 minutes are served from cache. ' +
-      'Handles JS-rendered (SPA) pages when playwright is installed in the DSH profile; ' +
-      'login-walled pages are not accessible.',
+      'Fetch a page and return its clean main content (auto charset detect). ' +
+      'text (default) = plain body capped at maxChars; markdown = headings/links/tables. ' +
+      'Compact block: title, metadata, truncated body; 5-min session cache; ' +
+      'SPA pages render when playwright installed; login walls are not accessible.',
     parameters: {
       type: 'object',
       additionalProperties: false,

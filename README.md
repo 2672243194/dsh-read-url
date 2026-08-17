@@ -157,7 +157,8 @@ const results = await Promise.all([
 4. **Compact text render** — the model sees a `title:` header + body directly, no JSON parsing; `siteName` is omitted when identical to the hostname; every status hint is one short line (truncated / cached / rendered), no verbose paragraphs;
 5. **Two-tier cache** — successful results cached per URL for 5 minutes (repeat reads hit cache: fewer network calls and fewer model retries); **failed results cached for 30 seconds** so a broken URL never triggers a re-fetch loop;
 6. **KV-cache friendly (DeepSeek cost tuning)** — tool schema/description stay **static text** (no config values embedded), so changing config never invalidates the reusable prompt prefix and KV cache keeps hitting. DeepSeek's cache-hit tokens cost about 1/10 of misses — the more stable the prefix, the cheaper the run (same analysis as the official `tool-web` docs);
-7. **Batch shares the cache** — `read_url_batch` reuses the same cache (repeat batches hit it directly) and caps each page at 3,000 chars (below the single-page 6,000) to bound total output.
+7. **Batch shares the cache** — `read_url_batch` reuses the same cache (repeat batches hit it directly) and caps each page at 3,000 chars (below the single-page 6,000) to bound total output;
+8. **Compact fixed cost** — the four tool descriptions total ~990 chars (audited by a budget assertion in tests, kept static for KV-cache); extended HTML-entity decoding (45 named entities) means leftovers like `&mdash;`/`&hellip;` never waste tokens or render as mojibake.
 
 ## Technical notes
 
@@ -166,25 +167,27 @@ const results = await Promise.all([
 - **Markdown**: self-written lightweight tag state machine (headings/paragraphs/lists/blockquotes/code/tables/inline bold-italic-links), zero deps;
 - **Safety**: http/https only; no page scripts executed; responses over 3 MB rejected; 15s timeout; structured errors (HTTP status / timeout / unsupported type);
 - **Optional enhancement 1 (Firefox Reader Mode algorithm)**: run `npm i @mozilla/readability happy-dom` in the DSH profile directory to auto-enable `@mozilla/readability` (MPL-2.0, referenced unmodified) for higher-quality extraction; falls back to the built-in heuristic when not installed — the core stays zero-dependency;
-- **Optional enhancement 2 (SPA page rendering)**: run `npm i playwright && npx playwright install chromium` in the DSH profile directory to auto-enable it. When the extracted body is empty and the page is script-heavy (likely Vue/React client-rendered), the plugin automatically renders it with headless Chromium before extracting (a `rendered` flag tells the model); when not installed it degrades with a clear install hint, never errors — the core stays zero-dependency;
+- **Optional enhancement 2 (SPA page rendering)**: run `npm i playwright && npx playwright install chromium` in the DSH profile directory to auto-enable it. When the extracted body is empty and the page is script-heavy (likely Vue/React client-rendered), the plugin automatically renders it with headless Chromium before extracting (a `rendered` flag tells the model); rendering waits for the DOM to stabilize (content stops growing) instead of `networkidle` — heartbeat-polling sites never idle, so this avoids 30s timeouts; when not installed it degrades with a clear install hint, never errors — the core stays zero-dependency;
 - **Boundaries**: login-walled pages are not readable; SPA pages need the Playwright enhancement; **structured data (e.g. which like-count belongs to which comment) is out of text-extraction scope** — this plugin flattens HTML into readable text, so exact field↔value associations are lost; for precise fields, intercept the page's actual data API (see "Real-world validation" below).
 
-## Real-world validation (2026-08-16)
+## Real-world validation (2026-08-17, v0.4.1)
+
+18-site sweep driven by `multi-site.mjs` (committed, re-runnable): **12 OK / 3 expected boundaries / 3 network-anti-bot boundaries / 0 crashes** (54s total).
 
 | Category | Sites | Result |
 |---|---|---|
-| Portal navigation cleaning | Baidu / QQ / NetEase | ✅ clean nav + hot searches, no CSS noise |
-| Multi-article aggregation | Cnblogs / Ruan Yifeng blog | ✅ 3,580+ chars across articles |
-| Encoding detection | People's Daily (UTF-8) / legacy GBK sites | ✅ correct detection, no mojibake |
-| Login wall / 404 / image / PDF | Zhihu / Baidu / W3C | ✅ clear errors (403 / 404 / type block) |
-| **SPA rendering** | Xiaoheihe / Juejin (JS-only) | ✅ `rendered` flag + post-JS body |
-| **offset continuation** | Sina News (12,359 chars) | ✅ 800→800+6000 seamless, no repeat, cache hit |
-| **Batch + failure isolation** | 3-URL mix | ✅ 2/3 ok, 403 isolated, cache reused |
-| **Site crawl** | Ruan Yifeng blog | ✅ 8/8 pages tree map |
+| Portal navigation cleaning | Baidu / QQ / NetEase / Sina / Douban / CSDN | ✅ clean text, no CSS noise |
+| SPA rendering | Bilibili / Xiaoheihe / Juejin / QQ News | ✅ `rendered` flag, post-JS body (QQ News was a 30s timeout before the networkidle fix) |
+| Multi-article aggregation | Cnblogs / Ruan Yifeng blog | ✅ 800+ chars across articles |
+| Static doc pages | MDN / Ruan Yifeng / example.com | ✅ clean extraction (example.com = short page, expected) |
+| Login wall | Zhihu / Weibo | ✅ clear content or empty (expected) |
+| Network / anti-bot boundary | Wikipedia (geo 403) / W3C (403 for Chrome UA) / GitHub (TLS-connect timeout) | ✅ diagnosed via curl comparison — not plugin defects |
+| offset continuation | Sina News (12,463 chars) | ✅ 800+800 seamless, cache hit |
+| Batch + failure isolation | 4-URL mix | ✅ 2/4 ok, failures isolated |
+| Site crawl | Ruan Yifeng blog | ✅ 5/5 pages tree map |
 
-- **27 zero-dep assertions** + **10 SPA-test assertions** all green;
+- **29 zero-dep assertions** (incl. entity decoding + description-budget guard) + **10 SPA-test assertions** all green;
 - Real case: on a Xiaoheihe post, comment like-counts (`up` field) could not be attributed from flattened text — **precise fields should come from the page's underlying data API** (e.g. `/bbs/app/link/tree` JSON). This is a shared boundary of text extractors, not a defect.
-- **Boundaries**: login-walled pages can't be read; SPA pages need the Playwright enhancement to be rendered (a clear hint is returned when it isn't installed).
 
 ## Roadmap
 
@@ -197,6 +200,8 @@ const results = await Promise.all([
 
 ```bash
 node test.mjs          # zero-dependency self-tests (charset/extract/markdown/truncate)
+node test-spa.mjs      # SPA rendering tests (10 assertions; SKIPs if playwright absent)
+node multi-site.mjs    # 18-site real-world sweep (needs network): portals/SPA/login-walls/static/anti-bot
 
 # End-to-end (requires DSH CLI)
 npx @deepseek-ai/dsh plugin --profile headless add .        # run from the parent dir of the plugin

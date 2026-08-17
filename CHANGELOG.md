@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.1] - 2026-08-17
+
+### 省 token 复审（18 站实测驱动）
+
+- **4 个工具 description 精简 ~23%**（约 1290 → 990 字符）：`read_url` 主描述删冗余引导（引擎/缓存机制细节移出），links/batch/site 同步压缩——固定开销每次调用都在，这是最大单项
+- **实体解码扩展 6 → 45 个命名实体**：`&mdash;` `&hellip;` `&ensp;` `&ldquo;` `&copy;` `&deg;` `&times;` 等不再残留——残留实体既浪费 token 又显示为乱码
+- **SPA 安装提示精简**、batch render 文案中文化（`(no readable content)` → `(无可读内容)`）
+
+### 修复（18 站实测发现）
+
+- **SPA 渲染 `networkidle` 30s 超时**（qq-news 持续轮询永不空闲 → 渲染失败）——改为 `domcontentloaded` + DOM 稳定轮询（内容停止增长即收，上限 10s）；18 站全量测试 **1m51s → 54s**，qq-news EMPTY → OK
+
+### 测试 / 验证
+
+- test.mjs 27 → **29 断言**（+实体解码 7 项、+description 预算与静态性守卫）
+- **multi-site.mjs 入库（18 站可复跑）**：12 OK / 3 预期边界（知乎·微博登录墙、example.com 简单页）/ 3 网络·反爬边界（wikipedia 地域 403、w3c 对 Chrome UA 403、github TLS 指纹超时——均 curl 对照定性，非插件 bug）；offset 续读、batch 失败隔离、site 爬取 5/5 通过
+
 ## [0.4.0] - 2026-08-16
 
 ### 新增（Roadmap 收官）
