@@ -166,28 +166,28 @@ const results = await Promise.all([
 - **编码**：HTTP `Content-Type` charset → HTML meta → BOM 三级探测，内置 `TextDecoder` 转码（Node 20+ full-icu），GB2312 归一为 GBK，检测到乱码自动回退 UTF-8；
 - **正文提取**：优先 `<article>` / `role="main"`，剥离 `nav/footer/header/aside/form/iframe` 及广告类容器，启发式回归到 `<body>`；
 - **Markdown**：自研轻量标签状态机（标题/段落/列表/引用/代码块/表格/行内加粗斜体链接），零依赖；
-- **安全**：仅 http/https；不执行页面脚本；响应超 3MB 拒绝；15s 超时；错误信息结构化返回（HTTP 状态/超时/类型不支持）；
+- **安全**：仅 http/https；不执行页面脚本；响应超 3MB 拒绝；15s 超时；错误信息结构化返回（HTTP 状态/超时/类型不支持/DNS 归因如 `getaddrinfo ENOTFOUND` vs 被墙超时）；
 - **可选增强一（Firefox Reader Mode 算法）**：在 DSH profile 目录执行 `npm i @mozilla/readability happy-dom` 后自动启用，正文提取升级为 `@mozilla/readability`（MPL-2.0，引用不改写），未安装时回退内置启发式提取器，核心保持零依赖；
 - **可选增强二（SPA 页面渲染）**：在 DSH profile 目录执行 `npm i playwright && npx playwright install chromium` 后自动启用。检测到正文为空且页面脚本密集（疑似 Vue/React 客户端渲染）时，自动用无头 Chromium 渲染后再提取（`rendered` 标记告知模型）；渲染采用 `domcontentloaded` + **DOM 稳定轮询**（内容停止增长即收，上限 10s）而非 `networkidle`——心跳轮询站永不空闲，避免 30s 超时；未安装时优雅提示安装方法、不报错——核心保持零依赖；
 - **边界**：登录墙页面无法读取；SPA 页面需安装 Playwright 增强后渲染读取（未安装时返回明确提示）；**结构化数据（如评论的点赞数归属、榜单数值）不在文本提取范围**——本插件把 HTML 扁平化为可读文本，字段与数值的精确对应关系会丢失；需要精确字段时，用 Playwright 拦截页面实际调用的数据 API 获取（见下方「真实世界验证」）。
 
-## 真实世界验证（2026-08-17，v0.4.1）
+## 真实世界验证（2026-08-18，v0.4.2）
 
-18 站全量实测（`multi-site.mjs` 已提交可复跑）：**12 OK / 3 预期边界 / 3 网络·反爬边界 / 0 崩溃**（总耗时 54s）。
+29 站全量实测（`multi-site.mjs` 已提交可复跑）：**16 OK / 3 预期边界 / 10 网络·反爬边界 / 0 崩溃**（总耗时 64s）。
 
 | 类别 | 站点 | 结果 |
 |---|---|---|
-| 门户导航净化 | 百度 / 腾讯 / 网易 / 新浪 / 豆瓣 / CSDN | ✅ 干净正文，无 CSS 噪音 |
-| **SPA 渲染** | B 站 / 小黑盒 / 掘金 / QQ 新闻 | ✅ `rendered` 标记 + JS 执行后正文（QQ 新闻在 networkidle 修复前是 30s 超时） |
+| 门户导航净化 | 百度 / 腾讯 / 网易 / 新浪 / 豆瓣 / CSDN / 搜狐 / 凤凰 | ✅ 干净正文，无 CSS 噪音 |
+| **SPA 渲染** | B 站 / 小黑盒 / 掘金 / QQ 新闻 / 少数派 | ✅ `rendered` 标记 + JS 执行后正文 |
 | 多 article 聚合 | 博客园 / 阮一峰博客 | ✅ 800+ 字符多篇聚合 |
-| 静态文档页 | MDN / 阮一峰 / example.com | ✅ 干净提取（example.com 简单页，预期） |
+| 静态文档页 | MDN / 阮一峰 / example.com / GitHub | ✅ 干净提取（example.com 简单页，预期） |
 | 登录墙 | 知乎 / 微博 | ✅ 清晰内容或空（预期） |
-| 网络·反爬边界 | 维基百科（地域 403）/ W3C（对 Chrome UA 403）/ GitHub（TLS 连接超时） | ✅ curl 对照定性，非插件缺陷 |
-| **offset 续读** | 新浪新闻（12463 字符） | ✅ 800+800 无缝衔接、命中缓存 |
+| 网络·反爬边界 | W3C（对 Chrome UA 403）；维基 / BBC / V2EX / httpbin / PDF / PNG / DNS 失败（Node 直连海外被墙，curl 走代理可达） | ✅ curl 对照定性，非插件缺陷；错误现已明确归因（ENOTFOUND vs 超时） |
+| **offset 续读** | 新浪新闻（12378 字符） | ✅ 800+800 无缝衔接、命中缓存 |
 | **批量 + 失败隔离** | 4 URL 混合 | ✅ 2/4 成功、失败隔离 |
 | **整站爬取** | 阮一峰博客 | ✅ 5/5 页树状站点地图 |
 
-- **29 个零依赖断言**（含实体解码、description 预算守卫）+ **10 个 SPA 测试断言**全绿；
+- **32 个零依赖断言**（含实体解码、description 预算守卫、链接去重、表格分隔行转义）+ **10 个 SPA 测试断言**全绿；
 - 一个真实案例：小黑盒帖子的评论点赞数（`up` 字段）无法从扁平文本确定归属——**精确字段应走页面背后的数据 API**（如 `/bbs/app/link/tree` JSON），这是同类文本提取器的共同边界，不是缺陷。
 
 ## Roadmap
@@ -205,8 +205,8 @@ node test.mjs          # 零依赖自测（转码/提取/Markdown/截断/批量/
 # SPA 渲染真实测试（需 playwright 已安装，未装自动 SKIP）
 node test-spa.mjs      # 10 断言：JS 正文/渲染后链接/工具不崩溃/缓存隔离
 
-# 18 站真实世界验证（需联网）
-node multi-site.mjs    # 门户/SPA/登录墙/静态/反爬边界，输出分级结果
+# 29 站真实世界验证（需联网）
+node multi-site.mjs    # 门户/SPA/登录墙/静态/反爬/网络边界，输出分级结果
 
 # 端到端验证（需已安装 DSH CLI）
 npx @deepseek-ai/dsh plugin --profile headless add .        # 在插件目录的上一级执行

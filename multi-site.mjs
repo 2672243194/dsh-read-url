@@ -1,7 +1,8 @@
 // multi-site.mjs — real-world multi-site verification for dsh-read-url
-// 18-site sweep across: Chinese portals / SPA / encoding / anti-bot / static /
-// structured pages. Checks extraction quality, charset detection, noise
-// filtering, SPA rendering, continuation, batch and site-crawl.
+// 29-site sweep: Chinese portals / SPA / encoding / anti-bot / static /
+// type-block (PDF/PNG) / 404 / redirect / DNS-failure / overseas sites.
+// Checks extraction quality, charset detection, noise filtering, SPA
+// rendering, continuation, batch and site-crawl.
 // Run: node multi-site.mjs
 import * as m from './index.js'
 
@@ -24,6 +25,17 @@ const SITES = [
   ['wikipedia-zh (geo/anti-bot)', 'https://zh.wikipedia.org/wiki/JavaScript'],
   ['w3c (403 for chrome UA)', 'https://www.w3.org/TR/'],
   ['github (net/tls boundary)', 'https://github.com/'],
+  ['sohu', 'https://www.sohu.com/'],
+  ['ifeng', 'https://www.ifeng.com/'],
+  ['sspai (SPA)', 'https://sspai.com/'],
+  ['v2ex (net-boundary)', 'https://www.v2ex.com/'],
+  ['bbc-zh (net-boundary)', 'https://www.bbc.com/zhongwen/simp'],
+  ['wikipedia-en (net-boundary)', 'https://en.wikipedia.org/wiki/JavaScript'],
+  ['pdf-sample (type block, net-boundary)', 'https://www.africau.edu/images/default/sample.pdf'],
+  ['httpbin-png (type block, net-boundary)', 'https://httpbin.org/image/png'],
+  ['httpbin-404 (net-boundary)', 'https://httpbin.org/status/404'],
+  ['httpbin-redirect (net-boundary)', 'https://httpbin.org/redirect/3'],
+  ['dns-fail (ENOTFOUND expected)', 'https://nonexistent-domain-xyz123.com/'],
 ]
 
 const tools = []

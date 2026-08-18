@@ -100,18 +100,27 @@ async function fetchPage(url, externalSignal, cfg) {
     if (e.name === 'AbortError' || e.name === 'TimeoutError') {
       return { error: `Timeout after ${cfg.timeoutMs}ms or cancelled` }
     }
-    return { error: `Fetch failed: ${e.message}` }
+    // undici wraps the real reason in e.cause (ENOTFOUND / ECONNREFUSED /
+    // connect-timeout / TLS) — surface it so the model can tell "bad domain"
+    // from "blocked network" and act accordingly instead of retrying blindly
+    const cause = e.cause && e.cause.message ? String(e.cause.message).slice(0, 90) : ''
+    const detail = cause || (e.message || '').slice(0, 120)
+    return { error: `Fetch failed: ${detail}` }
   }
 }
 
 // Prefer the ctx.web capability seam (official docs/capability-seams.md):
 // the web provider already decodes the document, so we skip our charset
 // layer and only re-extract. Falls back to global fetch when absent.
-async function fetchViaWebSeam(ctx, url, externalSignal) {
+// Seam calls get the same cooperative timeout as fetchPage (a hanging
+// provider should not block the tool call forever).
+async function fetchViaWebSeam(ctx, url, externalSignal, cfg) {
   const web = ctx && typeof ctx.get === 'function' ? ctx.get('web') : undefined
   if (!web || typeof web.fetch !== 'function') return null
   try {
-    const res = await web.fetch(url, { signal: externalSignal })
+    const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs)
+    const signal = externalSignal ? AbortSignal.any([externalSignal, timeoutSignal]) : timeoutSignal
+    const res = await web.fetch(url, { signal })
     if (!res || typeof res.content !== 'string') return null
     const finalUrl = res.url || res.finalUrl || url
     return { html: res.content, finalUrl }
@@ -288,7 +297,9 @@ export function blockMd(html) {
       }
       if (rows.length) {
         const header = rows[0]
-        const sep = header.replace(/[^|]/g, '-')
+        // unescape cells' escaped pipes before deriving the separator row,
+        // otherwise the --- line is one char wider per escaped pipe
+        const sep = header.replace(/\\\|/g, '|').replace(/[^|]/g, '-')
         out += `\n\n${rows.join('\n')}\n${sep}`
       }
     } else if (tag === 'a' || tag === 'strong' || tag === 'b' || tag === 'em' || tag === 'i') {
@@ -382,6 +393,7 @@ export function smartTruncate(text, maxChars, offset = 0) {
 
 function extractLinks(html, limit, baseUrl) {
   const links = []
+  const seen = new Set()
   // Accept relative hrefs too — most real pages link internally with relative
   // paths — and resolve them against the page URL so the model can follow them.
   const re = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi
@@ -395,6 +407,10 @@ function extractLinks(html, limit, baseUrl) {
     } catch {
       continue
     }
+    // dedupe: nav bars repeat the same links many times — one entry per URL
+    // keeps the link list compact (tokens) without losing coverage
+    if (seen.has(url)) continue
+    seen.add(url)
     const t = textOnly(m[2])
     if (t) links.push({ title: t.slice(0, 80), url })
   }
@@ -440,7 +456,16 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   // Cache stores the FULL extracted text keyed by url+mode+includeLinks, so
   // continuation reads (offset) and different maxChars hit the same entry —
   // but a links-request must not be served from a links-less cached copy.
-  const cacheKey = `${url}|${mode}|${args.includeLinks === true ? 'links' : 'no-links'}`
+  // The key drops the URL fragment: #sections would otherwise split the cache.
+  let cacheUrl = url
+  try {
+    const u = new URL(url)
+    u.hash = ''
+    cacheUrl = u.href
+  } catch {
+    /* keep raw url on parse failure */
+  }
+  const cacheKey = `${cacheUrl}|${mode}|${args.includeLinks === true ? 'links' : 'no-links'}`
   const hit = cache.get(cacheKey)
   if (hit) {
     // Failed fetches are cached briefly so the model doesn't re-request a
@@ -455,7 +480,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   }
 
   let html, finalUrl, charset
-  const viaSeam = await fetchViaWebSeam(ctx, url, externalSignal)
+  const viaSeam = await fetchViaWebSeam(ctx, url, externalSignal, cfg)
   if (viaSeam) {
     html = viaSeam.html
     finalUrl = viaSeam.finalUrl
@@ -611,7 +636,7 @@ function readLinksTool(ctx, cfg) {
       const url = String(args.url || '').trim()
       if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
       const limit = Math.max(1, Math.min(50, Number(args.limit) || cfg.maxLinks))
-      const viaSeam = await fetchViaWebSeam(ctx, url, exec && exec.signal)
+      const viaSeam = await fetchViaWebSeam(ctx, url, exec && exec.signal, cfg)
       let html, finalUrl
       if (viaSeam) {
         html = viaSeam.html
@@ -668,7 +693,8 @@ function renderBatch(value) {
     const head = p.title || p.url
     lines.push('', `--- ${head} (${p.chars} 字符${p.cached ? ' · cached' : ''}) ---`, p.text || '(无可读内容)')
     if (Array.isArray(p.links) && p.links.length) {
-      lines.push(`links: ${p.links.map((l) => l.title + ' — ' + l.url).join(' | ')}`)
+      const ls = p.links.map((l) => l.title + ' — ' + l.url)
+      lines.push(`links: ${ls.slice(0, 6).join(' | ')}${ls.length > 6 ? ` …共${ls.length}个` : ''}`)
     }
   }
   return lines.join('\n')

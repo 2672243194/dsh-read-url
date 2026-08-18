@@ -7,10 +7,15 @@ let browserPromise = null
 
 // Heuristic: a page whose HTML carries many <script> tags is likely a
 // client-rendered SPA (Vue/React) whose body lives only after JS execution.
+// Counts with exec() instead of match() to avoid materializing a large array
+// for multi-MB HTML (match() builds an array entry per script tag).
 export function looksLikeSpa(html) {
   if (!html) return false
-  const scripts = (html.match(/<script[\s>]/gi) || []).length
-  return scripts >= 5
+  const re = /<script[\s>]/gi
+  let n = 0
+  let m
+  while ((m = re.exec(html)) && n < 5) n++
+  return n >= 5
 }
 
 async function getBrowser() {
@@ -46,7 +51,9 @@ export async function renderPage(url, externalSignal) {
         .evaluate(() => (document.body ? document.body.innerHTML.length : 0))
         .catch(() => -1)
       if (Date.now() - t0 > 10000) break
-      if (len > 0 && len === prevLen) break
+      // stop once two consecutive reads agree — including empty bodies (a
+      // blank page should not burn the full 10s poll)
+      if (len === prevLen && prevLen >= 0) break
       prevLen = len
     }
     const html = await page.content()

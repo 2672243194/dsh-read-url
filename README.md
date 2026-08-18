@@ -165,28 +165,28 @@ const results = await Promise.all([
 - **Encoding**: three-level detection (HTTP `Content-Type` charset → HTML meta → BOM), built-in `TextDecoder` transcoding (Node 20+ full-icu), GB2312 normalized to GBK, auto-fallback to UTF-8 on mojibake;
 - **Extraction**: prefers `<article>` / `role="main"`, strips `nav/footer/header/aside/form/iframe` and ad-like containers, heuristic fallback to `<body>`;
 - **Markdown**: self-written lightweight tag state machine (headings/paragraphs/lists/blockquotes/code/tables/inline bold-italic-links), zero deps;
-- **Safety**: http/https only; no page scripts executed; responses over 3 MB rejected; 15s timeout; structured errors (HTTP status / timeout / unsupported type);
+- **Safety**: http/https only; no page scripts executed; responses over 3 MB rejected; 15s timeout; structured errors (HTTP status / timeout / unsupported type / DNS cause such as `getaddrinfo ENOTFOUND` vs blocked-network timeout);
 - **Optional enhancement 1 (Firefox Reader Mode algorithm)**: run `npm i @mozilla/readability happy-dom` in the DSH profile directory to auto-enable `@mozilla/readability` (MPL-2.0, referenced unmodified) for higher-quality extraction; falls back to the built-in heuristic when not installed — the core stays zero-dependency;
 - **Optional enhancement 2 (SPA page rendering)**: run `npm i playwright && npx playwright install chromium` in the DSH profile directory to auto-enable it. When the extracted body is empty and the page is script-heavy (likely Vue/React client-rendered), the plugin automatically renders it with headless Chromium before extracting (a `rendered` flag tells the model); rendering waits for the DOM to stabilize (content stops growing) instead of `networkidle` — heartbeat-polling sites never idle, so this avoids 30s timeouts; when not installed it degrades with a clear install hint, never errors — the core stays zero-dependency;
 - **Boundaries**: login-walled pages are not readable; SPA pages need the Playwright enhancement; **structured data (e.g. which like-count belongs to which comment) is out of text-extraction scope** — this plugin flattens HTML into readable text, so exact field↔value associations are lost; for precise fields, intercept the page's actual data API (see "Real-world validation" below).
 
-## Real-world validation (2026-08-17, v0.4.1)
+## Real-world validation (2026-08-18, v0.4.2)
 
-18-site sweep driven by `multi-site.mjs` (committed, re-runnable): **12 OK / 3 expected boundaries / 3 network-anti-bot boundaries / 0 crashes** (54s total).
+29-site sweep driven by `multi-site.mjs` (committed, re-runnable): **16 OK / 3 expected boundaries / 10 network boundaries / 0 crashes** (64s total).
 
 | Category | Sites | Result |
 |---|---|---|
-| Portal navigation cleaning | Baidu / QQ / NetEase / Sina / Douban / CSDN | ✅ clean text, no CSS noise |
-| SPA rendering | Bilibili / Xiaoheihe / Juejin / QQ News | ✅ `rendered` flag, post-JS body (QQ News was a 30s timeout before the networkidle fix) |
+| Portal navigation cleaning | Baidu / QQ / NetEase / Sina / Douban / CSDN / Sohu / Ifeng | ✅ clean text, no CSS noise |
+| SPA rendering | Bilibili / Xiaoheihe / Juejin / QQ News / SSPAI | ✅ `rendered` flag, post-JS body (QQ News was a 30s timeout before the networkidle fix) |
 | Multi-article aggregation | Cnblogs / Ruan Yifeng blog | ✅ 800+ chars across articles |
-| Static doc pages | MDN / Ruan Yifeng / example.com | ✅ clean extraction (example.com = short page, expected) |
+| Static doc pages | MDN / Ruan Yifeng / example.com / GitHub | ✅ clean extraction (example.com = short page, expected) |
 | Login wall | Zhihu / Weibo | ✅ clear content or empty (expected) |
-| Network / anti-bot boundary | Wikipedia (geo 403) / W3C (403 for Chrome UA) / GitHub (TLS-connect timeout) | ✅ diagnosed via curl comparison — not plugin defects |
-| offset continuation | Sina News (12,463 chars) | ✅ 800+800 seamless, cache hit |
+| Network / anti-bot boundary | W3C (403 for Chrome UA); Wikipedia / BBC / V2EX / httpbin / PDF / PNG / DNS-fail (Node direct-to-overseas blocked — curl via proxy reaches them) | ✅ diagnosed via curl comparison; errors now attribute the cause (`getaddrinfo ENOTFOUND` vs timeout) — not plugin defects |
+| offset continuation | Sina News (12,378 chars) | ✅ 800+800 seamless, cache hit |
 | Batch + failure isolation | 4-URL mix | ✅ 2/4 ok, failures isolated |
 | Site crawl | Ruan Yifeng blog | ✅ 5/5 pages tree map |
 
-- **29 zero-dep assertions** (incl. entity decoding + description-budget guard) + **10 SPA-test assertions** all green;
+- **32 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping) + **10 SPA-test assertions** all green;
 - Real case: on a Xiaoheihe post, comment like-counts (`up` field) could not be attributed from flattened text — **precise fields should come from the page's underlying data API** (e.g. `/bbs/app/link/tree` JSON). This is a shared boundary of text extractors, not a defect.
 
 ## Roadmap
@@ -201,7 +201,7 @@ const results = await Promise.all([
 ```bash
 node test.mjs          # zero-dependency self-tests (charset/extract/markdown/truncate)
 node test-spa.mjs      # SPA rendering tests (10 assertions; SKIPs if playwright absent)
-node multi-site.mjs    # 18-site real-world sweep (needs network): portals/SPA/login-walls/static/anti-bot
+node multi-site.mjs    # 29-site real-world sweep (needs network): portals/SPA/login-walls/static/anti-bot/net-boundaries
 
 # End-to-end (requires DSH CLI)
 npx @deepseek-ai/dsh plugin --profile headless add .        # run from the parent dir of the plugin

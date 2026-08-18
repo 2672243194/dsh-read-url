@@ -114,6 +114,14 @@ ok('escapes special chars in plain text', () => {
   assert.equal(inlineMd('a *b* and `c`'), 'a \\*b\\* and \\`c\\`')
 })
 
+ok('table separator row handles escaped pipes', () => {
+  const md = blockMd('<table><tr><th>a|b</th><th>c</th></tr><tr><td>1</td><td>2</td></tr></table>')
+  const lines = md.trim().split('\n')
+  const last = lines[lines.length - 1]
+  assert.ok(last.includes('|'), `separator line present: ${last}`)
+  assert.ok(!last.includes('\\'), `separator must not carry escaped-pipe backslashes: ${last}`)
+})
+
 console.log('noise stripping / hidden containers')
 ok('removes entity-escaped style inside textarea (baidu pattern)', () => {
   const html = '<html><head><title>测试</title></head><body><textarea id="s_is_result_css" style="display:none;">&lt;style data-for=&quot;result&quot;&gt;html{font-size:100px}body{color:#333}.foo{color:red}&lt;/style&gt;</textarea><article><h1>真标题</h1><p>真实正文段落。</p></article></body></html>'
@@ -204,6 +212,12 @@ ok('detects script-heavy SPA skeleton', () => {
   assert.equal(looksLikeSpa(spa), true)
 })
 
+ok('threshold: 5 scripts needed, 4 is not SPA', () => {
+  assert.equal(looksLikeSpa('<script src="/a.js"></script>'.repeat(4)), false)
+  assert.equal(looksLikeSpa('<script src="/a.js"></script>'.repeat(5)), true)
+  assert.equal(looksLikeSpa('no scripts here'), false)
+})
+
 ok('does not flag normal pages as SPA', () => {
   const normal = '<html><body><article><h1>Title</h1><p>Body text.</p></article><script src="/s.js"></script></body></html>'
   assert.equal(looksLikeSpa(normal), false)
@@ -235,6 +249,21 @@ ok('does not flag normal pages as SPA', () => {
   assert.equal(r.count, 0, 'static SPA skeleton has no links; fallback hint path taken')
   passed++
   console.log('  ok - read_url_links on SPA page falls back to static links')
+}
+
+{
+  // extractLinks dedupe: repeated URLs (nav bars) must collapse to one entry
+  const html = '<html><body><a href="/page1">一</a><a href="/page1">二</a><a href="/page1">三</a><a href="/page2">四</a><a href="/page2">五</a></body></html>'
+  const fakeSeam = { fetch: async (u) => ({ content: html, url: u }) }
+  const fakeCtx = { tools: { register: () => {} }, effect: () => {}, get: (k) => (k === 'web' ? fakeSeam : undefined) }
+  const tools = []
+  m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: fakeCtx.get }, {})
+  const linksTool = tools.find((t) => t.name === 'read_url_links')
+  const r = await linksTool.execute({ url: 'https://dup.example.com' })
+  assert.equal(r.count, 2, `duplicate URLs must be deduped, got ${r.count}`)
+  assert.ok(r.links.every((l) => l.url.includes('page1') || l.url.includes('page2')))
+  passed++
+  console.log('  ok - read_url_links dedupes repeated URLs')
 }
 
 console.log('read_url_batch (local server, real fetch)')

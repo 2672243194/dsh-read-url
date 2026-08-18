@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.4.2] - 2026-08-18
+
+### 性能
+
+- **looksLikeSpa 计数优化**：`match()` 建大数组 → `exec()` 循环计数（多 MB HTML 不再为每个 script 标签分配数组项）
+- **SPA 空页轮询提前退出**：DOM 稳定检测改为"连续两次一致即停"（含空 body）——空白页不再白等满 10 秒
+- **ctx.web seam 调用加协作超时**：官方 provider 挂起不再阻塞工具调用（与 fetchPage 同款 `timeoutMs` 约束）
+
+### 修复 / 省 token
+
+- **extractLinks URL 去重**：导航栏重复链接只保留一条（链接列表更紧凑，token 更省，覆盖不减）
+- **缓存键去除 URL fragment**：`#锚点` 不再分裂缓存（续读命中率提升）
+- **fetch 错误明确归因**：提取 undici `e.cause`——DNS 失败显示 `getaddrinfo ENOTFOUND`、被墙站显示超时，模型能区分"域名不存在"与"网络被阻断"，不再盲目重试；错误信息截断 ≤120 字符
+- **blockMd 表格分隔行转义修复**：含 `|` 的表头单元格不再让 `---` 分隔行带反斜杠
+- **batch render 链接截断**：每页 links 最多内联 6 条 + `…共 N 个`
+
+### 测试 / 验证
+
+- test.mjs 29 → **32 断言**（SPA 阈值 4/5 边界、链接去重、表格分隔行转义）
+- **multi-site.mjs 扩展 18 → 29 站**：新增门户（搜狐/凤凰）、SPA（少数派）、海外与边界站（BBC-中文/维基英文/httpbin 404·重定向·PNG/PDF 类型拦截/DNS 失败）
+- 29 站实测：**16 OK / 3 预期边界 / 10 环境网络边界 / 0 崩溃**（64s）；海外站 Node 直连被墙（curl 走代理可达）为环境限制非插件缺陷，错误信息现已明确归因；site crawl 阮一峰 5/5
+- **海外站专项验证（08-18）**：curl 走 7897 代理拉取 BBC 中文（427KB）/V2EX（107KB）真实 HTML 后，本地提取管线输出 4112 / 6422 字符干净正文——**提取逻辑对海外站完全正常**，失败根因仅为 Node fetch 直连被墙（`NODE_USE_ENV_PROXY` 在 Node 22/24 均实测无效，不引入代理，网络通道由 DSH 官方 ctx.web seam 负责）；Wikipedia 代理 IP 被限流（403 Too Many Reqs）
+
 ## [0.4.1] - 2026-08-17
 
 ### 省 token 复审（18 站实测驱动）
