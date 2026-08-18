@@ -459,7 +459,7 @@ function sliceFrom(full, offset, maxChars) {
 }
 
 export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
-  const url = String(args.url || '').trim()
+  const url = String((args && args.url) || '').trim()
   if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
   const maxChars = Math.max(500, Math.min(20000, Number(args.maxChars) || cfg.maxChars))
   const mode = args.mode === 'markdown' ? 'markdown' : 'text'
@@ -645,7 +645,7 @@ function readLinksTool(ctx, cfg) {
       render: (_args, value) => [{ type: 'text', text: renderLinks(value) }],
     },
     async execute(args, exec) {
-      const url = String(args.url || '').trim()
+      const url = String((args && args.url) || '').trim()
       if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
       const limit = Math.max(1, Math.min(50, Number(args.limit) || cfg.maxLinks))
       const viaSeam = await fetchViaWebSeam(ctx, url, exec && exec.signal, cfg)
@@ -746,14 +746,15 @@ function readUrlBatchTool(ctx, cfg) {
       render: (_args, value) => [{ type: 'text', text: renderBatch(value) }],
     },
     async execute(args, exec) {
-      const urls = (Array.isArray(args.urls) ? args.urls : []).map((u) => String(u).trim()).filter(Boolean)
+      const a = args || {}
+      const urls = (Array.isArray(a.urls) ? a.urls : []).map((u) => String(u).trim()).filter(Boolean)
       if (!urls.length) return { error: 'urls array is required (1-10 http(s) URLs)' }
       const list = urls.slice(0, 10)
-      const perMax = Math.max(500, Math.min(20000, Number(args.maxChars) || 3000))
-      const mode = args.mode === 'markdown' ? 'markdown' : 'text'
+      const perMax = Math.max(500, Math.min(20000, Number(a.maxChars) || 3000))
+      const mode = a.mode === 'markdown' ? 'markdown' : 'text'
       const signal = exec && exec.signal
       const pages = await mapLimit(list, 4, (u) =>
-        readUrl({ url: u, maxChars: perMax, mode, includeLinks: args.includeLinks === true }, ctx, signal, cfg),
+        readUrl({ url: u, maxChars: perMax, mode, includeLinks: a.includeLinks === true }, ctx, signal, cfg),
       )
       const ok = pages.filter((p) => !p.error)
       return {
@@ -910,7 +911,7 @@ function readUrlSiteTool(ctx, cfg) {
       render: (_args, value) => [{ type: 'text', text: renderSite(value) }],
     },
     async execute(args, exec) {
-      const url = String(args.url || '').trim()
+      const url = String((args && args.url) || '').trim()
       if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
       const maxPages = Math.max(2, Math.min(50, Number(args.maxPages) || 15))
       const maxDepth = Math.max(1, Math.min(5, Number(args.maxDepth) || 2))

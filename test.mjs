@@ -206,6 +206,21 @@ ok('tool descriptions stay compact & static (KV-cache friendly)', () => {
   assert.ok(total < 1150, `4 descriptions total ${total} chars (budget 1150)`)
 })
 
+{
+  // robustness: tools must never throw on missing/empty args (defensive)
+  const tools = []
+  const fakeCtx = { tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }
+  m.apply(fakeCtx, {})
+  let allSafe = true
+  for (const t of tools) {
+    try { await t.execute(undefined, {}) } catch { allSafe = false }
+    try { await t.execute(null, {}) } catch { allSafe = false }
+  }
+  assert.ok(allSafe, 'all tools tolerate undefined/null args without throwing')
+  passed++
+  console.log('  ok - tools tolerate missing/empty args without throwing')
+}
+
 console.log('SPA detection')
 ok('detects script-heavy SPA skeleton', () => {
   const spa = '<html><head></head><body><div id="app"></div>' + '<script src="/a.js"></script>'.repeat(8) + '</body></html>'

@@ -82,8 +82,9 @@ export async function fetchViaCurlProxy(url, cfg, externalSignal) {
     })
     // tail line carries the metadata: "<http_code> <content_type>"
     const nl = buf.lastIndexOf(0x0a)
-    const meta = nl >= 0 ? buf.subarray(nl + 1).toString('latin1').trim() : ''
-    const body = nl >= 0 ? buf.subarray(0, nl) : buf
+    if (nl < 0) return null // no trailing metadata — abnormal response, treat as failure
+    const meta = buf.subarray(nl + 1).toString('latin1').trim()
+    const body = buf.subarray(0, nl)
     const [codeStr, ...ctParts] = meta.split(' ')
     const code = Number(codeStr)
     const contentType = ctParts.join(' ')

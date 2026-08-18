@@ -167,11 +167,12 @@ const results = await Promise.all([
 - **Markdown**: self-written lightweight tag state machine (headings/paragraphs/lists/blockquotes/code/tables/inline bold-italic-links), zero deps;
 - **Safety**: http/https only; no page scripts executed; responses over 3 MB rejected; 15s timeout; structured errors (HTTP status / timeout / unsupported type / DNS cause such as `getaddrinfo ENOTFOUND` vs blocked-network timeout);
 - **Network fallback (proxy)**: direct connect first; on connection-class failures (blocked/refused/DNS/connect-timeout) the plugin automatically retries once through the user's own proxy — env `HTTPS_PROXY`/`HTTP_PROXY`, falling back to the Windows system proxy (registry, where Clash-type apps persist it) — via system `curl` (zero npm deps, `-x` passed explicitly). A successful proxied read is transparent to the model; a failed attempt returns the original error with the proxy attempt noted (`已尝试代理 …`). The tool's own overall timeout (slow page) is not treated as a connection failure, so domestic sites never pay the fallback cost;
+- **Privacy**: the plugin never uses the developer's network configuration — the proxy fallback only reads **your own machine's** proxy (env vars or Windows system proxy) at runtime. No telemetry, no analytics, no data collection: the only outbound action is fetching the URL you asked it to read;
 - **Optional enhancement 1 (Firefox Reader Mode algorithm)**: run `npm i @mozilla/readability happy-dom` in the DSH profile directory to auto-enable `@mozilla/readability` (MPL-2.0, referenced unmodified) for higher-quality extraction; falls back to the built-in heuristic when not installed — the core stays zero-dependency;
 - **Optional enhancement 2 (SPA page rendering)**: run `npm i playwright && npx playwright install chromium` in the DSH profile directory to auto-enable it. When the extracted body is empty and the page is script-heavy (likely Vue/React client-rendered), the plugin automatically renders it with headless Chromium before extracting (a `rendered` flag tells the model); rendering waits for the DOM to stabilize (content stops growing) instead of `networkidle` — heartbeat-polling sites never idle, so this avoids 30s timeouts; when not installed it degrades with a clear install hint, never errors — the core stays zero-dependency;
 - **Boundaries**: login-walled pages are not readable; SPA pages need the Playwright enhancement; **structured data (e.g. which like-count belongs to which comment) is out of text-extraction scope** — this plugin flattens HTML into readable text, so exact field↔value associations are lost; for precise fields, intercept the page's actual data API (see "Real-world validation" below).
 
-## Real-world validation (2026-08-18, v0.4.3)
+## Real-world validation (2026-08-18, v0.4.4)
 
 29-site sweep driven by `multi-site.mjs` (committed, re-runnable): **18 OK / 3 expected boundaries / 8 network boundaries / 0 crashes** (109s total; overseas sites pay a ~11s direct-connect timeout before the proxy fallback kicks in).
 
@@ -188,7 +189,7 @@ const results = await Promise.all([
 | Batch + failure isolation | 4-URL mix | ✅ 2/4 ok, failures isolated |
 | Site crawl | Ruan Yifeng blog | ✅ 5/5 pages tree map |
 
-- **32 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function) + **10 SPA-test assertions** all green;
+- **33 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance) + **10 SPA-test assertions** all green;
 - Real case: on a Xiaoheihe post, comment like-counts (`up` field) could not be attributed from flattened text — **precise fields should come from the page's underlying data API** (e.g. `/bbs/app/link/tree` JSON). This is a shared boundary of text extractors, not a defect.
 
 ## Roadmap
