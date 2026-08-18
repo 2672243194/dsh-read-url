@@ -75,9 +75,10 @@ export function decodeBuffer(buffer, contentType) {
   return { text, charset: enc }
 }
 
-async function fetchPage(url, externalSignal, cfg) {
-  const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs)
-  const signal = externalSignal ? AbortSignal.any([externalSignal, timeoutSignal]) : timeoutSignal
+// Direct-connect fetch, extracted so the race path can run it concurrently
+// with the proxy attempt and abort it. Returns { buffer, contentType, finalUrl }
+// on success or { error } — never throws (abort/timeout/network all mapped).
+async function directFetch(url, signal, cfg) {
   try {
     const res = await fetch(url, {
       redirect: 'follow',
@@ -105,20 +106,71 @@ async function fetchPage(url, externalSignal, cfg) {
     // connect-timeout / TLS) — surface it so the model can tell "bad domain"
     // from "blocked network" and act accordingly instead of retrying blindly
     const cause = e.cause && e.cause.message ? String(e.cause.message).slice(0, 90) : ''
-    const detail = cause || (e.message || '').slice(0, 120)
-    // Connection-class failure (blocked/refused/DNS): retry once through the
-    // user's proxy — transparent on success, attributed on failure. The
-    // tool's own overall timeout is NOT a connection failure (a slow page is
-    // not a blocked page), so we don't proxy-retry it.
-    const proxied = await fetchViaCurlProxy(url, cfg, externalSignal)
-    if (proxied && !proxied.error) return proxied
-    const proxy = await detectProxy()
-    if (proxy) {
-      const px = proxied && proxied.error ? `，代理返回 ${proxied.error}` : '，代理未连通'
-      return { error: `Fetch failed: ${detail}（直连失败；已尝试代理 ${proxy}${px}）` }
-    }
-    return { error: `Fetch failed: ${detail}（直连失败，未检测到代理配置）` }
+    return { error: cause || (e.message || '').slice(0, 120) }
   }
+}
+
+// Settle-all race that resolves with the FIRST SUCCESSFUL result (a value
+// with a buffer and no error). If every attempt fails it resolves with
+// { success:false, failures:[...] } once the slowest one has settled —
+// the proxy channel (curl --max-time ~20s) is the natural ceiling, and the
+// direct fetch aborts on the same total budget.
+// Settle-all race that resolves with the FIRST SUCCESSFUL result (a value
+// with a buffer and no error). If every attempt fails it resolves with
+// { success:false, failures:[...] } once the slowest one has settled —
+// the proxy channel (curl --max-time ~20s) is the natural ceiling, and the
+// direct fetch aborts on the same total budget.
+export function raceFirstSuccess(promises) {
+  return new Promise((resolve) => {
+    const failures = []
+    let settled = 0
+    promises.forEach((p, i) => {
+      p.then((v) => {
+        if (v && !v.error && v.buffer) {
+          resolve({ success: true, value: v })
+          return
+        }
+        failures[i] = v
+        settled += 1
+        if (settled === promises.length) resolve({ success: false, failures })
+      }).catch((e) => {
+        failures[i] = { error: String((e && e.message) || e) }
+        settled += 1
+        if (settled === promises.length) resolve({ success: false, failures })
+      })
+    })
+  })
+}
+async function raceFetch(url, externalSignal, cfg, proxy) {
+  const directCtrl = new AbortController()
+  const proxyCtrl = new AbortController()
+  const withExt = (ctrl) =>
+    externalSignal ? AbortSignal.any([externalSignal, ctrl.signal]) : ctrl.signal
+  const directSignal = AbortSignal.any([withExt(directCtrl), AbortSignal.timeout(cfg.timeoutMs)])
+  const direct = directFetch(url, directSignal, cfg)
+  const proxied = fetchViaCurlProxy(url, cfg, withExt(proxyCtrl))
+  const winner = await raceFirstSuccess([direct, proxied])
+  directCtrl.abort()
+  proxyCtrl.abort()
+  return winner
+}
+
+async function fetchPage(url, externalSignal, cfg) {
+  const proxy = await detectProxy()
+  if (proxy) {
+    const winner = await raceFetch(url, externalSignal, cfg, proxy)
+    if (winner.success) return winner.value
+    const dErr = winner.failures[0] && winner.failures[0].error
+    const pErr = winner.failures[1]
+    const px = pErr && pErr.error ? `，代理返回 ${pErr.error}` : '，代理未连通'
+    return { error: `Fetch failed: ${dErr}（直连失败；已尝试代理 ${proxy}${px}）` }
+  }
+  // No proxy configured: plain direct connect (the original behaviour).
+  const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs)
+  const signal = externalSignal ? AbortSignal.any([externalSignal, timeoutSignal]) : timeoutSignal
+  const r = await directFetch(url, signal, cfg)
+  if (r.error) return { error: `Fetch failed: ${r.error}（直连失败，未检测到代理配置）` }
+  return r
 }
 
 // Prefer the ctx.web capability seam (official docs/capability-seams.md):

@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import * as m from './index.js'
 import { looksLikeSpa } from './spa.js'
-const { decodeBuffer, extract, smartTruncate, blockMd, inlineMd, decodeTextEntities } = m
+const { decodeBuffer, extract, smartTruncate, blockMd, inlineMd, decodeTextEntities, raceFirstSuccess } = m
 
 let passed = 0
 function ok(name, fn) {
@@ -10,6 +10,35 @@ function ok(name, fn) {
   passed++
   console.log(`  ok - ${name}`)
 }
+
+console.log('raceFirstSuccess / proxy race logic')
+{
+  const slow = new Promise((res) => setTimeout(() => res({ error: 'Timeout after 15000ms or cancelled' }), 30))
+  const fast = Promise.resolve({ buffer: Buffer.from('ok'), contentType: 'text/html', finalUrl: 'https://x' })
+  const out = await raceFirstSuccess([slow, fast])
+  assert.equal(out.success, true)
+  assert.equal(out.value.buffer.toString(), 'ok')
+  passed++
+  console.log('  ok - first successful result wins, later failures ignored')
+}
+{
+  const fast = Promise.resolve({ error: 'HTTP 403 Forbidden' })
+  const slow = new Promise((res) => setTimeout(() => res({ buffer: Buffer.from('data'), contentType: 'text/html' }), 20))
+  const out = await raceFirstSuccess([fast, slow])
+  assert.equal(out.success, true)
+  assert.equal(out.value.buffer.toString(), 'data')
+  passed++
+  console.log('  ok - slow success beats fast failure')
+}
+ok('all-fail collects failures in order', async () => {
+  const out = await raceFirstSuccess([
+    Promise.resolve({ error: 'HTTP 403 Forbidden' }),
+    Promise.resolve(null),
+  ])
+  assert.equal(out.success, false)
+  assert.equal(out.failures[0].error, 'HTTP 403 Forbidden')
+  assert.equal(out.failures[1], null)
+})
 
 console.log('decodeBuffer / GBK charset')
 ok('gbk meta charset decodes correctly', () => {
