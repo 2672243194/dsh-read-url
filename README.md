@@ -166,27 +166,29 @@ const results = await Promise.all([
 - **Extraction**: prefers `<article>` / `role="main"`, strips `nav/footer/header/aside/form/iframe` and ad-like containers, heuristic fallback to `<body>`;
 - **Markdown**: self-written lightweight tag state machine (headings/paragraphs/lists/blockquotes/code/tables/inline bold-italic-links), zero deps;
 - **Safety**: http/https only; no page scripts executed; responses over 3 MB rejected; 15s timeout; structured errors (HTTP status / timeout / unsupported type / DNS cause such as `getaddrinfo ENOTFOUND` vs blocked-network timeout);
+- **Network fallback (proxy)**: direct connect first; on connection-class failures (blocked/refused/DNS/connect-timeout) the plugin automatically retries once through the user's own proxy — env `HTTPS_PROXY`/`HTTP_PROXY`, falling back to the Windows system proxy (registry, where Clash-type apps persist it) — via system `curl` (zero npm deps, `-x` passed explicitly). A successful proxied read is transparent to the model; a failed attempt returns the original error with the proxy attempt noted (`已尝试代理 …`). The tool's own overall timeout (slow page) is not treated as a connection failure, so domestic sites never pay the fallback cost;
 - **Optional enhancement 1 (Firefox Reader Mode algorithm)**: run `npm i @mozilla/readability happy-dom` in the DSH profile directory to auto-enable `@mozilla/readability` (MPL-2.0, referenced unmodified) for higher-quality extraction; falls back to the built-in heuristic when not installed — the core stays zero-dependency;
 - **Optional enhancement 2 (SPA page rendering)**: run `npm i playwright && npx playwright install chromium` in the DSH profile directory to auto-enable it. When the extracted body is empty and the page is script-heavy (likely Vue/React client-rendered), the plugin automatically renders it with headless Chromium before extracting (a `rendered` flag tells the model); rendering waits for the DOM to stabilize (content stops growing) instead of `networkidle` — heartbeat-polling sites never idle, so this avoids 30s timeouts; when not installed it degrades with a clear install hint, never errors — the core stays zero-dependency;
 - **Boundaries**: login-walled pages are not readable; SPA pages need the Playwright enhancement; **structured data (e.g. which like-count belongs to which comment) is out of text-extraction scope** — this plugin flattens HTML into readable text, so exact field↔value associations are lost; for precise fields, intercept the page's actual data API (see "Real-world validation" below).
 
-## Real-world validation (2026-08-18, v0.4.2)
+## Real-world validation (2026-08-18, v0.4.3)
 
-29-site sweep driven by `multi-site.mjs` (committed, re-runnable): **16 OK / 3 expected boundaries / 10 network boundaries / 0 crashes** (64s total).
+29-site sweep driven by `multi-site.mjs` (committed, re-runnable): **18 OK / 3 expected boundaries / 8 network boundaries / 0 crashes** (109s total; overseas sites pay a ~11s direct-connect timeout before the proxy fallback kicks in).
 
 | Category | Sites | Result |
 |---|---|---|
 | Portal navigation cleaning | Baidu / QQ / NetEase / Sina / Douban / CSDN / Sohu / Ifeng | ✅ clean text, no CSS noise |
-| SPA rendering | Bilibili / Xiaoheihe / Juejin / QQ News / SSPAI | ✅ `rendered` flag, post-JS body (QQ News was a 30s timeout before the networkidle fix) |
+| SPA rendering | Bilibili / Xiaoheihe / Juejin / QQ News / SSPAI | ✅ `rendered` flag, post-JS body |
 | Multi-article aggregation | Cnblogs / Ruan Yifeng blog | ✅ 800+ chars across articles |
 | Static doc pages | MDN / Ruan Yifeng / example.com / GitHub | ✅ clean extraction (example.com = short page, expected) |
 | Login wall | Zhihu / Weibo | ✅ clear content or empty (expected) |
-| Network / anti-bot boundary | W3C (403 for Chrome UA); Wikipedia / BBC / V2EX / httpbin / PDF / PNG / DNS-fail (Node direct-to-overseas blocked — curl via proxy reaches them) | ✅ diagnosed via curl comparison; errors now attribute the cause (`getaddrinfo ENOTFOUND` vs timeout) — not plugin defects |
-| offset continuation | Sina News (12,378 chars) | ✅ 800+800 seamless, cache hit |
+| **Proxy fallback (overseas)** | BBC Chinese / V2EX | ✅ direct connect blocked → auto-retried through the user's system proxy → clean body |
+| Network / anti-bot boundary | W3C (403 for Chrome UA); Wikipedia (403 via proxy); httpbin (503 service-down); PDF (404); DNS-fail (proxy unreachable) | ✅ accurately attributed errors (HTTP status / 403 / 503 / ENOTFOUND) — not plugin defects |
+| offset continuation | Sina News (12,284 chars) | ✅ 800+800 seamless, cache hit |
 | Batch + failure isolation | 4-URL mix | ✅ 2/4 ok, failures isolated |
 | Site crawl | Ruan Yifeng blog | ✅ 5/5 pages tree map |
 
-- **32 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping) + **10 SPA-test assertions** all green;
+- **32 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function) + **10 SPA-test assertions** all green;
 - Real case: on a Xiaoheihe post, comment like-counts (`up` field) could not be attributed from flattened text — **precise fields should come from the page's underlying data API** (e.g. `/bbs/app/link/tree` JSON). This is a shared boundary of text extractors, not a defect.
 
 ## Roadmap

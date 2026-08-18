@@ -13,6 +13,7 @@
 //   - session-level cache, compact text render (lowest token cost)
 import { TextDecoder } from 'node:util'
 import { looksLikeSpa, renderPage, closeBrowser } from './spa.js'
+import { detectProxy, fetchViaCurlProxy } from './proxy-fallback.js'
 // Re-export for tests / programmatic (PTC) cleanup.
 export { closeBrowser, renderPage, looksLikeSpa } from './spa.js'
 
@@ -105,7 +106,18 @@ async function fetchPage(url, externalSignal, cfg) {
     // from "blocked network" and act accordingly instead of retrying blindly
     const cause = e.cause && e.cause.message ? String(e.cause.message).slice(0, 90) : ''
     const detail = cause || (e.message || '').slice(0, 120)
-    return { error: `Fetch failed: ${detail}` }
+    // Connection-class failure (blocked/refused/DNS): retry once through the
+    // user's proxy — transparent on success, attributed on failure. The
+    // tool's own overall timeout is NOT a connection failure (a slow page is
+    // not a blocked page), so we don't proxy-retry it.
+    const proxied = await fetchViaCurlProxy(url, cfg, externalSignal)
+    if (proxied && !proxied.error) return proxied
+    const proxy = await detectProxy()
+    if (proxy) {
+      const px = proxied && proxied.error ? `，代理返回 ${proxied.error}` : '，代理未连通'
+      return { error: `Fetch failed: ${detail}（直连失败；已尝试代理 ${proxy}${px}）` }
+    }
+    return { error: `Fetch failed: ${detail}（直连失败，未检测到代理配置）` }
   }
 }
 
