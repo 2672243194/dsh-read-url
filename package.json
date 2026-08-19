@@ -4,6 +4,20 @@
   "description": "DeepSeek Harness URL reader: fetch any webpage, auto-detect encoding (GBK/GB2312/UTF-8/Big5), extract clean main content, output compact text/Markdown to save tokens. Zero runtime dependencies.",
   "type": "module",
   "main": "index.js",
+  "files": [
+    "index.js",
+    "spa.js",
+    "proxy-fallback.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/2672243194/dsh-read-url.git"
+  },
   "dsh": {
     "bundle": {
       "patch": "cordis.patch.yml"

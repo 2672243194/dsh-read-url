@@ -4,6 +4,9 @@
 
 ![dsh-read-url](docs/banner.svg)
 
+[![npm](https://img.shields.io/npm/v/dsh-read-url)](https://www.npmjs.com/package/dsh-read-url)
+[![License](https://img.shields.io/github/license/2672243194/dsh-read-url)](https://github.com/2672243194/dsh-read-url/blob/main/LICENSE)
+
 DeepSeek Harness 的 URL 阅读插件：抓取任意网页，**自动识别编码（GBK/GB2312/UTF-8/Big5）**，提取干净正文，输出**省 token 的紧凑文本或结构化 Markdown**。
 
 零依赖（Node 20+ 内置能力），免 API key，免服务端，装完即用。
