@@ -241,7 +241,13 @@ export function pickMain(html) {
   // collect all of them instead of only the first.
   const articles = [...html.matchAll(/<article[\s>][\s\S]*?<\/article\s*>/gi)]
   if (articles.length) return articles.map((a) => a[0]).join('\n')
-  const mainTag = /<(main|div)[^>]*role=["']main["'][\s>][\s\S]*?<\/\1\s*>/i.exec(html)
+  const mainTag =
+    /<(main|div)[^>]*role=["']main["'][\s>][\s\S]*?<\/\1\s*>/i.exec(html) ||
+    // Bare <main> without role="main": doc generators (VitePress/VuePress,
+    // MDN, MDX sites) mark the body with a plain <main> tag. Falling back to
+    // the whole <body> would drag in the top/local nav (menu, outline, skip
+    // link) — the extraction quality loss we saw on vuejs.org.
+    /<main[\s>][\s\S]*?<\/main\s*>/i.exec(html)
   if (mainTag) return mainTag[0]
   const body = /<body[\s>]/i.exec(html)
   if (body) {

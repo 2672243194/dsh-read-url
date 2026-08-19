@@ -16,14 +16,21 @@
 import { execFile, execFileSync } from 'node:child_process'
 
 let sysProxyCache = null // '' = checked & absent; string = proxy URL
+let sysProxyCheckedAt = 0 // cache timestamp; a failed read is re-tried after 60s
+const SYS_PROXY_RETRY_MS = 60 * 1000
 
 // Windows system proxy from the registry (HKCU Internet Settings). PowerShell
 // is used because `reg.exe` is frequently blocked by security policy; the
 // read is synchronous and cached after the first call (it only runs after a
 // direct-connect failure, so the ~1s cost is invisible on the happy path).
+// A FAILED read is cached as '' but re-tried after 60s — an environment that
+// transiently blocks the PowerShell child (EDR, policy) should not starve
+// the whole session of the proxy.
 function readWindowsSystemProxy() {
-  if (sysProxyCache !== null) return sysProxyCache
+  const now = Date.now()
+  if (sysProxyCache !== null && now - sysProxyCheckedAt < SYS_PROXY_RETRY_MS) return sysProxyCache
   sysProxyCache = ''
+  sysProxyCheckedAt = now
   try {
     const out = execFileSync(
       'powershell',
@@ -38,10 +45,11 @@ function readWindowsSystemProxy() {
     // ProxyServer may be "host:port" or "http=...;https=host:port"
     const httpsPart = server.split(';').map((s) => s.trim()).find((s) => /^https=/i.test(s))
     sysProxyCache = (httpsPart ? httpsPart.replace(/^https=/i, '') : server) || ''
+    return sysProxyCache
   } catch {
     sysProxyCache = ''
+    return sysProxyCache
   }
-  return sysProxyCache
 }
 
 // The user's proxy, in priority order: env vars, then Windows system proxy.

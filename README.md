@@ -62,6 +62,45 @@ Read https://example.com/article and summarize the key points
 Read https://docs.example.org/guide in markdown mode
 ```
 
+### Real examples (measured)
+
+**1. Token economy — return only what the model needs**
+
+`read_url` on a portal returns cleaned body capped at `maxChars` (default 6,000) — not the raw page with nav/ads/footers. Repeat reads hit the 5-min cache (`(cached)`), so the agent never re-fetches:
+
+```
+title: 新闻中心首页_新浪网
+charset utf-8
+(chars 800/12398 — 截断，offset 续读)
+```
+
+**2. Overseas sites — direct + proxy race**
+
+When a proxy is configured, the direct fetch and the proxy `curl` start together and the first to complete wins. A blocked overseas site that used to cost ~11s (direct-connect timeout + fallback) now reads in under a second:
+
+```
+BBC 中文: OK (633ms) — clean 4,000+ chars of headline news
+```
+
+**3. Long-article continuation (`offset`)**
+
+A 12,000-char article is read in slices; `offset` resumes from cache without repeating earlier text — the model keeps exactly what it needs in context:
+
+```
+chars 800+800/12398 · cached
+```
+
+**4. Batch research across pages**
+
+`read_url_batch` reads up to 10 pages in parallel (concurrency 4), each cleaned individually, failures isolated:
+
+```
+读取 2/4 页成功，2 页失败
+--- 阮一峰的网络日志 (491 字符) ---
+--- Example Domain (127 字符) ---
+[失败] https://zh.wikipedia.org/... — Fetch failed: HTTP 403 ...
+```
+
 ### Tools
 
 **`read_url(url, maxChars?, offset?, mode?, includeLinks?)`** — fetch and extract clean body
@@ -175,9 +214,9 @@ const results = await Promise.all([
 - **Optional enhancement 2 (SPA page rendering)**: run `npm i playwright && npx playwright install chromium` in the DSH profile directory to auto-enable it. When the extracted body is empty and the page is script-heavy (likely Vue/React client-rendered), the plugin automatically renders it with headless Chromium before extracting (a `rendered` flag tells the model); rendering waits for the DOM to stabilize (content stops growing) instead of `networkidle` — heartbeat-polling sites never idle, so this avoids 30s timeouts; when not installed it degrades with a clear install hint, never errors — the core stays zero-dependency;
 - **Boundaries**: login-walled pages are not readable; SPA pages need the Playwright enhancement; **structured data (e.g. which like-count belongs to which comment) is out of text-extraction scope** — this plugin flattens HTML into readable text, so exact field↔value associations are lost; for precise fields, intercept the page's actual data API (see "Real-world validation" below).
 
-## Real-world validation (2026-08-19, v0.4.6)
+## Real-world validation (2026-08-19, v0.4.8)
 
-29-site sweep driven by `multi-site.mjs` (committed, re-runnable): **18 OK / 4 expected boundaries / 7 network boundaries / 0 crashes** — overseas sites (BBC/V2EX) are served through the user's proxy in ~1s via the direct+proxy race; wikipedia/httpbin remain clear attributed network boundaries.
+41-site sweep driven by `multi-site.mjs` (committed, re-runnable): **23 OK / 8 expected boundaries / 10 network·anti-bot boundaries / 0 crashes** — overseas sites (BBC/V2EX) served in ~1s via the direct+proxy race; doc sites (vuejs.org) fixed via bare-`<main>` picking; wikipedia/httpbin remain clear attributed network boundaries.
 
 | Category | Sites | Result |
 |---|---|---|
@@ -192,7 +231,7 @@ const results = await Promise.all([
 | Batch + failure isolation | 4-URL mix | ✅ 2/4 ok, failures isolated |
 | Site crawl | Ruan Yifeng blog | ✅ 5/5 pages tree map |
 
-- **38 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard, schema budget) + **10 SPA-test assertions** all green;
+- **39 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard, schema budget, bare-main pick) + **10 SPA-test assertions** all green;
 - Real case: on a Xiaoheihe post, comment like-counts (`up` field) could not be attributed from flattened text — **precise fields should come from the page's underlying data API** (e.g. `/bbs/app/link/tree` JSON). This is a shared boundary of text extractors, not a defect.
 
 ## Roadmap

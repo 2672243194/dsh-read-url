@@ -180,6 +180,15 @@ ok('removes HTML comments and decodes entities', () => {
   assert.ok(r.text.includes('价格 与 "质量" 的对比 & 分析'), `entities must decode, got: ${r.text.slice(-60)}`)
 })
 
+ok('prefers bare <main> over whole <body> (doc sites: VitePress/MDN)', () => {
+  const html = '<html><head><title>Doc</title></head><body><nav>菜单 本页目录 赞助位</nav><main><h1>正文标题</h1><p>文档真实内容段落。</p></main><footer>版权</footer></body></html>'
+  const r = extract(html, 'text')
+  assert.ok(r.text.includes('正文标题'), 'main content must survive')
+  assert.ok(r.text.includes('文档真实内容段落'))
+  assert.ok(!r.text.includes('菜单'), `top nav must be excluded, got: ${r.text.slice(0, 120)}`)
+  assert.ok(!r.text.includes('赞助位'), 'outline noise must be excluded')
+})
+
 ok('aggregates multiple article blocks (blog homepage pattern)', () => {
   const html = '<html><head><title>博客园</title></head><body><nav>导航</nav>' +
     '<article class="post-item"><h1>文章A</h1><p>内容A内容A内容A</p></article>' +

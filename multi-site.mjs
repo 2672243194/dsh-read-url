@@ -1,6 +1,7 @@
 // multi-site.mjs — real-world multi-site verification for dsh-read-url
-// 29-site sweep: Chinese portals / SPA / encoding / anti-bot / static /
-// type-block (PDF/PNG) / 404 / redirect / DNS-failure / overseas sites.
+// 41-site sweep: Chinese portals / SPA / encoding / anti-bot / static /
+// type-block (PDF/PNG) / 404 / redirect / DNS-failure / overseas sites /
+// Q&A / forum / e-commerce / video / novel / government / edu / encyclopedia.
 // Checks extraction quality, charset detection, noise filtering, SPA
 // rendering, continuation, batch and site-crawl.
 // Run: node multi-site.mjs
@@ -36,6 +37,19 @@ const SITES = [
   ['httpbin-404 (net-boundary)', 'https://httpbin.org/status/404'],
   ['httpbin-redirect (net-boundary)', 'https://httpbin.org/redirect/3'],
   ['dns-fail (ENOTFOUND expected)', 'https://nonexistent-domain-xyz123.com/'],
+  // ---- 新类型（第 2 批）----
+  ['zhihu-zhuanlan (Q&A/column)', 'https://zhuanlan.zhihu.com/'],
+  ['baidu-baike (encyclopedia)', 'https://baike.baidu.com/'],
+  ['hupu (forum)', 'https://www.hupu.com/'],
+  ['36kr (tech media, SPA)', 'https://36kr.com/'],
+  ['qidian (novel)', 'https://www.qidian.com/'],
+  ['gov.cn (government)', 'https://www.gov.cn/'],
+  ['bupt.edu.cn (education)', 'https://www.bupt.edu.cn/'],
+  ['bilibili-video (video page, SPA)', 'https://www.bilibili.com/video/BV1xx411c7mD'],
+  ['zhidao.baidu (Q&A)', 'https://zhidao.baidu.com/'],
+  ['tieba (forum, anti-bot)', 'https://tieba.baidu.com/'],
+  ['zol (tech media, gbk)', 'https://www.zol.com.cn/'],
+  ['vuejs-doc (tech doc, bare-main fix)', 'https://cn.vuejs.org/guide/introduction.html'],
 ]
 
 const tools = []
@@ -53,7 +67,11 @@ function short(s, n = 70) {
 function noiseCheck(text) {
   if (!text) return false
   const t = text.slice(0, 2000)
-  return /font-size|font-family|margin:|padding:|\.css|\{\s*[a-z-]+:/i.test(t) || /<[a-z/!]/.test(t)
+  // CSS-property names only: `{ data ()` in JS code samples must NOT trip
+  // this (vuejs.org body contains code blocks with object literals).
+  return /font-size|font-family|margin:|padding:|\.css/i.test(t) ||
+    /\{\s*(?:font-|margin|padding|color|display|background|width|height|position|border|text-align)[a-z-]*:/i.test(t) ||
+    /<[a-z/!]/.test(t)
 }
 
 console.log(`=== dsh-read-url multi-site verification (${SITES.length} sites) ===\n`)
