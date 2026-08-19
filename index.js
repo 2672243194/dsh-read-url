@@ -682,7 +682,7 @@ function readLinksTool(ctx, cfg) {
       additionalProperties: false,
       properties: {
         url: { type: 'string', description: 'http(s) URL to scan for links' },
-        limit: { type: 'number', description: 'Max links to return (range 1-50, default from plugin config)' },
+        limit: { type: 'number', description: 'Links to return (1-50; default from plugin config)' },
       },
       required: ['url'],
     },
@@ -772,17 +772,16 @@ function readUrlBatchTool(ctx, cfg) {
   return {
     name: 'read_url_batch',
     description:
-      'Read multiple URLs in parallel, each as a compact clean-content block ' +
-      '(same extraction + session cache as read_url). Per-page failures isolated and tagged. ' +
-      'Max 10 URLs, per-page capped at maxChars. For research/comparison across pages.',
+      'Read multiple URLs in parallel: each a compact clean block (same extraction + cache as read_url). ' +
+      'Failures isolated and tagged. Max 10 URLs, capped at maxChars per page.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        urls: { type: 'array', items: { type: 'string' }, description: 'List of http(s) URLs to read (1-10)' },
-        maxChars: { type: 'number', description: 'Max characters per page (range 500-20000, default 3000)' },
-        mode: { type: 'string', enum: ['text', 'markdown'], description: 'text = plain (token-efficient, default); markdown = structured' },
-        includeLinks: { type: 'boolean', description: 'Also return a bounded list of links per page (title+url)' },
+        urls: { type: 'array', items: { type: 'string' }, description: 'URLs to read in parallel (1-10, http/s)' },
+        maxChars: { type: 'number', description: 'Chars per page (500-20000; default 3000)' },
+        mode: { type: 'string', enum: ['text', 'markdown'], description: 'text = plain (token-cheap, default); markdown = structured' },
+        includeLinks: { type: 'boolean', description: 'Return page links too (title+url, bounded)' },
       },
       required: ['urls'],
     },
@@ -937,18 +936,18 @@ function readUrlSiteTool(ctx, cfg) {
     name: 'read_url_site',
     description:
       'Crawl a site BFS from one URL: dedupe same-host pages, return a compact site map ' +
-      '(title + depth + size). Auth/static paths skipped; depth + page count capped; failures isolated. ' +
-      'includeContent=true attaches a short summary per page (default off, token-efficient). ' +
+      '(title + depth + size). Auth/static paths skipped; failures isolated. ' +
+      'includeContent=true attaches a short summary per page (default off, token-cheap). ' +
       'Does not render SPA pages (use read_url for that).',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        url: { type: 'string', description: 'http(s) entry URL of the site to crawl' },
-        maxPages: { type: 'number', description: 'Max pages to crawl (range 2-50, default 15)' },
-        maxDepth: { type: 'number', description: 'Max link depth from the entry page (range 1-5, default 2)' },
-        includeContent: { type: 'boolean', description: 'Also return a short body summary per page (default false — structure only, token-efficient)' },
-        maxCharsPerPage: { type: 'number', description: 'Summary length per page when includeContent=true (range 200-2000, default 500)' },
+        url: { type: 'string', description: 'Entry URL of the site to crawl (http/s)' },
+        maxPages: { type: 'number', description: 'Pages to crawl (2-50; default 15)' },
+        maxDepth: { type: 'number', description: 'Link depth from entry (1-5; default 2)' },
+        includeContent: { type: 'boolean', description: 'Short body summary per page (default off; structure-only is token-cheap)' },
+        maxCharsPerPage: { type: 'number', description: 'Summary chars per page (200-2000; default 500)' },
       },
       required: ['url'],
     },
@@ -1019,10 +1018,10 @@ export function apply(ctx, config) {
       additionalProperties: false,
       properties: {
         url: { type: 'string', description: 'http(s) URL to read' },
-        maxChars: { type: 'number', description: 'Max characters of body text to return (range 500-20000, default from plugin config)' },
-        offset: { type: 'number', description: 'Start reading from this character offset (for continuing a long page). Default 0. Served from cache.' },
-        mode: { type: 'string', enum: ['text', 'markdown'], description: 'text = plain (token-efficient, default); markdown = structured' },
-        includeLinks: { type: 'boolean', description: 'Also return a bounded list of page links (title+url)' },
+        maxChars: { type: 'number', description: 'Body text chars to return (500-20000; default from plugin config)' },
+        offset: { type: 'number', description: 'Start at this char offset (continue long pages). Default 0; served from cache.' },
+        mode: { type: 'string', enum: ['text', 'markdown'], description: 'text = plain (token-cheap, default); markdown = structured' },
+        includeLinks: { type: 'boolean', description: 'Return page links too (title+url, bounded)' },
       },
       required: ['url'],
     },

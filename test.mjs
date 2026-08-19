@@ -245,6 +245,17 @@ ok('tool descriptions stay compact & static (KV-cache friendly)', () => {
   assert.ok(total < 1150, `4 descriptions total ${total} chars (budget 1150)`)
 })
 
+ok('parameter schemas stay compact (fixed per-call cost)', () => {
+  const tools = []
+  const fakeCtx = { tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }
+  m.apply(fakeCtx, {})
+  let schemaTotal = 0
+  for (const t of tools) {
+    schemaTotal += JSON.stringify(t.parameters).length
+  }
+  assert.ok(schemaTotal < 2000, `4 parameter schemas total ${schemaTotal} chars (budget 2000)`)
+})
+
 {
   // robustness: tools must never throw on missing/empty args (defensive)
   const tools = []
