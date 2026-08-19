@@ -172,9 +172,9 @@ const results = await Promise.all([
 - **Optional enhancement 2 (SPA page rendering)**: run `npm i playwright && npx playwright install chromium` in the DSH profile directory to auto-enable it. When the extracted body is empty and the page is script-heavy (likely Vue/React client-rendered), the plugin automatically renders it with headless Chromium before extracting (a `rendered` flag tells the model); rendering waits for the DOM to stabilize (content stops growing) instead of `networkidle` — heartbeat-polling sites never idle, so this avoids 30s timeouts; when not installed it degrades with a clear install hint, never errors — the core stays zero-dependency;
 - **Boundaries**: login-walled pages are not readable; SPA pages need the Playwright enhancement; **structured data (e.g. which like-count belongs to which comment) is out of text-extraction scope** — this plugin flattens HTML into readable text, so exact field↔value associations are lost; for precise fields, intercept the page's actual data API (see "Real-world validation" below).
 
-## Real-world validation (2026-08-18, v0.4.5)
+## Real-world validation (2026-08-19, v0.4.6)
 
-29-site sweep driven by `multi-site.mjs` (committed, re-runnable): **18 OK / 3 expected boundaries / 8 network boundaries / 0 crashes** (109s total; overseas sites pay a ~11s direct-connect timeout before the proxy fallback kicks in).
+29-site sweep driven by `multi-site.mjs` (committed, re-runnable): **18 OK / 4 expected boundaries / 7 network boundaries / 0 crashes** — overseas sites (BBC/V2EX) are served through the user's proxy in ~1s via the direct+proxy race; wikipedia/httpbin remain clear attributed network boundaries.
 
 | Category | Sites | Result |
 |---|---|---|
@@ -189,7 +189,7 @@ const results = await Promise.all([
 | Batch + failure isolation | 4-URL mix | ✅ 2/4 ok, failures isolated |
 | Site crawl | Ruan Yifeng blog | ✅ 5/5 pages tree map |
 
-- **36 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic) + **10 SPA-test assertions** all green;
+- **37 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard) + **10 SPA-test assertions** all green;
 - Real case: on a Xiaoheihe post, comment like-counts (`up` field) could not be attributed from flattened text — **precise fields should come from the page's underlying data API** (e.g. `/bbs/app/link/tree` JSON). This is a shared boundary of text extractors, not a defect.
 
 ## Roadmap

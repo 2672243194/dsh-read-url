@@ -42,10 +42,14 @@ export async function renderPage(url, externalSignal) {
     // (qq-news, juejin) never go idle and would time out at 30s. Instead wait
     // for the DOM to stabilize (content stops growing) up to 10s — SPA paint
     // usually lands within a couple of seconds of DOM-ready.
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    // The cooperative signal aborts both the navigation and the poll loop, so
+    // a cancelled/timed-out call releases the browser immediately instead of
+    // burning the full poll window.
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000, signal: externalSignal || undefined })
     const t0 = Date.now()
     let prevLen = -1
     for (;;) {
+      if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
       await page.waitForTimeout(500)
       const len = await page
         .evaluate(() => (document.body ? document.body.innerHTML.length : 0))
@@ -60,6 +64,7 @@ export async function renderPage(url, externalSignal) {
     const finalUrl = page.url()
     return { html, finalUrl }
   } catch (e) {
+    if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
     return { error: `Render failed: ${e.message}` }
   } finally {
     if (page) await page.close().catch(() => {})

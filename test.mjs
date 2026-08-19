@@ -30,7 +30,7 @@ console.log('raceFirstSuccess / proxy race logic')
   passed++
   console.log('  ok - slow success beats fast failure')
 }
-ok('all-fail collects failures in order', async () => {
+{
   const out = await raceFirstSuccess([
     Promise.resolve({ error: 'HTTP 403 Forbidden' }),
     Promise.resolve(null),
@@ -38,7 +38,17 @@ ok('all-fail collects failures in order', async () => {
   assert.equal(out.success, false)
   assert.equal(out.failures[0].error, 'HTTP 403 Forbidden')
   assert.equal(out.failures[1], null)
-})
+  passed++
+  console.log('  ok - all-fail collects failures in order')
+}
+{
+  // Empty input must not hang forever (guards a regression to a deadlock).
+  const out = await raceFirstSuccess([])
+  assert.equal(out.success, false)
+  assert.equal(out.failures.length, 0)
+  passed++
+  console.log('  ok - empty race resolves instead of hanging')
+}
 
 console.log('decodeBuffer / GBK charset')
 ok('gbk meta charset decodes correctly', () => {

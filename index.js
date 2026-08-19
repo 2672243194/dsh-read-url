@@ -115,13 +115,12 @@ async function directFetch(url, signal, cfg) {
 // { success:false, failures:[...] } once the slowest one has settled —
 // the proxy channel (curl --max-time ~20s) is the natural ceiling, and the
 // direct fetch aborts on the same total budget.
-// Settle-all race that resolves with the FIRST SUCCESSFUL result (a value
-// with a buffer and no error). If every attempt fails it resolves with
-// { success:false, failures:[...] } once the slowest one has settled —
-// the proxy channel (curl --max-time ~20s) is the natural ceiling, and the
-// direct fetch aborts on the same total budget.
 export function raceFirstSuccess(promises) {
   return new Promise((resolve) => {
+    if (promises.length === 0) {
+      resolve({ success: false, failures: [] })
+      return
+    }
     const failures = []
     let settled = 0
     promises.forEach((p, i) => {
@@ -148,7 +147,7 @@ async function raceFetch(url, externalSignal, cfg, proxy) {
     externalSignal ? AbortSignal.any([externalSignal, ctrl.signal]) : ctrl.signal
   const directSignal = AbortSignal.any([withExt(directCtrl), AbortSignal.timeout(cfg.timeoutMs)])
   const direct = directFetch(url, directSignal, cfg)
-  const proxied = fetchViaCurlProxy(url, cfg, withExt(proxyCtrl))
+  const proxied = fetchViaCurlProxy(url, cfg, withExt(proxyCtrl), proxy)
   const winner = await raceFirstSuccess([direct, proxied])
   directCtrl.abort()
   proxyCtrl.abort()
@@ -462,7 +461,12 @@ function extractLinks(html, limit, baseUrl) {
   // paths — and resolve them against the page URL so the model can follow them.
   const re = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi
   let m
-  while ((m = re.exec(html)) && links.length < limit) {
+  // Iteration cap: a page whose nav repeats the same links thousands of times
+  // would otherwise scan the whole HTML to fill `limit` unique entries. Scan
+  // at most limit*4 anchors; dedupe keeps the result bounded regardless.
+  let scans = 0
+  const maxScans = limit * 4
+  while ((m = re.exec(html)) && links.length < limit && scans++ < maxScans) {
     const href = m[1].trim()
     if (!href || /^(javascript|mailto|tel|data):/i.test(href)) continue
     let url
@@ -899,6 +903,9 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal) {
       }
       pages.push(r)
       if (r.depth + 1 <= maxDepth) {
+        // Queue cap: a huge site (millions of links) would otherwise grow the
+        // queue unboundedly while maxPages bounds only what we *process*.
+        if (queue.length >= maxPages * 20) continue
         for (const l of r.links) {
           if (!sameHost(l.url, host) || isNoiseUrl(l.url)) continue
           const n = normalizeUrl(l.url)

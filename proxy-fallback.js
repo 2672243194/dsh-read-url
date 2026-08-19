@@ -59,8 +59,10 @@ export async function detectProxy() {
 // Returns { buffer, contentType, finalUrl } on success, { error } when the
 // proxy answered but the target failed, or null when there is no proxy /
 // curl is unavailable / the proxy itself is unreachable.
-export async function fetchViaCurlProxy(url, cfg, externalSignal) {
-  const proxy = await detectProxy()
+// `proxyOverride` lets the caller pass an already-detected proxy (the race
+// path probes once up front) instead of re-detecting here.
+export async function fetchViaCurlProxy(url, cfg, externalSignal, proxyOverride) {
+  const proxy = proxyOverride || (await detectProxy())
   if (!proxy) return null
   const maxSec = Math.max(10, Math.ceil(cfg.timeoutMs / 1000) + 5)
   const args = [

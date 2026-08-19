@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.6] - 2026-08-19
+
+### 日常维护：逻辑缺陷 + 效率 + 边界加固
+
+**修复（逻辑/边界）**
+- `raceFirstSuccess([])` 空数组永不 resolve（死锁）→ 立即返回 `{ success:false, failures:[] }`
+- `renderPage` 不响应外部取消：协作超时/模型取消后 playwright 仍跑满 poll 窗口 → goto 传 signal + poll 循环检查 aborted，取消立即释放浏览器（spa.js）
+- `extractLinks` 无迭代上限：导航重复链接上千次的页面会扫到 HTML 末尾 → 扫描上限 `limit*4`
+- `crawlSite` queue 无上限：海量链接站点内存膨胀 → queue 上限 `maxPages*20`
+
+**效率**
+- `fetchViaCurlProxy` 支持 `proxyOverride`：竞速路径已探测过代理，不再二次读 env/注册表
+
+**代码卫生**
+- 移除 `raceFirstSuccess` 上方重复注释（v0.4.5 修复残留）
+
+**验证**：36 → **37 断言**（+空竞速防挂起；修正 1 个 async 回调断言为顶层 await）+ test-spa 10 全绿；真实 e2e：SPA 渲染/竞速 1.3s/取消立即响应 全过；29 站回归 **18 OK / 4 预期 / 7 边界 / 0 崩溃**
+
 ## [0.4.5] - 2026-08-18
 
 ### 直连 + 代理并发竞速（海外站提速 ~94%）
