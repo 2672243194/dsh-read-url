@@ -12,6 +12,7 @@
 //   - HTML -> Markdown / plain text, paragraph-aligned smart truncation
 //   - session-level cache, compact text render (lowest token cost)
 import { TextDecoder } from 'node:util'
+import Schema from '@deepseek-ai/schemastery'
 import { looksLikeSpa, renderPage, closeBrowser } from './spa.js'
 import { detectProxy, fetchViaCurlProxy } from './proxy-fallback.js'
 // Re-export for tests / programmatic (PTC) cleanup.
@@ -31,6 +32,25 @@ const DEFAULTS = {
   spaRender: true,
   userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
 }
+
+// Settings card (DSH rc.7+): the six user-facing keys rendered as an editable
+// form by the host Web UI. Internal tuning keys (cacheTtlMs, cacheMax) stay
+// cordis.patch.yml-only. Keys not listed here never get hot-patched.
+const SETTINGS_NS = 'dsh-read-url'
+const SETTINGS_KEYS = ['timeoutMs', 'maxBytes', 'maxChars', 'maxLinks', 'spaRender', 'userAgent']
+// The tool-call budgets below are registered once at load but cfg.timeoutMs
+// hot-tunes at runtime via the settings card — budgets must be derived from
+// the schema max, or a UI-tuned timeout gets silently clamped by the host.
+const TIMEOUT_MS_MAX = 60000
+
+const SettingsSchema = Schema.object({
+  timeoutMs: Schema.number().min(500).max(TIMEOUT_MS_MAX).default(15000).description('Per-request network timeout (ms)'),
+  maxBytes: Schema.number().min(65536).max(16777216).default(3145728).description('Max response body size in bytes'),
+  maxChars: Schema.number().min(500).max(20000).default(6000).description('Default body chars returned per read (500-20000)'),
+  maxLinks: Schema.number().min(1).max(50).default(20).description('Default link count for read_url_links'),
+  spaRender: Schema.boolean().default(true).description('Render SPA pages via headless Chromium (needs playwright)'),
+  userAgent: Schema.string().role('textarea').default(DEFAULTS.userAgent).description('Request User-Agent'),
+})
 
 const cache = new Map()
 const decoders = new Map()
@@ -90,6 +110,7 @@ async function directFetch(url, signal, cfg) {
     if (contentType && !/text\/html|application\/xhtml|text\/plain/i.test(contentType)) {
       return { error: `Unsupported content-type: ${contentType.split(';')[0]}` }
     }
+    if (!res.body) return { buffer: Buffer.alloc(0), contentType, finalUrl: res.url }
     const chunks = []
     let size = 0
     for await (const chunk of res.body) {
@@ -178,9 +199,11 @@ async function fetchPage(url, externalSignal, cfg) {
 // Seam calls get the same cooperative timeout as fetchPage (a hanging
 // provider should not block the tool call forever).
 async function fetchViaWebSeam(ctx, url, externalSignal, cfg) {
-  const web = ctx && typeof ctx.get === 'function' ? ctx.get('web') : undefined
-  if (!web || typeof web.fetch !== 'function') return null
   try {
+    // ctx.get for a non-injected service throws on strict cordis hosts (seen
+    // with 'settings') — treat that as "seam absent" and fall through.
+    const web = ctx && typeof ctx.get === 'function' ? ctx.get('web') : undefined
+    if (!web || typeof web.fetch !== 'function') return null
     const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs)
     const signal = externalSignal ? AbortSignal.any([externalSignal, timeoutSignal]) : timeoutSignal
     const res = await web.fetch(url, { signal })
@@ -655,9 +678,13 @@ function renderResult(value) {
   if (r.cached) lines.push('(cached)')
   if (r.rendered) lines.push('(rendered — JS 执行后内容)')
   if (!r.text) {
-    lines.push(r.spaHint
-      ? `(无可读内容 — ${r.spaHint})`
-      : '(无可读内容 — 登录墙 / SPA 页 / 空页面；SPA 需安装 playwright)')
+    if (r.charsStart > 0 && !r.truncated) {
+      lines.push('(offset 已到文末，无更多内容)')
+    } else {
+      lines.push(r.spaHint
+        ? `(无可读内容 — ${r.spaHint})`
+        : '(无可读内容 — 登录墙 / SPA 页 / 空页面；SPA 需安装 playwright)')
+    }
   }
   lines.push('', r.text || '')
   if (Array.isArray(r.links) && r.links.length) {
@@ -692,7 +719,9 @@ function readLinksTool(ctx, cfg) {
       },
       required: ['url'],
     },
-    timeoutMs: 20000,
+    // Covers SPA-render fallback (fetch at settings-card max + DOM-stability
+    // poll); the fetch timeout itself stays live-tunable via the settings card.
+    timeoutMs: TIMEOUT_MS_MAX + 20000,
     output: {
       schema: {
         type: 'object',
@@ -791,7 +820,9 @@ function readUrlBatchTool(ctx, cfg) {
       },
       required: ['urls'],
     },
-    timeoutMs: Math.max(30000, cfg.timeoutMs + 15000),
+    // Worst case: ceil(10/4)=3 concurrency waves, each (fetch + SPA render) at
+    // the settings-card max. Registered at load; per-page fetch stays live.
+    timeoutMs: TIMEOUT_MS_MAX * 3 + 45000,
     output: {
       schema: {
         type: 'object',
@@ -877,7 +908,9 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal) {
   const pages = []
   const failures = []
   const queue = [{ url: entryUrl, depth: 0 }]
-  while (queue.length && pages.length < maxPages) {
+  // Stop once the host's cooperative signal fires (tool budget hit): without
+  // this the loop keeps draining the queue on instantly-aborted fetches.
+  while (queue.length && pages.length < maxPages && !(externalSignal && externalSignal.aborted)) {
     // Never overshoot the page budget within a batch round.
     const batch = queue.splice(0, Math.min(2, maxPages - pages.length, queue.length))
     const results = await Promise.all(
@@ -957,7 +990,9 @@ function readUrlSiteTool(ctx, cfg) {
       },
       required: ['url'],
     },
-    timeoutMs: 120000,
+    // Crawl waves (ceil(maxPages/2)) of fetch at the settings-card max; the
+    // cooperative signal stops the loop early once the host budget is hit.
+    timeoutMs: 300000,
     output: {
       schema: {
         type: 'object',
@@ -1002,7 +1037,54 @@ function readUrlSiteTool(ctx, cfg) {
 
 export function apply(ctx, config) {
   // Plugin-level config from cordis.patch.yml (config row), merged over defaults.
+  // `cfg` stays mutable: the settings registration below live-patches the six
+  // user-facing keys into this one object every tool already closes over.
+  // YAML is free-form: numbers can arrive quoted as strings, which would
+  // poison arithmetic and AbortSignal timeouts downstream — coerce once here.
   const cfg = { ...DEFAULTS, ...(config || {}) }
+  const num = (v, d) => {
+    const n = Number(v)
+    return Number.isFinite(n) ? n : d
+  }
+  cfg.timeoutMs = num(cfg.timeoutMs, DEFAULTS.timeoutMs)
+  cfg.maxBytes = num(cfg.maxBytes, DEFAULTS.maxBytes)
+  cfg.maxChars = num(cfg.maxChars, DEFAULTS.maxChars)
+  cfg.maxLinks = num(cfg.maxLinks, DEFAULTS.maxLinks)
+  cfg.cacheTtlMs = num(cfg.cacheTtlMs, DEFAULTS.cacheTtlMs)
+  cfg.cacheMax = num(cfg.cacheMax, DEFAULTS.cacheMax)
+  if (typeof cfg.userAgent !== 'string' || !cfg.userAgent.trim()) cfg.userAgent = DEFAULTS.userAgent
+  if (typeof cfg.spaRender !== 'boolean') cfg.spaRender = DEFAULTS.spaRender
+
+  // Settings card (DSH rc.7+). ctx.inject() is the official optional-dependency
+  // seam: the callback runs once the host provides `settings` (Web UI), and
+  // never on hosts without it (headless / older DSH) — cordis.patch.yml config
+  // stays the only layer there. The registration is an effect on this plugin's
+  // fiber, so unload reverts it together with the watchers.
+  let settingsState = 'settings card: waiting for host seam (DSH rc.7+)'
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['settings'], (sctx) => {
+      try {
+        const base = {}
+        for (const key of SETTINGS_KEYS) if (key in cfg) base[key] = cfg[key]
+        const scope = sctx.settings.register(SETTINGS_NS, SettingsSchema, { base, applies: 'live' })
+        // Adopt any already-stored user edits immediately, then keep following
+        // committed changes live (UI edits apply without restart).
+        const adopt = (next) => {
+          for (const key of SETTINGS_KEYS) {
+            const v = next && next[key]
+            if (v !== undefined) cfg[key] = v
+          }
+        }
+        adopt(scope.get())
+        scope.watch(adopt)
+        console.log('[dsh-read-url] settings card live: dsh-read-url namespace registered (Web UI settings page)')
+      } catch (err) {
+        console.log(`[dsh-read-url] settings card unavailable (${err && err.message}); cordis.patch.yml config still active`)
+      }
+    })
+  } else {
+    settingsState = 'settings card: host ctx.inject unavailable (DSH rc.6-)'
+  }
 
   // Temporal composability: unload must fully revert side effects.
   ctx.effect(() => () => {
@@ -1010,7 +1092,7 @@ export function apply(ctx, config) {
     closeBrowser().catch(() => {})
   })
 
-  console.log('[dsh-read-url] plugin loaded; tools read_url, read_url_batch, read_url_links, read_url_site registered')
+  console.log(`[dsh-read-url] plugin loaded; tools read_url, read_url_batch, read_url_links, read_url_site registered; ${settingsState}`)
 
   ctx.tools.register({
     name: 'read_url',
@@ -1031,7 +1113,11 @@ export function apply(ctx, config) {
       },
       required: ['url'],
     },
-    timeoutMs: Math.max(5000, cfg.timeoutMs + 5000),
+    // Pipeline budget must cover the worst real execution at the settings
+    // card's max: hot-tuned fetch (TIMEOUT_MS_MAX) + SPA render (DOM-stability
+    // poll, ~10s) + margin. Registered once at load; deriving it from the
+    // load-time cfg would clamp a later UI-tuned timeout.
+    timeoutMs: TIMEOUT_MS_MAX + 20000,
     output: {
       schema: {
         type: 'object',

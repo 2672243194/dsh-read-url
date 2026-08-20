@@ -9,7 +9,9 @@
 
 URL reader plugin for DeepSeek Harness: fetch any webpage, **auto-detect encoding (GBK/GB2312/UTF-8/Big5)**, extract the clean main content, and return **token-efficient compact text or structured Markdown**.
 
-Zero dependencies (Node 20+ built-ins), no API key, no server side — install and use.
+Zero runtime dependencies for the core (Node 20+ built-ins handle fetch/decode/extract; one DSH-official schema library is declared for the settings card), no API key, no server side — install and use.
+
+> **New in v0.5.0: Web UI settings card** (DSH rc.7+) — edit the six core options in the `dsh web` settings page; changes apply live without restart. Hosts without the settings seam (rc.6 and older, headless) fall back to `cordis.patch.yml` automatically.
 
 ## Why
 
@@ -149,7 +151,9 @@ chars 800+800/12398 · cached
 
 ### Configuration (optional)
 
-Plugin-level config is overridable via the profile's `cordis.patch.yml` (defaults in the plugin's own `cordis.patch.yml`):
+**Option 1: Web UI settings card** (DSH rc.7+, recommended): `dsh web` → Settings → the `dsh-read-url` card renders the six core options as an editable form; saving applies live (no restart). Values from `cordis.patch.yml` act as the form's base layer — reset returns to them.
+
+**Option 2: profile config file**: override via the profile's `cordis.patch.yml` (defaults in the plugin's own `cordis.patch.yml`):
 
 ```yaml
 - id: dsh-read-url
@@ -160,7 +164,11 @@ Plugin-level config is overridable via the profile's `cordis.patch.yml` (default
     maxLinks: 20          # read_url_links default count
     spaRender: true       # SPA rendering enhancement (needs playwright installed; degrades with a hint otherwise)
     userAgent: '...'      # request UA
+    cacheTtlMs: 300000    # success-cache TTL (internal, not on the UI form)
+    cacheMax: 32          # cache entry cap (internal, not on the UI form)
 ```
+
+Both coexist: UI-saved values (user layer) win over the config file (base layer). Hosts without the settings service (rc.6 and older, headless) use the config file only — behavior is identical to v0.4.x.
 
 ### Output (compact)
 
@@ -231,7 +239,7 @@ const results = await Promise.all([
 | Batch + failure isolation | 4-URL mix | ✅ 2/4 ok, failures isolated |
 | Site crawl | Ruan Yifeng blog | ✅ 5/5 pages tree map |
 
-- **39 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard, schema budget, bare-main pick) + **10 SPA-test assertions** all green;
+- **45 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard, schema budget, bare-main pick, settings-card contracts, hot-tuned timeout budgets, yml string coercion, strict-host seam degradation) + **10 SPA-test assertions** all green;
 - Real case: on a Xiaoheihe post, comment like-counts (`up` field) could not be attributed from flattened text — **precise fields should come from the page's underlying data API** (e.g. `/bbs/app/link/tree` JSON). This is a shared boundary of text extractors, not a defect.
 
 ## Roadmap

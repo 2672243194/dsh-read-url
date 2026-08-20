@@ -241,6 +241,67 @@ ok('apply merges config and registers both tools', () => {
   assert.ok(!links.parameters.properties.limit.description.includes('default 5'))
 })
 
+ok('settings card registers live namespace with patch-yml base (DSH rc.7+)', () => {
+  const tools = []
+  let registered = null
+  let watched = 0
+  const settingsSeam = {
+    register: (ns, schema, opts) => {
+      registered = { ns, schema, opts }
+      return { get: () => ({ maxChars: 900 }), watch: (cb) => { watched++; cb({ maxChars: 900, spaRender: false }); return () => {} } }
+    },
+  }
+  const fakeCtx = {
+    tools: { register: (t) => tools.push(t) },
+    effect: () => {},
+    get: () => undefined,
+    inject: (deps, cb) => { cb({ settings: settingsSeam }) },
+  }
+  m.apply(fakeCtx, { maxChars: 8000, timeoutMs: 9000, cacheMax: 5 })
+  assert.ok(registered, 'settings.register must run once the host provides the seam (ctx.inject)')
+  assert.equal(registered.ns, 'dsh-read-url', 'namespace must be the plugin id')
+  assert.equal(registered.opts.applies, 'live', 'settings must apply live (no restart)')
+  assert.equal(registered.opts.base.maxChars, 8000, 'base layer carries the cordis.patch.yml value')
+  assert.equal(registered.opts.base.timeoutMs, 9000)
+  assert.equal(registered.opts.base.cacheMax, undefined, 'internal tuning keys stay out of the UI schema')
+  assert.ok(typeof registered.schema === 'function' && typeof registered.schema.toJSON === 'function', 'schema must be a schemastery object the host can serialize')
+  assert.ok(watched >= 1, 'watch must be subscribed for live updates')
+  assert.equal(tools.length, 4, 'tools still registered alongside settings')
+})
+
+ok('settings registration failure degrades gracefully', () => {
+  const tools = []
+  const fakeCtx = {
+    tools: { register: (t) => tools.push(t) },
+    effect: () => {},
+    get: () => undefined,
+    inject: (deps, cb) => { cb({ settings: { register: () => { throw new Error('duplicate ns') } } }) },
+  }
+  m.apply(fakeCtx, {})
+  assert.equal(tools.length, 4, 'apply must survive a settings-seam failure and register all tools')
+})
+
+ok('host without settings service (headless / DSH rc.6-) stays on cordis.patch.yml config', () => {
+  const tools = []
+  // seam exists but the service never arrives: callback must simply never fire
+  const fakeCtx = {
+    tools: { register: (t) => tools.push(t) },
+    effect: () => {},
+    get: () => undefined,
+    inject: () => {},
+  }
+  m.apply(fakeCtx, {})
+  assert.equal(tools.length, 4, 'apply must not require the settings service')
+  const tools2 = []
+  const fakeCtx2 = {
+    tools: { register: (t) => tools2.push(t) },
+    effect: () => {},
+    get: () => undefined,
+  }
+  m.apply(fakeCtx2, {})
+  assert.equal(tools2.length, 4, 'apply must not require ctx.inject at all (very old hosts)')
+})
+
 ok('tool descriptions stay compact & static (KV-cache friendly)', () => {
   const tools = []
   const fakeCtx = { tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }
@@ -264,6 +325,59 @@ ok('parameter schemas stay compact (fixed per-call cost)', () => {
   }
   assert.ok(schemaTotal < 2000, `4 parameter schemas total ${schemaTotal} chars (budget 2000)`)
 })
+
+ok('pipeline timeout budgets cover the settings-card max (hot-tuned worst case)', () => {
+  const tools = []
+  const fakeCtx = { tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }
+  m.apply(fakeCtx, {})
+  const by = Object.fromEntries(tools.map((t) => [t.name, t]))
+  // budgets are registered once at load but cfg.timeoutMs hot-tunes up to the
+  // schema max (60s): budget < max would clamp a UI-tuned timeout mid-flight
+  assert.ok(by.read_url.timeoutMs >= 80000, `read_url budget ${by.read_url.timeoutMs} must cover 60s fetch + 10s render`)
+  assert.ok(by.read_url_links.timeoutMs >= 80000, `read_url_links budget ${by.read_url_links.timeoutMs} must cover render fallback`)
+  // worst chain: 3 concurrency waves of (fetch + render) at the card max
+  assert.ok(by.read_url_batch.timeoutMs >= 225000, `read_url_batch budget ${by.read_url_batch.timeoutMs} must cover 3 waves`)
+  // crawl waves: ceil(maxPages/2) of fetch at the card max, stopped early by signal
+  assert.ok(by.read_url_site.timeoutMs >= 300000, `read_url_site budget ${by.read_url_site.timeoutMs} must cover crawl waves`)
+})
+
+ok('cordis.patch.yml numeric strings are coerced, not concatenated', () => {
+  const tools = []
+  let registered = null
+  const settingsSeam = {
+    register: (_ns, _schema, opts) => {
+      registered = opts
+      return { get: () => ({}), watch: () => () => {} }
+    },
+  }
+  const fakeCtx = {
+    tools: { register: (t) => tools.push(t) },
+    effect: () => {},
+    get: () => undefined,
+    inject: (_deps, cb) => cb({ settings: settingsSeam }),
+  }
+  m.apply(fakeCtx, { timeoutMs: '25000', maxChars: '8000', spaRender: 'yes' })
+  assert.equal(registered.base.timeoutMs, 25000, `string '25000' must arrive coerced, got ${typeof registered.base.timeoutMs}`)
+  assert.equal(typeof registered.base.timeoutMs, 'number')
+  assert.equal(registered.base.maxChars, 8000)
+  const read = tools.find((t) => t.name === 'read_url')
+  assert.equal(typeof read.timeoutMs, 'number')
+})
+
+{
+  // Strict cordis hosts throw on ctx.get for non-injected services (seen with
+  // 'settings' in the wild): the web seam must degrade to direct fetch, and the
+  // tool must return an error object instead of propagating the throw.
+  const boomCtx = {
+    tools: { register: () => {} },
+    effect: () => {},
+    get: () => { throw new Error('cannot get property "web" without inject') },
+  }
+  const r = await m.readUrl({ url: 'https://no-such-host-dsh-test.invalid/x', maxChars: 500 }, boomCtx)
+  assert.ok(r && typeof r.error === 'string', `must return {error} instead of throwing: ${JSON.stringify(r)}`)
+  passed++
+  console.log('  ok - throwing web seam (strict host) degrades to direct fetch')
+}
 
 {
   // robustness: tools must never throw on missing/empty args (defensive)

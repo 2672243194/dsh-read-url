@@ -20,8 +20,14 @@ export function looksLikeSpa(html) {
 
 async function getBrowser() {
   if (!browserPromise) {
-    const { chromium } = await import('playwright')
-    browserPromise = chromium.launch({ headless: true })
+    // A failed launch (playwright later installed / chromium download finished)
+    // must not stay cached as a rejected promise — reset so the next call retries.
+    browserPromise = import('playwright')
+      .then(({ chromium }) => chromium.launch({ headless: true }))
+      .catch((e) => {
+        browserPromise = null
+        throw e
+      })
   }
   return browserPromise
 }
@@ -73,9 +79,13 @@ export async function renderPage(url, externalSignal) {
 
 // Called on plugin unload (temporal composability): release the browser.
 export async function closeBrowser() {
-  if (browserPromise) {
-    const b = await browserPromise
+  if (!browserPromise) return
+  const p = browserPromise
+  browserPromise = null
+  try {
+    const b = await p
     await b.close().catch(() => {})
-    browserPromise = null
+  } catch {
+    // launch never completed — nothing to close
   }
 }
