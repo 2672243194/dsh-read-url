@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.9] - 2026-08-20
+
+### 稳定性：配置健壮性 + 严格宿主兼容 + 资源泄漏
+
+**修复（真 bug）**
+- `cordis.patch.yml` 数字加引号（`timeoutMs: "15000"`）时按字符串拼接进超时预算（`"1500020000"`）→ 加载时统一强转数字并钳制到合理范围（timeoutMs 500–120000 等），非法值回退默认
+- 严格 cordis 宿主上 `ctx.get('web')` 对未注入服务直接抛错（同 `settings` 踩过的坑）→ 移入 try，降级为全局 fetch
+- 超时预算公式低估最坏链路：SPA 渲染实际是 goto 30s 上限 + DOM 轮询 10s = 40s，原公式只留 20s → 修正为 `timeoutMs + 45s`，且随配置缩放（60s 配置得 105s 预算，不再钳制）
+- `read_url_site` 预算 120s 覆盖不了 50 页 × 长超时的爬取波次 → 改为随配置缩放（`timeoutMs × 25` 波）
+- `crawlSite` 在协作超时触发后不退出循环（对已中止的 fetch 空转清空队列）→ while 增加 signal aborted 检查
+- 无 body 响应（204/304）导致 `res.body` 迭代抛 TypeError → 空响应防护返回空 buffer
+- offset 续读到文末时误报"登录墙 / SPA 页" → 识别文末，提示"offset 已到文末"
+- playwright 启动失败被永久缓存为 rejected promise（装好后也不重试）→ 失败自愈重置；`closeBrowser` 对未完成的 launch 健壮化
+
+**测试**：39 → **42 断言**（+最坏链路预算随配置缩放、yml 字符串强转+钳制、严格宿主 seam 降级）+ test-spa 10 全绿
+
+**明确不做**：Web UI 设置卡片——宿主侧注册成功但官方 UI 只渲染自带浏览器半边的插件（"A served namespace no card claims renders nothing"），为一个 6 字段低频配置维护 React 构建链不划算；配置走 `cordis.patch.yml` 已足够
+
 ## [0.4.8] - 2026-08-19
 
 ### 41 站多类型实测 + 提取修复

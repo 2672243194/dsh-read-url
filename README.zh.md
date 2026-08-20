@@ -9,9 +9,7 @@
 
 DeepSeek Harness 的 URL 阅读插件：抓取任意网页，**自动识别编码（GBK/GB2312/UTF-8/Big5）**，提取干净正文，输出**省 token 的紧凑文本或结构化 Markdown**。
 
-核心零运行时依赖（Node 20+ 内置能力完成抓取/转码/提取；仅一个 DSH 官方 schema 库用于设置卡片声明），免 API key，免服务端，装完即用。
-
-> **v0.5.0 新增：Web UI 设置卡片**（DSH rc.7+）——`dsh web` 设置页可视化编辑六项核心配置，改完即生效无需重启；rc.6 及更早版本自动回退 `cordis.patch.yml` 配置，行为不变。
+核心零运行时依赖（Node 20+ 内置能力完成抓取/转码/提取），免 API key，免服务端，装完即用。
 
 ## 为什么做它
 
@@ -152,24 +150,22 @@ chars 800+800/12398 · cached
 
 ### 配置（可选）
 
-**方式一：Web UI 设置卡片**（DSH rc.7+，推荐）：`dsh web` → 设置页 → `dsh-read-url` 卡片，六项核心配置表单化编辑，保存即热生效（无需重启）。`cordis.patch.yml` 的值作为表单的"基础层"，重置即回退到它。
-
-**方式二：profile 配置文件**：通过 profile 的 `cordis.patch.yml` 覆盖（默认值见插件自带 `cordis.patch.yml`）：
+通过 profile 的 `cordis.patch.yml` 覆盖（默认值见插件自带 `cordis.patch.yml`）：
 
 ```yaml
 - id: dsh-read-url
   config:
-    timeoutMs: 15000      # 单请求超时
+    timeoutMs: 15000      # 单请求超时（500-120000，自动钳制）
     maxBytes: 3145728     # 响应体上限（字节）
     maxChars: 6000        # 默认正文截断
     maxLinks: 20          # read_url_links 默认条数
     spaRender: true       # SPA 渲染增强（需 playwright 已安装，未装自动降级提示）
     userAgent: '...'      # 请求 UA
-    cacheTtlMs: 300000    # 成功缓存 TTL（内部项，不在 UI 表单）
-    cacheMax: 32          # 缓存条目上限（内部项，不在 UI 表单）
+    cacheTtlMs: 300000    # 成功缓存 TTL
+    cacheMax: 32          # 缓存条目上限
 ```
 
-设置卡片与配置文件可共存：UI 保存的值（用户层）优先于配置文件（基础层）；rc.6 及更早宿主或 headless 模式没有设置服务时，自动只用配置文件，行为与 v0.4.x 完全一致。
+配置在加载时统一强转数字并钳制到合理范围——YAML 里加引号的数字也能用，非法值回退默认。
 
 ### 输出结构（紧凑）
 
@@ -240,7 +236,7 @@ const results = await Promise.all([
 | **批量 + 失败隔离** | 4 URL 混合 | ✅ 2/4 成功、失败隔离 |
 | **整站爬取** | 阮一峰博客 | ✅ 5/5 页树状站点地图 |
 
-- **45 个单元断言**（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、设置卡片注册/降级/热更新契约、热更新超时预算守卫、yml 字符串强转、严格宿主 seam 降级）+ **10 个 SPA 测试断言**全绿；
+- **42 个单元断言**（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级）+ **10 个 SPA 测试断言**全绿；
 - 一个真实案例：小黑盒帖子的评论点赞数（`up` 字段）无法从扁平文本确定归属——**精确字段应走页面背后的数据 API**（如 `/bbs/app/link/tree` JSON），这是同类文本提取器的共同边界，不是缺陷。
 
 ## Roadmap
@@ -249,12 +245,11 @@ const results = await Promise.all([
 - [x] SPA 页面按需渲染（可选 Playwright 增强，装浏览器后自动启用）
 - [x] 批量读取（`read_url_batch`）
 - [x] 整站递归爬取（`read_url_site`）
-- [x] Web UI 设置卡片（DSH rc.7+，热生效；旧宿主自动降级）
 
 ## 开发
 
 ```bash
-node test.mjs          # 单元自测（转码/提取/Markdown/截断/批量/站点爬取/缓存隔离/设置卡片）
+node test.mjs          # 单元自测（转码/提取/Markdown/截断/批量/站点爬取/缓存隔离/配置钳制）
 
 # SPA 渲染真实测试（需 playwright 已安装，未装自动 SKIP）
 node test-spa.mjs      # 10 断言：JS 正文/渲染后链接/工具不崩溃/缓存隔离
