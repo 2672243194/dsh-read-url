@@ -235,6 +235,8 @@ const results = await Promise.all([
 
 Sweep-driven pre-release fixes (each locked by unit tests): double-escaped RSS descriptions, headerless binary sniffing, JS-redirect shell rendering, **`role="main"` container cut short by nested divs** (gnu.org 165→800 chars), **tiny `<article>` hijacking the main content** (gitlab 71→800 chars), relaxed render-acceptance threshold.
 
+Plus a **15-item DSH acceptance round** (a real agent driving every read_url tool end-to-end): 12 items fully conformant, the 3 findings all closed — ① Cloudflare's "Just a moment..." interstitial carries MORE text than the real body (259 vs 135 chars) and was mistaken for a render improvement → challenge-marker detection + an extra 8s wait for the auto-redirect + interstitial results rejected; ② ruanyifeng.com ships ZERO author/date meta tags, the byline only exists in body text → byline fallback harvesting the body head (verified: `author=阮一峰 published=2026年8月21日`); ③ PDF rejection now attributes clearly: `Unsupported content-type: application/pdf`.
+
 | Category | Sites | Result |
 |---|---|---|
 | Portal navigation cleaning | Baidu / QQ / NetEase / Sina / Douban / CSDN / Sohu / Ifeng | ✅ clean text, no CSS noise |
@@ -252,7 +254,7 @@ Sweep-driven pre-release fixes (each locked by unit tests): double-escaped RSS d
 | Batch + failure isolation | 4-URL mix | ✅ 2/4 ok, failures isolated |
 | Site crawl | Ruan Yifeng blog | ✅ 5/5 pages tree map |
 
-- **72 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard, schema budget, bare-main pick, worst-case timeout budgets, yml string coercion + clamping, strict-host seam degradation, UTF-16 BOM, Shift-JIS, density filter, pagination join/cap/disable, JSON render, RSS parse, sitemap rejection, 429 Retry-After retry, image alt, code-fence language, metadata, og:description fallback, double-escaped feed, headerless binary sniff, nested role=main, tiny-article fallback, unbalanced-tag degradation) + **12 SPA-test assertions** all green;
+- **77 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard, schema budget, bare-main pick, worst-case timeout budgets, yml string coercion + clamping, strict-host seam degradation, UTF-16 BOM, Shift-JIS, density filter, pagination join/cap/disable, JSON render, RSS parse, sitemap rejection, 429 Retry-After retry, image alt, code-fence language, metadata, og:description fallback, double-escaped feed, headerless binary sniff, nested role=main, tiny-article fallback, unbalanced-tag degradation, byline fallback, challenge-page detection) + **12 SPA-test assertions** all green;
 - Real case: on a Xiaoheihe post, comment like-counts (`up` field) could not be attributed from flattened text — **precise fields should come from the page's underlying data API** (e.g. `/bbs/app/link/tree` JSON). This is a shared boundary of text extractors, not a defect.
 
 ## Roadmap

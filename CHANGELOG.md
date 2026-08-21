@@ -46,7 +46,12 @@
 - **小 `<article>` 劫持主内容**：页面存在无关小 article（如订阅卡片，实测 about.gitlab.com 71 字符）时优先级高于 `<main>` → article 文本 < 200 字符且页面有 `<main>` 时回落 main
 - **渲染结果接受门槛过严**：静态提取为空时，渲染出 20–50 字符的短正文（JS 壳典型形态）被 `+50` 增量门槛拒绝 → 空静态 + 渲染 ≥ 20 字符即接受
 
-**测试（发布前终态）**：**72 断言**（+双转义 feed、无头二进制拒绝、嵌套 role=main、薄 article 回落 main、不平衡标签降级）+ test-spa **12 全绿**（+JS 跳转壳渲染）+ **152 站真实回归**（113 OK / 16 预期边界 THIN / 23 环境类 ERR / 0 崩溃；对比修复前 THIN 20 → 16，gnu.org 165→800 字符、gitlab 71→800 字符）
+**发布前实测修复二（DSH 15 项全功能验收驱动）**
+- **Cloudflare 人机验证页劫持正文**：挑战过渡页（"Just a moment..."）文字量可超过真实静态正文（实测 259 vs 135 字符），被渲染提升逻辑误当作更优结果 → 三层防御：`looksLikeChallenge` 高特异性特征（cf-chl / cdn-cgi/challenge-platform 等）识别；renderPage 检测到挑战页时额外轮询 8s 等待自动跳转（验证常在数秒内自行通过）；仍是指纹页则拒绝渲染结果、保留静态正文 + 明确提示，且挑战页 DOM 不污染分页/链接提取
+- **元数据 byline 兜底**：无任何 author/date meta 的页面（实测阮一峰博客零 meta 标签）从正文头部 600 字符提取「作者：XXX / 日期：2026年8月21日」等署名行——仅填空缺字段、meta 优先、深部提及不误采、markdown 链接语法不泄漏
+- 测试 PDF 样本 URL 失效（africau.edu sample.pdf 已 404）→ 换 mozilla.github.io 稳定样本，PDF 类型拒绝路径恢复验证（明确报 `Unsupported content-type: application/pdf`）
+
+**测试（发布前终态）**：**77 断言**（+双转义 feed、无头二进制拒绝、嵌套 role=main、薄 article 回落 main、不平衡标签降级、byline 兜底四态、挑战页识别不误伤正文）+ test-spa **12 全绿**（+JS 跳转壳渲染）+ **152 站真实回归**（113 OK / 16 预期边界 THIN / 23 环境类 ERR / 0 崩溃；对比修复前 THIN 20 → 16，gnu.org 165→800 字符、gitlab 71→800 字符）+ **DSH 15 项全功能验收**（12 项完全符合，3 项问题全部修复闭环：验证页防御、byline 字段、PDF 类型归因）
 
 **发布策略**：大版本收敛——此后以修 bug 为主，减少更新频率。
 

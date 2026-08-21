@@ -18,6 +18,17 @@ export function looksLikeSpa(html) {
   return n >= 5
 }
 
+// High-specificity markers of a bot-challenge interstitial (Cloudflare and
+// friends). Measured: ruanyifeng.com served "Just a moment..." whose DOM
+// stabilizes while the challenge sits in "Verification successful. Waiting
+// for ... to respond" — the poll loop returned that transitional page and
+// the caller mistook it for an improvement over static extraction.
+const CHALLENGE_RE = /just a moment|performing security verification|verifying (you are|your) human|cf-chl|cf_chl|cdn-cgi\/challenge-platform|attention required!\s*[|·]?\s*cloudflare|enable javascript and cookies to continue/i
+
+export function looksLikeChallenge(html) {
+  return typeof html === 'string' && CHALLENGE_RE.test(html)
+}
+
 async function getBrowser() {
   if (!browserPromise) {
     // A failed launch (playwright later installed / chromium download finished)
@@ -66,7 +77,21 @@ export async function renderPage(url, externalSignal) {
       if (len === prevLen && prevLen >= 0) break
       prevLen = len
     }
-    const html = await page.content()
+    // A bot-challenge interstitial "stabilizes" the same way real content
+    // does while it waits to redirect. When the DOM settled on a challenge
+    // page, keep polling briefly: the challenge often clears and navigates
+    // on its own within a few seconds (measured: Cloudflare "Verification
+    // successful. Waiting for ... to respond").
+    let html = await page.content()
+    if (looksLikeChallenge(html)) {
+      const t1 = Date.now()
+      while (Date.now() - t1 < 8000) {
+        if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
+        await page.waitForTimeout(700)
+        html = await page.content()
+        if (!looksLikeChallenge(html)) break
+      }
+    }
     const finalUrl = page.url()
     return { html, finalUrl }
   } catch (e) {

@@ -1,7 +1,7 @@
 // dsh-read-url self-test — zero-dependency, run: node test.mjs
 import assert from 'node:assert/strict'
 import * as m from './index.js'
-import { looksLikeSpa } from './spa.js'
+import { looksLikeSpa, looksLikeChallenge } from './spa.js'
 const { decodeBuffer, extract, smartTruncate, blockMd, inlineMd, decodeTextEntities, raceFirstSuccess } = m
 
 let passed = 0
@@ -148,6 +148,52 @@ ok('unbalanced role=main div degrades to body path, never returns null', () => {
 <p>正文第二段继续。</p></body></html>`
   const r = extract(broken, 'text')
   assert.ok(r.text.includes('正文第二段'), `body fallback works: ${r.text.slice(0, 80)}`)
+})
+
+console.log('post-test fixes (15-item DSH test findings)')
+ok('byline fallback harvests author/date from meta-less body head', () => {
+  const page = `<html><head><title>周刊</title></head><body><main>
+<h1>科技爱好者周刊（第 409 期）</h1>
+<p>作者：阮一峰</p>
+<p>日期：2026年8月21日</p>
+<p>${'这里是正文内容，讲了很多事情。'.repeat(80)}</p>
+</main></body></html>`
+  const r = extract(page, 'text')
+  assert.equal(r.author, '阮一峰', `author: ${JSON.stringify(r.author)}`)
+  assert.equal(r.published, '2026年8月21日', `published: ${JSON.stringify(r.published)}`)
+})
+
+ok('meta tags still win over byline fallback', () => {
+  const page = `<html><head>
+<meta name="author" content="元数据作者">
+<meta property="article:published_time" content="2025-01-01">
+</head><body><main><p>作者：正文里的作者</p><p>${'正文。'.repeat(100)}</p></main></body></html>`
+  const r = extract(page, 'text')
+  assert.equal(r.author, '元数据作者', `author: ${JSON.stringify(r.author)}`)
+  assert.equal(r.published, '2025-01-01', `published: ${JSON.stringify(r.published)}`)
+})
+
+ok('byline fallback ignores deep-body mentions (600-char window)', () => {
+  const page = `<html><body><main><p>${'正常正文段落，与作者无关。'.repeat(60)}</p>
+<p>作者：文章中部提到的名字</p></main></body></html>`
+  const r = extract(page, 'text')
+  assert.equal(r.author, '', `deep mention must not be harvested: ${JSON.stringify(r.author)}`)
+})
+
+ok('byline fallback handles markdown mode link syntax', () => {
+  const page = `<html><body><main><p>作者：[阮一峰](https://ruanyifeng.com)</p><p>${'正文。'.repeat(100)}</p></main></body></html>`
+  const r = extract(page, 'markdown')
+  assert.ok(!r.author.includes(']('), `markdown link syntax must not leak: ${JSON.stringify(r.author)}`)
+})
+
+ok('looksLikeChallenge detects Cloudflare interstitials, not real pages', () => {
+  const cf = `<html><head><title>Just a moment...</title></head><body>
+<div>Verifying you are human. This may take a few seconds.</div>
+<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1"></script></body></html>`
+  assert.ok(looksLikeChallenge(cf), 'cloudflare page detected')
+  const real = `<html><head><title>正常文章</title></head><body><main>
+<p>正文讨论了网络安全与验证码技术的历史演进。</p></main></body></html>`
+  assert.ok(!looksLikeChallenge(real), 'normal prose mentioning verification must not match')
 })
 
 console.log('smartTruncate / paragraph alignment')

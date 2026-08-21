@@ -34,7 +34,7 @@ const SITES = [
   ['v2ex (proxy-fallback)', 'https://www.v2ex.com/'],
   ['bbc-zh (proxy-fallback)', 'https://www.bbc.com/zhongwen/simp'],
   ['wikipedia-en (net-boundary)', 'https://en.wikipedia.org/wiki/JavaScript'],
-  ['pdf-sample (type block)', 'https://www.africau.edu/images/default/sample.pdf'],
+  ['pdf-sample (type block)', 'https://mozilla.github.io/pdf.js/web/compressed.tracemonkey-pldi-09.pdf'],
   ['httpbin-png (type block)', 'https://httpbin.org/image/png'],
   ['httpbin-404 (net-boundary)', 'https://httpbin.org/status/404'],
   ['httpbin-redirect (net-boundary)', 'https://httpbin.org/redirect/3'],

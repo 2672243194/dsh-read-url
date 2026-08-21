@@ -236,6 +236,8 @@ const results = await Promise.all([
 
 扫描驱动的发布前修复（全部带单测锁定）：RSS 双重转义、无头二进制嗅探、JS 跳转壳渲染、**`role="main"` 嵌套 div 截断**（gnu.org 165→800 字符）、**小 article 劫持主内容**（gitlab 71→800 字符）、渲染接受门槛放宽。
 
+另有 **DSH 15 项全功能验收轮**（真实 Agent 调用 read_url 系工具逐项核对）：12 项完全符合，3 项问题全部修复闭环——① Cloudflare「Just a moment...」验证页文字量超过真实正文（259 vs 135 字符）被误当作渲染提升 → 挑战页特征识别 + 渲染后额外等待 8s 自动跳转 + 拒绝接受指纹页；② 阮一峰页面零 author/date meta 标签，作者/日期只在正文里 → byline 兜底从正文头部 600 字符提取署名行（实测 `author=阮一峰 published=2026年8月21日`）；③ PDF 类型拒绝归因 → 明确报 `Unsupported content-type: application/pdf`。
+
 | 类别 | 站点 | 结果 |
 |---|---|---|
 | 门户导航净化 | 百度 / 腾讯 / 网易 / 新浪 / 豆瓣 / CSDN / 搜狐 / 凤凰 | ✅ 干净正文，无 CSS 噪音 |
@@ -253,7 +255,7 @@ const results = await Promise.all([
 | **批量 + 失败隔离** | 4 URL 混合 | ✅ 2/4 成功、失败隔离 |
 | **整站爬取** | 阮一峰博客 | ✅ 5/5 页树状站点地图 |
 
-- **72 个单元断言**（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级、UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 Retry-After 重试、图片 alt、代码语言、元数据、og:description 回落、双转义 feed、无头二进制嗅探、嵌套 role=main、薄 article 回落、不平衡标签降级）+ **12 个 SPA 测试断言**全绿；
+- **77 个单元断言**（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级、UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 Retry-After 重试、图片 alt、代码语言、元数据、og:description 回落、双转义 feed、无头二进制嗅探、嵌套 role=main、薄 article 回落、不平衡标签降级、byline 兜底、人机验证页识别）+ **12 个 SPA 测试断言**全绿；
 - 一个真实案例：小黑盒帖子的评论点赞数（`up` 字段）无法从扁平文本确定归属——**精确字段应走页面背后的数据 API**（如 `/bbs/app/link/tree` JSON），这是同类文本提取器的共同边界，不是缺陷。
 
 ## Roadmap

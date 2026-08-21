@@ -15,10 +15,10 @@
 //   - HTML -> Markdown / plain text, paragraph-aligned smart truncation
 //   - session-level cache, compact text render (lowest token cost)
 import { TextDecoder } from 'node:util'
-import { looksLikeSpa, renderPage, closeBrowser } from './spa.js'
+import { looksLikeSpa, renderPage, closeBrowser, looksLikeChallenge } from './spa.js'
 import { detectProxy, fetchViaCurlProxy, looksBinary } from './proxy-fallback.js'
 // Re-export for tests / programmatic (PTC) cleanup.
-export { closeBrowser, renderPage, looksLikeSpa } from './spa.js'
+export { closeBrowser, renderPage, looksLikeSpa, looksLikeChallenge } from './spa.js'
 
 export const name = 'dsh-read-url'
 export const inject = ['tools']
@@ -599,6 +599,27 @@ function extractMeta(html) {
   }
 }
 
+// Meta-less pages (measured: ruanyifeng.com carries ZERO author/date meta
+// tags) still print the byline inside the body head: "作者：阮一峰 日期：
+// 2026年8月21日". Fill ONLY the missing fields, and only from the first
+// 600 chars of body text — deeper matches are content, not bylines.
+const BYLINE_AUTHOR_RE = /(?:作者|責任編輯|責任主编|editor)[：:\s]{1,3}([^\s，,。/|()（）[\]]{2,24})/
+const BYLINE_DATE_RE = /(?:发表日期|发布日期|发表时间|发布时间|日期|发表于|发布于|published(?:\s+on)?)[：:\s]{0,3}(\d{4}[-/.年]\s?\d{1,2}[-/.月]\s?\d{1,2}日?|\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2})?)/i
+
+function bylineFallback(text, meta) {
+  const head = typeof text === 'string' ? text.slice(0, 600) : ''
+  const out = { published: meta.published, author: meta.author }
+  if (!out.author) {
+    const m = BYLINE_AUTHOR_RE.exec(head)
+    if (m) out.author = m[1].trim().slice(0, 40)
+  }
+  if (!out.published) {
+    const m = BYLINE_DATE_RE.exec(head)
+    if (m) out.published = m[1].replace(/\s+/g, ' ').trim().slice(0, 40)
+  }
+  return out
+}
+
 export function extract(html, mode) {
   const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html) || /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i.exec(html)
   const siteName = /<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']+)["']/i.exec(html)
@@ -620,12 +641,13 @@ export function extract(html, mode) {
     text = meta.description
     usedDescription = true
   }
+  const byline = bylineFallback(text, meta)
   return {
     title: titleMatch ? textOnly(titleMatch[1]) || titleMatch[1].trim() : '',
     siteName: siteName ? siteName[1] : '',
     lang: langMatch ? langMatch[1] : '',
-    published: meta.published,
-    author: meta.author,
+    published: byline.published,
+    author: byline.author,
     text,
     usedDescription,
   }
@@ -932,19 +954,30 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     const rr = await renderPage(finalUrl || url, externalSignal)
     if (rr.html) {
       renderedHtml = rr.html
-      const r2 = upgrade(extract(rr.html, mode), rr.html)
-      // Accept the rendered text when it meaningfully beats the static one.
-      // From an EMPTY static extraction even a short body is a real gain
-      // (measured: taptap-style JS shells render 30-60 chars of real content
-      // that the fixed +50 margin would reject).
-      const gain = r2.text.length - extracted.text.length
-      const accept = r2.text && (gain > 50 || (!extracted.text && r2.text.length >= 20))
-      if (accept) {
-        extracted = r2
-        finalUrl = rr.finalUrl || finalUrl
-        rendered = true
-      } else if (!extracted.text) {
-        spaHint = '已渲染仍无可读内容（可能登录墙或反爬拦截）'
+      // A challenge interstitial (Cloudflare "Just a moment...") must never
+      // be accepted as an improvement — it can carry MORE text than the real
+      // static body (measured: 259 chars of verification prose vs 135 chars
+      // of real content on ruanyifeng.com) and would evict the latter.
+      if (looksLikeChallenge(rr.html)) {
+        renderedHtml = null // pagination/links must not read the interstitial DOM
+        spaHint = extracted.text
+          ? '已渲染但被人机验证页拦截，保留静态提取结果'
+          : '已渲染但被人机验证页拦截（无静态内容可用）'
+      } else {
+        const r2 = upgrade(extract(rr.html, mode), rr.html)
+        // Accept the rendered text when it meaningfully beats the static one.
+        // From an EMPTY static extraction even a short body is a real gain
+        // (measured: taptap-style JS shells render 30-60 chars of real content
+        // that the fixed +50 margin would reject).
+        const gain = r2.text.length - extracted.text.length
+        const accept = r2.text && (gain > 50 || (!extracted.text && r2.text.length >= 20))
+        if (accept) {
+          extracted = r2
+          finalUrl = rr.finalUrl || finalUrl
+          rendered = true
+        } else if (!extracted.text) {
+          spaHint = '已渲染仍无可读内容（可能登录墙或反爬拦截）'
+        }
       }
     } else {
       spaHint = rr.error
@@ -1107,7 +1140,9 @@ function readLinksTool(ctx, cfg) {
       // static shell may be a JS-redirect (same rationale as read_url).
       if (links.length < 3 && cfg.spaRender !== false && (looksLikeSpa(html) || (links.length === 0 && /<script[\s>]/i.test(html)))) {
         const rr = await renderPage(finalUrl || url, exec && exec.signal)
-        if (rr.html) {
+        // A challenge interstitial's links are the challenge's own scripts —
+        // never an improvement over whatever the static HTML offered.
+        if (rr.html && !looksLikeChallenge(rr.html)) {
           const rl = extractLinks(rr.html, limit, rr.finalUrl || finalUrl)
           if (rl.length > links.length) {
             links = rl
