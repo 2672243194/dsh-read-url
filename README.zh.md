@@ -106,7 +106,7 @@ chars 800+800/12398 · cached
 
 ### 工具
 
-**`read_url(url, maxChars?, offset?, mode?, includeLinks?)`** — 抓取并提取干净正文。支持 HTML 网页、JSON 接口（紧凑重排渲染）、RSS/Atom 订阅源（条目列表 + `feedCount`）；分页长文（小说/新闻/论坛）自动拼接至 `paginateMax` 页；页面元数据（`published`、`author`）存在时自动提取
+**`read_url(url, maxChars?, offset?, mode?, includeLinks?)`** — 抓取并提取干净正文。支持 HTML 网页、JSON 接口（紧凑重排渲染）、RSS/Atom 订阅源（条目列表 + `feedCount`）；分页长文（小说/新闻/论坛）自动拼接至 `paginateMax` 页；页面元数据（`published`、`author`）自动提取——meta 标签优先，无 meta 时从正文署名行兜底
 
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
@@ -184,12 +184,14 @@ chars 800+800/12398 · cached
   "truncated": true,
   "charsTotal": 12990,
   "charsReturned": 6000,
+  "charsStart": 0,
   "text": "……",
-  "paginated": 3,            // 自动拼接的页数（仅 > 1 时出现）
-  "feedCount": 20,           // RSS/Atom 条目数（仅订阅源）
-  "published": "2026-08-01", // 页面声明了发布时间时
-  "author": "……",            // 页面声明了作者时
-  "links": []          // 仅 includeLinks=true 时
+  "rendered": true,        // 仅 SPA 渲染后提取时出现
+  "paginated": 3,          // 自动拼接的页数（仅 > 1 时出现）
+  "feedCount": 20,         // RSS/Atom 条目数（仅订阅源）
+  "published": "2026-08-01", // 页面声明了发布时间时（含署名行兜底）
+  "author": "……",            // 页面声明了作者时（含署名行兜底）
+  "links": []              // 仅 includeLinks=true 时
 }
 ```
 
@@ -213,26 +215,26 @@ const results = await Promise.all([
 5. **双层缓存**——成功结果按 URL 缓存 5 分钟（重复读取直接命中，省网络也省模型重试）；**失败结果缓存 30 秒**（坏 URL 不会触发重复 fetch 循环）；
 6. **KV Cache 友好（DeepSeek 成本特调）**——工具 schema/description 保持**静态文本**（不嵌入配置值），配置变更不会使可复用的 prompt 前缀失效，KV 缓存持续命中。DeepSeek 缓存命中 token 价格约为未命中的 1/10，前缀越稳定越省钱（官方 `tool-web` 文档同款分析）；
 7. **批量共用缓存**——`read_url_batch` 内部复用同一套缓存，重复批量读直接命中，且每页默认 3000 字符（低于单页 6000）控制总量；
-8. **固定开销压缩**——4 个工具 description 合计约 990 字符（有断言守卫，保持静态利于 KV 缓存）；HTML 实体解码扩展至 45 个命名实体，`&mdash;`/`&hellip;` 等残留不再浪费 token 或显示为乱码。
+8. **固定开销压缩**——4 个工具 description 合计约 900 字符（有断言守卫，保持静态利于 KV 缓存）；HTML 实体解码扩展至 45 个命名实体，`&mdash;`/`&hellip;` 等残留不再浪费 token 或显示为乱码。
 
 ## 技术说明
 
 - **编码**：BOM 优先探测（UTF-8 / UTF-16LE / UTF-16BE——字节级证据优先于任何声明），其次 HTTP `Content-Type` charset → HTML meta；内置 `TextDecoder` 转码（Node 20+ full-icu，页面声明的 Shift-JIS/EUC-JP/GBK/Big5 均可正确解码），GB2312 归一为 GBK，检测到乱码自动回退 UTF-8；
-- **内容类型分发**：URL 不一定是 HTML——JSON 接口紧凑重排渲染（缩进 1 格），RSS 2.0 / Atom 订阅源解析为条目列表（`标题 — 链接` + 摘要，`feedCount` 字段，`includeLinks` 时附完整 items）；XML sitemap 明确拒绝（对模型无阅读价值）；其余全部走 HTML 管线；
-- **正文提取**：优先 `<article>` / `<main>` / `role="main"`，剥离 `nav/footer/header/aside/form/iframe` 及广告类容器，启发式回归到 `<body>`；body 路径上追加**文本密度过滤**——丢弃链接主导的短块（相关推荐/分类侧栏/热门文章挂件），标准容器页面完全不走此路径；
+- **内容类型分发**：URL 不一定是 HTML——JSON 接口紧凑重排渲染（缩进 1 格），RSS 2.0 / Atom 订阅源解析为条目列表（`标题 — 链接` + 摘要，`feedCount` 字段，`includeLinks` 时附完整 items；条目摘要迭代「剥标签+解实体」直到稳定，双重转义的 `&lt;a&gt;` 不会漏成字面标签）；XML sitemap 明确拒绝（对模型无阅读价值）；其余全部走 HTML 管线；
+- **正文提取**：优先 `<article>`（聚合页多篇合并；无关小卡片 article——如订阅挂件——文本不足 200 字符且页面有 `<main>` 时自动回落 main）/ `<main>` / `role="main"`，`role="main"` 容器用**深度计数找平衡闭合标签**（嵌套 div 不会在第一个 `</div>` 被截断——实测 gnu.org 曾因此只取到 1/8 正文）；剥离 `nav/footer/header/aside/form/iframe` 及广告类容器，启发式回归到 `<body>`；body 路径上追加**文本密度过滤**——丢弃链接主导的短块（相关推荐/分类侧栏/热门文章挂件），标准容器页面完全不走此路径；
 - **分页拼接**：识别 `rel=next`（标准）或纯「下一页 / next / › / »」短锚文本（刻意保守，不做模糊猜测）；同域限定 + 防环；跨页重复段落自动去重；续页走静态快路径（分页 SPA 链每页一次完整渲染不划算）；
-- **元数据**：`published` / `author` 从 meta 标签提取进输出字段与状态行；空正文页（登录墙/JS 壳）回落到 `og:description` 作为提示，不再返回空；
+- **元数据**：`published` / `author` 从 meta 标签提取进输出字段与状态行；页面无相关 meta 时（如阮一峰博客零 meta 标签）从**正文头部 600 字符的署名行兜底**（「作者：X / 日期：2026年8月21日」，meta 优先、正文深部提及不误采、markdown 链接语法不泄漏）；空正文页（登录墙/JS 壳）回落到 `og:description` 作为提示，不再返回空；
 - **Markdown**：自研轻量标签状态机（标题/段落/列表/引用/代码块/表格/行内加粗斜体链接），零依赖；带 alt 的图片渲染为 `![alt](src)`（空 alt 装饰图丢弃），代码块围栏带 `language-*` class 里的语言标注；
-- **安全**：仅 http/https；不执行页面脚本；响应超 3MB 拒绝；15s 超时；**429/503 感知 Retry-After 重试一次**（封顶 5s，保证协作超时仍约束调用）；错误信息结构化返回（HTTP 状态/超时/类型不支持/DNS 归因如 `getaddrinfo ENOTFOUND` vs 被墙超时）；
+- **安全**：仅 http/https；不执行页面脚本；响应超 3MB 拒绝；15s 超时；**429/503 感知 Retry-After 重试一次**（封顶 5s，保证协作超时仍约束调用）；**无 Content-Type 头的响应按字节特征嗅探**（NUL 字节或控制字符占比 >30% 判为二进制，PDF/图片等明确拒绝，不进 HTML 管线产出乱码）；错误信息结构化返回（HTTP 状态/超时/类型不支持/DNS 归因如 `getaddrinfo ENOTFOUND` vs 被墙超时）；
 - **网络回退（代理，并发竞速）**：检测到代理时（环境变量 `HTTPS_PROXY`/`HTTP_PROXY` → **Windows 系统代理**注册表，Clash 类软件的真正落点），插件**同时发起**直连 fetch 与代理 curl（`-x` 显式传参，零 npm 依赖），**先完成且成功者胜**——海外站（直连被墙）经用户自己的代理 ~0.6s 读到，不再等直连超时兜底（实测 11s → 633ms，-94%）。输者立即 abort（curl 进程 kill / fetch 中止），**结果从不进入模型上下文，token 消耗零变化**。双方均失败时返回原始直连错误并注明代理尝试（`已尝试代理 …`）；无代理配置时退化为纯直连（行为与 v0.4.3 完全一致）；
 - **隐私**：插件**绝不使用开发者的任何网络配置**——代理回退只在运行时读取**你自己机器**的代理（环境变量或 Windows 系统代理）。无遥测、无统计、无数据收集：唯一的对外动作就是抓取你让它读的那个 URL；
 - **可选增强一（Firefox Reader Mode 算法）**：在 DSH profile 目录执行 `npm i @mozilla/readability happy-dom` 后自动启用，正文提取升级为 `@mozilla/readability`（MPL-2.0，引用不改写），未安装时回退内置启发式提取器，核心保持零依赖；
-- **可选增强二（SPA 页面渲染）**：在 DSH profile 目录执行 `npm i playwright && npx playwright install chromium` 后自动启用。检测到正文为空且页面脚本密集（疑似 Vue/React 客户端渲染）时，自动用无头 Chromium 渲染后再提取（`rendered` 标记告知模型）；渲染采用 `domcontentloaded` + **DOM 稳定轮询**（内容停止增长即收，上限 10s）而非 `networkidle`——心跳轮询站永不空闲，避免 30s 超时；未安装时优雅提示安装方法、不报错——核心保持零依赖；
+- **可选增强二（SPA 页面渲染）**：在 DSH profile 目录执行 `npm i playwright && npx playwright install chromium` 后自动启用。检测到正文为空且（页面脚本密集 疑似 Vue/React 客户端渲染，或 body 为空的 JS 跳转壳——script 数不多但正文全靠跳转）时，自动用无头 Chromium 渲染后再提取（`rendered` 标记告知模型）；渲染结果仅在**显著优于**静态提取时采用（静态为空时 ≥20 字符即接受，防短正文被拒）；**人机验证页防御**——Cloudflare「Just a moment...」等指纹页识别后额外轮询 8s 供其自动跳转，仍未通过则拒绝渲染结果、保留静态正文（指纹页文字量可能超过真实正文，实测 259 vs 135 字符，绝不当作提升），指纹页 DOM 也不污染分页/链接提取；渲染采用 `domcontentloaded` + **DOM 稳定轮询**（内容停止增长即收，上限 10s）而非 `networkidle`——心跳轮询站永不空闲，避免 30s 超时；未安装时优雅提示安装方法、不报错——核心保持零依赖；
 - **边界**：登录墙页面无法读取；SPA 页面需安装 Playwright 增强后渲染读取（未安装时返回明确提示）；**结构化数据（如评论的点赞数归属、榜单数值）不在文本提取范围**——本插件把 HTML 扁平化为可读文本，字段与数值的精确对应关系会丢失；需要精确字段时，用 Playwright 拦截页面实际调用的数据 API 获取（见下方「真实世界验证」）。
 
 ## 真实世界验证（2026-08-21，v1.0.0）
 
-152 站全量实测（`multi-site.mjs` 已提交可复跑，8 并发）：**113 OK / 16 预期边界（登录墙·验证页·静态小页） / 23 网络·反爬归因错误 / 0 崩溃**。覆盖国内门户 / 媒体 / 电商（京东·淘宝·拼多多·苏宁·当当）/ 视频（B 站·爱奇艺·优酷·芒果）/ 音乐 / 游戏 / 小说（起点·纵横·晋江 legacy GBK）/ 问答 / 论坛 / 政府 / 高校（清北复交等 8 所）/ 港台繁体（PTT·自由时报·联合报）/ 日韩（Yahoo JP·Hatena·goo·naver·daum）/ 海外技术站（GitHub·dev.to·react.dev·nodejs·rust·go·python docs）/ 订阅源 / JSON API / 编码压力（GBK·GB2312·Big5·gb18030）/ 反爬与网络边界。23 个错误全部环境归因（维基/Reddit/UDN 连接超时；W3C/贴吧/NGA/StackOverflow 403；北邮 412；httpbin 服务端 503；DNS 失败）——每一个都返回结构化、准确归因的错误，无一崩溃。
+152 站全量实测（`multi-site.mjs` 已提交可复跑，8 并发）：**115 OK / 17 预期边界（登录墙·验证页·静态小页） / 20 网络·反爬归因错误 / 0 崩溃**（含全部发布前修复的终态轮；网络类错误逐轮有 ±5 波动，均为环境归因）。覆盖国内门户 / 媒体 / 电商（京东·淘宝·拼多多·苏宁·当当）/ 视频（B 站·爱奇艺·优酷·芒果）/ 音乐 / 游戏 / 小说（起点·纵横·晋江 legacy GBK）/ 问答 / 论坛 / 政府 / 高校（清北复交等 8 所）/ 港台繁体（PTT·自由时报·联合报）/ 日韩（Yahoo JP·Hatena·goo·naver·daum）/ 海外技术站（GitHub·dev.to·react.dev·nodejs·rust·go·python docs）/ 订阅源 / JSON API / 编码压力（GBK·GB2312·Big5·gb18030）/ 反爬与网络边界。错误全部环境归因（维基/Reddit/UDN 连接超时；W3C/贴吧/NGA/StackOverflow 403；北邮 412；DNS 失败等）——每一个都返回结构化、准确归因的错误，无一崩溃。
 
 扫描驱动的发布前修复（全部带单测锁定）：RSS 双重转义、无头二进制嗅探、JS 跳转壳渲染、**`role="main"` 嵌套 div 截断**（gnu.org 165→800 字符）、**小 article 劫持主内容**（gitlab 71→800 字符）、渲染接受门槛放宽。
 
@@ -268,6 +270,8 @@ const results = await Promise.all([
 - [x] 分页长文自动拼接（v1.0.0）
 - [x] UTF-16 BOM / Shift-JIS 编码增强（v1.0.0）
 - [x] 文本密度兜底 + 元数据提取（v1.0.0）
+- [x] 人机验证页防御（Cloudflare 指纹页识别 + 等待自动跳转 + 拒绝误采，v1.0.0）
+- [x] 无 meta 页面署名行兜底（author / published，v1.0.0）
 
 > v1.0.0 起进入维护期：以修 bug 为主，减少更新频率。
 

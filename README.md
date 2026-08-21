@@ -62,6 +62,7 @@ Just talk to the agent:
 ```
 Read https://example.com/article and summarize the key points
 Read https://docs.example.org/guide in markdown mode
+Read these URLs together and compare their viewpoints: <url1> <url2> <url3>
 ```
 
 ### Real examples (measured)
@@ -105,7 +106,7 @@ chars 800+800/12398 · cached
 
 ### Tools
 
-**`read_url(url, maxChars?, offset?, mode?, includeLinks?)`** — fetch and extract clean body. Handles HTML pages, JSON APIs (compact re-indented render) and RSS/Atom feeds (entry list + `feedCount`); paginated articles (novel/news/forum) are auto-joined up to `paginateMax` pages; page metadata (`published`, `author`) is harvested when present
+**`read_url(url, maxChars?, offset?, mode?, includeLinks?)`** — fetch and extract clean body. Handles HTML pages, JSON APIs (compact re-indented render) and RSS/Atom feeds (entry list + `feedCount`); paginated articles (novel/news/forum) are auto-joined up to `paginateMax` pages; page metadata (`published`, `author`) is harvested automatically — meta tags first, with a byline fallback from the body text when meta is absent
 
 | Param | Type | Default | Description |
 |---|---|---|---|
@@ -183,12 +184,14 @@ Values are coerced and clamped to sane ranges at load — quoted numbers in YAML
   "truncated": true,
   "charsTotal": 12990,
   "charsReturned": 6000,
+  "charsStart": 0,
   "text": "...",
-  "paginated": 3,      // pages auto-joined (only when > 1)
-  "feedCount": 20,     // RSS/Atom entries (feeds only)
-  "published": "2026-08-01",  // when the page declares it
-  "author": "...",           // when the page declares it
-  "links": []          // only when includeLinks=true
+  "rendered": true,        // only when extracted after SPA rendering
+  "paginated": 3,          // pages auto-joined (only when > 1)
+  "feedCount": 20,         // RSS/Atom entries (feeds only)
+  "published": "2026-08-01",  // when the page declares it (incl. byline fallback)
+  "author": "...",           // when the page declares it (incl. byline fallback)
+  "links": []               // only when includeLinks=true
 }
 ```
 
@@ -212,26 +215,26 @@ const results = await Promise.all([
 5. **Two-tier cache** — successful results cached per URL for 5 minutes (repeat reads hit cache: fewer network calls and fewer model retries); **failed results cached for 30 seconds** so a broken URL never triggers a re-fetch loop;
 6. **KV-cache friendly (DeepSeek cost tuning)** — tool schema/description stay **static text** (no config values embedded), so changing config never invalidates the reusable prompt prefix and KV cache keeps hitting. DeepSeek's cache-hit tokens cost about 1/10 of misses — the more stable the prefix, the cheaper the run (same analysis as the official `tool-web` docs);
 7. **Batch shares the cache** — `read_url_batch` reuses the same cache (repeat batches hit it directly) and caps each page at 3,000 chars (below the single-page 6,000) to bound total output;
-8. **Compact fixed cost** — the four tool descriptions total ~990 chars (audited by a budget assertion in tests, kept static for KV-cache); extended HTML-entity decoding (45 named entities) means leftovers like `&mdash;`/`&hellip;` never waste tokens or render as mojibake.
+8. **Compact fixed cost** — the four tool descriptions total ~900 chars (audited by a budget assertion in tests, kept static for KV-cache); extended HTML-entity decoding (45 named entities) means leftovers like `&mdash;`/`&hellip;` never waste tokens or render as mojibake.
 
 ## Technical notes
 
 - **Encoding**: BOM-first detection (UTF-8 / UTF-16LE / UTF-16BE — byte-level evidence beats any declared charset), then HTTP `Content-Type` charset → HTML meta; built-in `TextDecoder` transcoding (Node 20+ full-icu, so declared Shift-JIS/EUC-JP/GBK/Big5 all decode), GB2312 normalized to GBK, auto-fallback to UTF-8 on mojibake;
-- **Content dispatch**: a URL is not always an HTML page — JSON APIs are re-rendered compact (indent 1), RSS 2.0 / Atom feeds parse into an entry list (`title — url` + summary, `feedCount` field, full items via `includeLinks`); XML sitemaps are rejected with a clear reason (no reading value); everything else falls through to the HTML pipeline;
-- **Extraction**: prefers `<article>` / `<main>` / `role="main"`, strips `nav/footer/header/aside/form/iframe` and ad-like containers, heuristic fallback to `<body>`; on the body path a **text-density pass** drops link-dominated segments (related posts, category sidebars, hot-article widgets) — pages with standard containers never reach it;
+- **Content dispatch**: a URL is not always an HTML page — JSON APIs are re-rendered compact (indent 1), RSS 2.0 / Atom feeds parse into an entry list (`title — url` + summary, `feedCount` field, full items via `includeLinks`; entry summaries are iteratively tag-stripped and entity-decoded until stable, so double-escaped `&lt;a&gt;` never leaks as a literal tag); XML sitemaps are rejected with a clear reason (no reading value); everything else falls through to the HTML pipeline;
+- **Extraction**: prefers `<article>` (all articles joined on aggregation pages; an unrelated tiny article — e.g. a newsletter card — falls through to `<main>` when its text is under 200 chars and `<main>` exists) / `<main>` / `role="main"`; `role="main"` containers are closed via **depth counting of balanced tags** (nested divs no longer cut the block at the first `</div>` — measured: gnu.org used to lose 7/8 of its body this way); strips `nav/footer/header/aside/form/iframe` and ad-like containers, heuristic fallback to `<body>`; on the body path a **text-density pass** drops link-dominated segments (related posts, category sidebars, hot-article widgets) — pages with standard containers never reach it;
 - **Pagination**: auto-follows `rel=next` or a short next-page anchor (下一页 / next / › / » — conservative, no fuzzy guessing); same-host only, loop-guarded, repeated paragraphs across the seam de-duplicated; continuation pages take the fast static path (a paginated SPA chain would cost one full render per page);
-- **Metadata**: `published` / `author` harvested from meta tags into the output and the status line; empty-body pages (login walls, JS shells) fall back to `og:description` as a hint instead of nothing;
+- **Metadata**: `published` / `author` harvested from meta tags into the output and the status line; when the page has no such meta (ruanyifeng.com ships zero author/date tags) a **byline fallback** harvests the body head (600-char window: `作者：X / 日期：Y` — meta wins, deep-body mentions ignored, markdown link syntax stripped); empty-body pages (login walls, JS shells) fall back to `og:description` as a hint instead of nothing;
 - **Markdown**: self-written lightweight tag state machine (headings/paragraphs/lists/blockquotes/code/tables/inline bold-italic-links), zero deps; images with alt text render as `![alt](src)` (decorative empty-alt images are dropped), code fences carry the language hint from `language-*` highlighter classes;
-- **Safety**: http/https only; no page scripts executed; responses over 3 MB rejected; 15s timeout; **429/503 honored with one Retry-After-aware retry** (capped at 5s so the cooperative timeout still bounds the call); structured errors (HTTP status / timeout / unsupported type / DNS cause such as `getaddrinfo ENOTFOUND` vs blocked-network timeout);
+- **Safety**: http/https only; no page scripts executed; responses over 3 MB rejected; 15s timeout; **429/503 honored with one Retry-After-aware retry** (capped at 5s so the cooperative timeout still bounds the call); **headerless responses are byte-sniffed** (a NUL byte or >30% control characters marks the body binary — PDFs/images rejected explicitly instead of mojibake through the HTML pipeline); structured errors (HTTP status / timeout / unsupported type / DNS cause such as `getaddrinfo ENOTFOUND` vs blocked-network timeout);
 - **Network fallback (proxy, raced)**: when a proxy is configured (env `HTTPS_PROXY`/`HTTP_PROXY`, falling back to the Windows system proxy registry where Clash-type apps persist it), the plugin starts the direct fetch and a proxy `curl` (`-x` passed explicitly, zero npm deps) **at the same time** and uses whichever completes first — so overseas sites that are blocked on direct connect are served through the user's own proxy in ~0.6s instead of waiting out the direct-connect timeout (~11s measured, -94%). The loser is aborted (curl killed / fetch aborted) and never enters the model context, so **token cost is unchanged**. A failed race returns the original direct error with the proxy attempt noted (`已尝试代理 …`); with no proxy configured the behaviour is exactly the plain direct connect;
 - **Privacy**: the plugin never uses the developer's network configuration — the proxy fallback only reads **your own machine's** proxy (env vars or Windows system proxy) at runtime. No telemetry, no analytics, no data collection: the only outbound action is fetching the URL you asked it to read;
 - **Optional enhancement 1 (Firefox Reader Mode algorithm)**: run `npm i @mozilla/readability happy-dom` in the DSH profile directory to auto-enable `@mozilla/readability` (MPL-2.0, referenced unmodified) for higher-quality extraction; falls back to the built-in heuristic when not installed — the core stays zero-dependency;
-- **Optional enhancement 2 (SPA page rendering)**: run `npm i playwright && npx playwright install chromium` in the DSH profile directory to auto-enable it. When the extracted body is empty and the page is script-heavy (likely Vue/React client-rendered), the plugin automatically renders it with headless Chromium before extracting (a `rendered` flag tells the model); rendering waits for the DOM to stabilize (content stops growing) instead of `networkidle` — heartbeat-polling sites never idle, so this avoids 30s timeouts; when not installed it degrades with a clear install hint, never errors — the core stays zero-dependency;
+- **Optional enhancement 2 (SPA page rendering)**: run `npm i playwright && npx playwright install chromium` in the DSH profile directory to auto-enable it. When the extracted body is empty and the page is script-heavy (likely Vue/React client-rendered) or a JS-redirect shell (few scripts but an empty `<body>`), the plugin automatically renders it with headless Chromium before extracting (a `rendered` flag tells the model); the rendered text is accepted only when it meaningfully beats the static one (≥20 chars from an empty static extraction — short real content is no longer rejected); **bot-challenge defense** — Cloudflare-style interstitials ("Just a moment...") get an extra 8s poll for the auto-redirect, and if the page still looks like a challenge the rendered result is rejected and the static body kept (an interstitial can carry MORE text than the real body — measured 259 vs 135 chars — and must never be mistaken for an improvement); the interstitial DOM never feeds pagination/link extraction either; rendering waits for the DOM to stabilize (content stops growing) instead of `networkidle` — heartbeat-polling sites never idle, so this avoids 30s timeouts; when not installed it degrades with a clear install hint, never errors — the core stays zero-dependency;
 - **Boundaries**: login-walled pages are not readable; SPA pages need the Playwright enhancement; **structured data (e.g. which like-count belongs to which comment) is out of text-extraction scope** — this plugin flattens HTML into readable text, so exact field↔value associations are lost; for precise fields, intercept the page's actual data API (see "Real-world validation" below).
 
 ## Real-world validation (2026-08-21, v1.0.0)
 
-152-site sweep driven by `multi-site.mjs` (committed, re-runnable, 8-way concurrent): **113 OK / 16 expected boundaries (login-walls·captcha·short static pages) / 23 attributed network·anti-bot errors / 0 crashes**. Coverage: CN portals/media, e-commerce (JD/Taobao/Pinduoduo/Suning/Dangdang), video (Bilibili/iQiyi/Youku/Mango), music, games, novels (Qidian/Zongheng/JJWXC legacy GBK), Q&A/forums, government, universities (Tsinghua/PKU/Fudan/SJTU…), Traditional-Chinese TW/HK (PTT/LTN/UDN), JP/KR portals (Yahoo JP/Hatena/goo/naver/daum), overseas tech docs (GitHub/dev.to/react.dev/nodejs.org/rust/go/python), feeds, JSON APIs, encoding stress (GBK/GB2312/Big5/gb18030), anti-bot & network boundaries. All 23 errors are environment-attributed (Wikipedia/Reddit/UDN connect-timeout; W3C/Tieba/NGA/StackOverflow 403; BUPT 412; httpbin server 503; DNS-fail) — every one returned as a structured, correctly-attributed error, never a crash.
+152-site sweep driven by `multi-site.mjs` (committed, re-runnable, 8-way concurrent): **115 OK / 17 expected boundaries (login-walls·captcha·short static pages) / 20 attributed network·anti-bot errors / 0 crashes** (final round with all pre-release fixes in; network-class errors vary ±5 between runs, all environment-attributed). Coverage: CN portals/media, e-commerce (JD/Taobao/Pinduoduo/Suning/Dangdang), video (Bilibili/iQiyi/Youku/Mango), music, games, novels (Qidian/Zongheng/JJWXC legacy GBK), Q&A/forums, government, universities (Tsinghua/PKU/Fudan/SJTU…), Traditional-Chinese TW/HK (PTT/LTN/UDN), JP/KR portals (Yahoo JP/Hatena/goo/naver/daum), overseas tech docs (GitHub/dev.to/react.dev/nodejs.org/rust/go/python), feeds, JSON APIs, encoding stress (GBK/GB2312/Big5/gb18030), anti-bot & network boundaries. All errors are environment-attributed (Wikipedia/Reddit/UDN connect-timeout; W3C/Tieba/NGA/StackOverflow 403; BUPT 412; DNS-fail…) — every one returned as a structured, correctly-attributed error, never a crash.
 
 Sweep-driven pre-release fixes (each locked by unit tests): double-escaped RSS descriptions, headerless binary sniffing, JS-redirect shell rendering, **`role="main"` container cut short by nested divs** (gnu.org 165→800 chars), **tiny `<article>` hijacking the main content** (gitlab 71→800 chars), relaxed render-acceptance threshold.
 
@@ -267,6 +270,8 @@ Plus a **15-item DSH acceptance round** (a real agent driving every read_url too
 - [x] Auto-joined paginated articles (v1.0.0)
 - [x] UTF-16 BOM / Shift-JIS encoding boost (v1.0.0)
 - [x] Text-density fallback + metadata harvesting (v1.0.0)
+- [x] Bot-challenge defense (Cloudflare interstitial detection + auto-redirect wait + rejection, v1.0.0)
+- [x] Byline fallback for meta-less pages (author / published, v1.0.0)
 
 > From v1.0.0 the plugin enters maintenance mode: bug fixes first, updates kept rare.
 
