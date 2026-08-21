@@ -1,5 +1,45 @@
 # Changelog
 
+## [1.0.0] - 2026-08-21
+
+### 量大管饱的持久版本：一次把「读网页」这件事做全
+
+目标：省 token 不变的前提下，覆盖绝大多数 URL 类型（HTML / JSON / RSS / Atom / 多页长文 / 各国编码），把后续更新频率降到最低。
+
+**新增：内容类型分发（HTML 不再是唯一入口）**
+- JSON 数据 API（如 `api.github.com`）→ 原生紧凑渲染（`JSON.stringify` 缩进 1 格），不再报 "Unsupported content-type"
+- RSS 2.0 / Atom 订阅源 → 解析为紧凑条目列表（`标题 — 链接 + 摘要`），返回 `feedCount`，`includeLinks` 时附完整 items；XML sitemap 仍明确拒绝（对模型无阅读价值）
+- 修复 proxy-fallback 的 content-type 正则：`application/rss+xml` 分隔符是 `+` 不是 `/`，此前被误拦
+- web seam 路径同样分流：seam 返回体以 `{`/`[` 开头时尝试 JSON 渲染
+
+**新增：分页长文自动拼接（默认 3 页）**
+- 识别 `rel=next`（标准）或纯「下一页 / 下页 / 后一页 / 下一頁 / next / › / » / older entries」短锚文本——刻意保守，不做模糊猜测
+- 同域限定 + 已见 URL 集合防环；续页走静态快路径（分页 SPA 链每页一次完整渲染不划算）；`joinPageText` 去除跨页重复段落/标题（30–300 字符重叠窗口）
+- 输出新增 `paginated` 字段，正文标注 `(已自动拼接 N 页)`；`paginate: false` 关闭，`paginateMax` 可调（1–10）
+- 工具超时预算随之修正：`timeoutMs × (paginateMax + 1) + 45s`（首页 + SPA 渲染 + 续页抓取），随配置缩放
+
+**新增：文本密度兜底（无标准容器页）**
+- 无 `<article>`/`<main>` 而退化到整页 body 的页面：按块级标签切块，丢弃「短且链接主导」（正文 < 300 字符且锚文本占比 > 65%）的相关推荐 / 分类侧栏 / 热门文章挂件
+- 标准容器页面完全不走此路径，零行为变化
+
+**新增：编码增强**
+- BOM 优先探测：UTF-8 / UTF-16LE / UTF-16BE（字节级证据优先于任何声明——UTF-16 body 用 latin1 读 `<meta>` 探针本来就匹配不上）
+- Shift-JIS 等日韩编码：页面声明 charset 即可由内置 TextDecoder 正确解码（实测日文页面全绿）
+
+**新增：网络韧性**
+- 429/503 感知 `Retry-After`（秒形式，封顶 5s 保证协作超时仍约束调用）重试一次
+- 空响应（204/304）沿用 v0.4.9 防护
+
+**新增：Markdown / 元数据增强**
+- `<img>` 带 alt+src → `![alt](src)`（哨兵占位法穿过转义层；空 alt 装饰图丢弃——模型反正看不见像素）
+- 代码块围栏带语言标注（识别 `language-*` / `lang-*` class，```js 远比无标注准确）
+- 页级元数据提取：`published`（article:published_time / og:published_time / pubdate / dc.date 等）、`author`（author / og:article:author 等）进输出字段与状态行
+- 空正文页（登录墙 / JS 壳）回落到 `og:description` 作为提示，不再返回空
+
+**测试**：42 → **60 断言**（+UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 重试、图片 alt、代码语言、元数据、og:description 回落）+ test-spa 10 全绿 + **47 站真实回归**（新增 ruanyifeng Atom / github-blog Atom / v2ex Atom / GitHub API JSON / 起点·开源中国分页候选站）
+
+**发布策略**：大版本收敛——此后以修 bug 为主，减少更新频率。
+
 ## [0.4.9] - 2026-08-20
 
 ### 稳定性：配置健壮性 + 严格宿主兼容 + 资源泄漏

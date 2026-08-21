@@ -248,8 +248,8 @@ ok('pipeline timeout budgets cover the configured worst case and scale with cfg'
     return Object.fromEntries(tools.map((t) => [t.name, t]))
   }
   const by = run({})
-  // default cfg.timeoutMs=15s: fetch 15s + SPA render (30s goto + 10s poll) + margin
-  assert.ok(by.read_url.timeoutMs >= 60000, `read_url budget ${by.read_url.timeoutMs} must cover 15s fetch + 40s render`)
+  // default cfg.timeoutMs=15s, paginateMax=3: (3+1) fetches + SPA render (30s goto + 10s poll)
+  assert.ok(by.read_url.timeoutMs >= 105000, `read_url budget ${by.read_url.timeoutMs} must cover 4 fetches + 40s render`)
   assert.ok(by.read_url_links.timeoutMs >= 60000, `read_url_links budget ${by.read_url_links.timeoutMs} must cover render fallback`)
   // worst chain: 3 concurrency waves of (fetch + render)
   assert.ok(by.read_url_batch.timeoutMs >= 180000, `read_url_batch budget ${by.read_url_batch.timeoutMs} must cover 3 waves`)
@@ -257,19 +257,22 @@ ok('pipeline timeout budgets cover the configured worst case and scale with cfg'
   assert.ok(by.read_url_site.timeoutMs >= 375000, `read_url_site budget ${by.read_url_site.timeoutMs} must cover crawl waves`)
   // budgets scale with a longer configured fetch timeout (never clamp it)
   const big = run({ timeoutMs: 60000 })
-  assert.ok(big.read_url.timeoutMs >= 105000, `read_url budget ${big.read_url.timeoutMs} must scale with timeoutMs=60s`)
+  assert.ok(big.read_url.timeoutMs >= 285000, `read_url budget ${big.read_url.timeoutMs} must scale with timeoutMs=60s`)
   assert.ok(big.read_url_batch.timeoutMs >= 315000, `read_url_batch budget ${big.read_url_batch.timeoutMs} must scale with timeoutMs=60s`)
   // and clamp instead of exploding on a runaway value
   const capped = run({ timeoutMs: 999999 })
-  assert.ok(capped.read_url.timeoutMs <= 165000, `timeoutMs clamped before budget math, got ${capped.read_url.timeoutMs}`)
+  assert.ok(capped.read_url.timeoutMs <= 525000, `timeoutMs clamped before budget math, got ${capped.read_url.timeoutMs}`)
+  // pagination disabled: budget drops back to single-fetch + render
+  const nopage = run({ paginate: false })
+  assert.ok(nopage.read_url.timeoutMs <= 60000, `paginate:false budget ${nopage.read_url.timeoutMs} must not carry pagination pages`)
 })
 
 ok('cordis.patch.yml numeric strings are coerced and clamped, not concatenated', () => {
   const tools = []
   m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }, { timeoutMs: '25000', maxChars: '8000' })
   const read = tools.find((t) => t.name === 'read_url')
-  // '25000' as a string would make the budget '2500045000'; coerced it is 70000
-  assert.equal(read.timeoutMs, 70000, `string '25000' must not concatenate into the budget, got ${read.timeoutMs}`)
+  // '25000' as a string would make the budget '2500045000'; coerced it is 25000*4+45000
+  assert.equal(read.timeoutMs, 145000, `string '25000' must not concatenate into the budget, got ${read.timeoutMs}`)
   assert.equal(typeof read.timeoutMs, 'number')
 })
 
@@ -537,6 +540,202 @@ console.log('read_url_site (local multi-page site, real fetch)')
 
   server.close()
 }
+
+console.log('v1.0.0 charset / encoding')
+ok('UTF-16LE BOM detected and decoded', () => {
+  const body = '<html><body><p>你好世界</p></body></html>'
+  const utf16 = Buffer.from('\ufeff' + body, 'utf16le')
+  const { text, charset } = decodeBuffer(utf16, '')
+  assert.equal(charset, 'utf-16le')
+  assert.ok(text.includes('你好世界'), `decoded text: ${text.slice(0, 60)}`)
+})
+
+ok('Shift-JIS meta charset decodes Japanese', () => {
+  // こんにちは in Shift-JIS bytes + a Shift_JIS meta declaration
+  const sjis = Buffer.from([0x82, 0xb1, 0x82, 0xf1, 0x82, 0xc9, 0x82, 0xbf, 0x82, 0xcd])
+  const buf = Buffer.concat([
+    Buffer.from('<html><head><meta charset="Shift_JIS"></head><body><p>', 'latin1'),
+    sjis,
+    Buffer.from('</p></body></html>', 'latin1'),
+  ])
+  const { text, charset } = decodeBuffer(buf, '')
+  assert.equal(charset, 'shift_jis')
+  assert.ok(text.includes('こんにちは'), `decoded text: ${text.slice(0, 60)}`)
+})
+
+console.log('v1.0.0 text-density fallback (body path)')
+ok('densityFilter drops link-dominated segments, keeps prose', () => {
+  const html =
+    '<div><a href="/n1">新闻一</a> <a href="/n2">新闻二</a> <a href="/n3">新闻三</a></div>' +
+    '<div><a href="/h1">热门推荐一</a> <a href="/h2">热门推荐二</a></div>' +
+    '<p>这是正文的第一段，包含足够多的文字来表明它是正文内容。</p>' +
+    '<p>这是正文的第二段，同样有实实在在的文字密度。</p>'
+  const out = m.densityFilter(html)
+  assert.ok(out.includes('正文的第一段'), 'prose paragraphs survive')
+  assert.ok(out.includes('正文第二段') || out.includes('正文的第二段'), 'second paragraph survives')
+  assert.ok(!out.includes('热门推荐'), `link widget dropped, got: ${out.slice(0, 120)}`)
+  assert.ok(!out.includes('新闻一'), 'nav links dropped')
+})
+
+ok('article/main pages bypass densityFilter (no behavior change)', () => {
+  const html = '<html><body><article><p>正文文字在这里。</p><ul><li><a href="/x">相关链接一</a></li></ul></article></body></html>'
+  const r = extract(html, 'text')
+  assert.ok(r.text.includes('正文文字'), 'article content survives')
+})
+
+console.log('v1.0.0 pagination')
+ok('findNextLink: rel=next wins', () => {
+  const html = '<html><body><a href="/p2" rel="next">go on</a></body></html>'
+  assert.equal(m.findNextLink(html, 'https://x.com/p1'), 'https://x.com/p2')
+})
+
+ok('findNextLink: 下一页 text anchor matched, relative resolved', () => {
+  const html = '<html><body><a href="?page=2">下一页</a></body></html>'
+  assert.equal(m.findNextLink(html, 'https://x.com/p1'), 'https://x.com/p1?page=2')
+})
+
+ok('findNextLink: ordinary links never match', () => {
+  const html = '<html><body><a href="/about">关于下一页主题的讨论</a><a href="/next-level">高级</a></body></html>'
+  assert.equal(m.findNextLink(html, 'https://x.com/'), null)
+})
+
+{
+  // e2e: 3-page article auto-joined, plus cap enforcement.
+  const http = await import('node:http')
+  const page = (n, next) =>
+    `<html><head><title>长文（${n}/3）</title></head><body><p>第${n}页的正文内容。${'内容填充。'.repeat(30)}</p>${next ? `<a href="/pg${next}">下一页</a>` : ''}</body></html>`
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    if (req.url === '/pg1') res.end(page(1, 2))
+    else if (req.url === '/pg2') res.end(page(2, 3))
+    else if (req.url === '/pg3') res.end(page(3, null))
+    else { res.statusCode = 404; res.end('x') }
+  })
+  await new Promise((r) => server.listen(18097, r))
+  const base = 'http://127.0.0.1:18097'
+  {
+    const r = await m.readUrl({ url: `${base}/pg1`, maxChars: 20000 }, undefined, undefined, undefined)
+    assert.ok(!r.error, `no error: ${JSON.stringify(r).slice(0, 100)}`)
+    assert.equal(r.paginated, 3, `3 pages joined, got paginated=${r.paginated}`)
+    assert.ok(r.text.includes('第1页的正文'), 'page 1 content present')
+    assert.ok(r.text.includes('第2页的正文'), 'page 2 content present')
+    assert.ok(r.text.includes('第3页的正文'), 'page 3 content present')
+    passed++
+    console.log('  ok - auto-pagination joins 3 pages into one body')
+  }
+  {
+    // paginateMax=2: only one continuation page followed.
+    const r2 = await m.readUrl({ url: `${base}/pg2`, maxChars: 20000 }, undefined, undefined, { paginateMax: 2, timeoutMs: 15000, maxBytes: 3145728, maxChars: 6000, maxLinks: 20, cacheTtlMs: 300000, cacheMax: 32, spaRender: false, userAgent: 'ua', paginate: true })
+    assert.equal(r2.paginated, 2, `capped at 2 pages, got ${r2.paginated}`)
+    assert.ok(r2.text.includes('第2页') && r2.text.includes('第3页'), 'both fetched pages present')
+    passed++
+    console.log('  ok - paginateMax caps the chain')
+  }
+  {
+    // paginate:false: single page, no following.
+    const r3 = await m.readUrl({ url: `${base}/pg3`, maxChars: 20000 }, undefined, undefined, { paginate: false, timeoutMs: 15000, maxBytes: 3145728, maxChars: 6000, maxLinks: 20, cacheTtlMs: 300000, cacheMax: 32, spaRender: false, userAgent: 'ua', paginateMax: 3 })
+    assert.equal(r3.paginated, undefined, 'no pagination when disabled')
+    passed++
+    console.log('  ok - paginate:false disables following')
+  }
+  server.close()
+}
+
+console.log('v1.0.0 JSON / RSS / retry')
+{
+  const http = await import('node:http')
+  let retryHits = 0
+  const rss = `<?xml version="1.0"?><rss version="2.0"><channel><title>示例订阅源</title>` +
+    `<item><title>文章一</title><link>https://example.com/1</link><description>第一篇的摘要内容。</description></item>` +
+    `<item><title>文章二</title><link>https://example.com/2</link><description>第二篇的摘要内容。</description></item>` +
+    `</channel></rss>`
+  const server = http.createServer((req, res) => {
+    if (req.url === '/api') {
+      res.setHeader('content-type', 'application/json; charset=utf-8')
+      res.end(JSON.stringify({ name: 'dsh-read-url', version: '1.0.0', tools: ['read_url'] }))
+    } else if (req.url === '/feed') {
+      res.setHeader('content-type', 'application/rss+xml')
+      res.end(rss)
+    } else if (req.url === '/sitemap.xml') {
+      res.setHeader('content-type', 'application/xml')
+      res.end('<?xml version="1.0"?><urlset><url><loc>https://x.com/</loc></url></urlset>')
+    } else if (req.url === '/ratelimited') {
+      retryHits++
+      if (retryHits === 1) {
+        res.statusCode = 429
+        res.setHeader('retry-after', '0')
+        res.end('slow down')
+      } else {
+        res.setHeader('content-type', 'text/html; charset=utf-8')
+        res.end('<html><head><title>重试成功</title></head><body><p>重试之后的正文。</p></body></html>')
+      }
+    } else { res.statusCode = 404; res.end('x') }
+  })
+  await new Promise((r) => server.listen(18098, r))
+  const base = 'http://127.0.0.1:18098'
+  {
+    const r = await m.readUrl({ url: `${base}/api`, maxChars: 5000 }, undefined, undefined, undefined)
+    assert.ok(!r.error, `json read ok: ${JSON.stringify(r).slice(0, 80)}`)
+    assert.equal(r.mode, 'json')
+    assert.ok(r.text.includes('"dsh-read-url"'), `pretty json body, got: ${r.text.slice(0, 80)}`)
+    passed++
+    console.log('  ok - JSON API URL rendered compact')
+  }
+  {
+    const r = await m.readUrl({ url: `${base}/feed`, maxChars: 5000 }, undefined, undefined, undefined)
+    assert.ok(!r.error, `feed read ok: ${JSON.stringify(r).slice(0, 80)}`)
+    assert.equal(r.feedCount, 2)
+    assert.ok(r.title.includes('示例订阅源'), `feed title: ${r.title}`)
+    assert.ok(r.text.includes('文章一 — https://example.com/1'), `feed items listed: ${r.text.slice(0, 100)}`)
+    passed++
+    console.log('  ok - RSS feed parsed into entry list')
+  }
+  {
+    const r = await m.readUrl({ url: `${base}/sitemap.xml`, maxChars: 5000 }, undefined, undefined, undefined)
+    assert.ok(r.error && r.error.includes('sitemap'), `sitemap rejected: ${JSON.stringify(r).slice(0, 80)}`)
+    passed++
+    console.log('  ok - XML sitemap rejected with clear reason')
+  }
+  {
+    const r = await m.readUrl({ url: `${base}/ratelimited`, maxChars: 5000 }, undefined, undefined, undefined)
+    assert.ok(!r.error, `retry succeeded: ${JSON.stringify(r).slice(0, 80)}`)
+    assert.ok(r.text.includes('重试之后的正文'), 'body from the second attempt')
+    assert.ok(retryHits >= 2, `server was hit ${retryHits} times (retry happened)`)
+    passed++
+    console.log('  ok - 429 with Retry-After retried once and succeeded')
+  }
+  server.close()
+}
+
+console.log('v1.0.0 markdown / metadata enhancements')
+ok('markdown mode emits image alt text', () => {
+  const html = '<html><body><article><p>图解如下：</p><img src="/chart.png" alt="架构图：三层结构"><img src="/spacer.gif" alt=""></article></body></html>'
+  const r = extract(html, 'markdown')
+  assert.ok(r.text.includes('![架构图：三层结构](/chart.png)'), `img alt kept: ${r.text.slice(0, 100)}`)
+  assert.ok(!r.text.includes('spacer.gif'), 'decorative empty-alt image dropped')
+})
+
+ok('markdown code fence carries language hint', () => {
+  const html = '<html><body><article><pre><code class="language-python">print(1)</code></pre></article></body></html>'
+  const r = extract(html, 'markdown')
+  assert.ok(r.text.includes('```python'), `language fence: ${r.text.slice(0, 80)}`)
+})
+
+ok('extract harvests published/author metadata', () => {
+  const html = '<html><head><title>T</title>' +
+    '<meta property="article:published_time" content="2026-08-21T10:00:00Z">' +
+    '<meta name="author" content="张三"></head>' +
+    '<body><article><p>正文段落。</p></article></body></html>'
+  const r = extract(html, 'text')
+  assert.equal(r.published, '2026-08-21T10:00:00Z')
+  assert.equal(r.author, '张三')
+})
+
+ok('empty body falls back to og:description instead of nothing', () => {
+  const html = '<html><head><title>登录墙页</title><meta property="og:description" content="这篇文章的导语摘要，需要登录后阅读全文。"></head><body><div id="app"></div></body></html>'
+  const r = extract(html, 'text')
+  assert.ok(r.text.includes('导语摘要'), `description fallback: ${r.text.slice(0, 60)}`)
+})
 
 console.log(`\n${passed} assertions passed`)
 // All assertions are synchronous or top-level awaited; reaching here means every

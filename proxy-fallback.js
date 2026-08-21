@@ -99,7 +99,7 @@ export async function fetchViaCurlProxy(url, cfg, externalSignal, proxyOverride)
     const code = Number(codeStr)
     const contentType = ctParts.join(' ')
     if (!(code >= 200 && code < 300)) return { error: `HTTP ${code}` }
-    if (contentType && !/text\/html|application\/xhtml|text\/plain/i.test(contentType)) {
+    if (contentType && !/text\/html|application\/xhtml|text\/plain|\/json|[+/]xml/i.test(contentType)) {
       return { error: `Unsupported content-type: ${contentType.split(';')[0]}` }
     }
     return { buffer: body, contentType, finalUrl: url, viaProxy: proxy }

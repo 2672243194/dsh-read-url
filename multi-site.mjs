@@ -50,6 +50,13 @@ const SITES = [
   ['tieba (forum, anti-bot)', 'https://tieba.baidu.com/'],
   ['zol (tech media, gbk)', 'https://www.zol.com.cn/'],
   ['vuejs-doc (tech doc, bare-main fix)', 'https://cn.vuejs.org/guide/introduction.html'],
+  // ---- 新类型（第 3 批, v1.0.0）----
+  ['ruanyifeng-feed (RSS/Atom)', 'https://www.ruanyifeng.com/blog/atom.xml'],
+  ['github-api (JSON)', 'https://api.github.com/repos/vuejs/core'],
+  ['github-blog-feed (Atom)', 'https://github.blog/feed/'],
+  ['v2ex-feed (Atom)', 'https://www.v2ex.com/index.xml'],
+  ['qidian-rank (pagination candidate)', 'https://www.qidian.com/rank/yuepiao/'],
+  ['oschina (pagination candidate)', 'https://www.oschina.net/blog'],
 ]
 
 const tools = []

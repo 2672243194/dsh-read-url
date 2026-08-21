@@ -7,7 +7,7 @@
 [![npm](https://img.shields.io/npm/v/dsh-read-url)](https://www.npmjs.com/package/dsh-read-url)
 [![License](https://img.shields.io/github/license/2672243194/dsh-read-url)](https://github.com/2672243194/dsh-read-url/blob/main/LICENSE)
 
-URL reader plugin for DeepSeek Harness: fetch any webpage, **auto-detect encoding (GBK/GB2312/UTF-8/Big5)**, extract the clean main content, and return **token-efficient compact text or structured Markdown**.
+URL reader plugin for DeepSeek Harness: fetch any URL — **webpages (HTML), JSON APIs, RSS/Atom feeds** — auto-detect encoding (UTF-16 BOM / GBK/GB2312 / UTF-8 / Big5 / Shift-JIS), extract the clean main content (**auto-joining paginated articles**), and return **token-efficient compact text or structured Markdown**.
 
 Zero runtime dependencies (Node 20+ built-ins handle fetch/decode/extract), no API key, no server side — install and use.
 
@@ -21,7 +21,9 @@ DSH agents can search (getting links and snippets) but lack the step of "reading
 |---|---|---|---|---|
 | Body cleaning (container-level) | ❌ whole page | ⚠️ tag-level, nav/footer leak in | ⚠️ custom, noisy | ✅ article/main containers + noise stripping |
 | Default output cap | 200,000 chars | 50,000 chars | 30,000 chars | **6,000 chars + paragraph-aligned truncation** |
-| Chinese GBK/GB2312 | provider-dependent | ⚠️ not normalized, GB2312 garbles | ❌ not handled | ✅ normalized + mojibake fallback |
+| Chinese GBK/GB2312 | provider-dependent | ⚠️ not normalized, GB2312 garbles | ❌ not handled | ✅ normalized + mojibake fallback + UTF-16 BOM + Shift-JIS |
+| JSON / RSS / Atom URLs | ❌ HTML only | ❌ | ❌ | ✅ native compact rendering |
+| Paginated articles | ❌ manual per-page calls | ❌ | ❌ | ✅ auto-joined (default 3 pages) |
 | Session-level cache | ❌ | ❌ | ❌ | ✅ 5-min TTL |
 | `ctx.web` seam | ✅ (official core) | ❌ global fetch | ❌ | ✅ seam-first, fallback included |
 | `ctx.effect` unload cleanup | ✅ | ❌ | ❌ | ✅ |
@@ -103,7 +105,7 @@ chars 800+800/12398 · cached
 
 ### Tools
 
-**`read_url(url, maxChars?, offset?, mode?, includeLinks?)`** — fetch and extract clean body
+**`read_url(url, maxChars?, offset?, mode?, includeLinks?)`** — fetch and extract clean body. Handles HTML pages, JSON APIs (compact re-indented render) and RSS/Atom feeds (entry list + `feedCount`); paginated articles (novel/news/forum) are auto-joined up to `paginateMax` pages; page metadata (`published`, `author`) is harvested when present
 
 | Param | Type | Default | Description |
 |---|---|---|---|
@@ -159,6 +161,8 @@ Override via the profile's `cordis.patch.yml` (defaults in the plugin's own `cor
     maxChars: 6000        # default body truncation
     maxLinks: 20          # read_url_links default count
     spaRender: true       # SPA rendering enhancement (needs playwright installed; degrades with a hint otherwise)
+    paginate: true        # auto-join paginated articles
+    paginateMax: 3        # pages per article, incl. the first (1-10, clamped)
     userAgent: '...'      # request UA
     cacheTtlMs: 300000    # success-cache TTL
     cacheMax: 32          # cache entry cap
@@ -180,6 +184,10 @@ Values are coerced and clamped to sane ranges at load — quoted numbers in YAML
   "charsTotal": 12990,
   "charsReturned": 6000,
   "text": "...",
+  "paginated": 3,      // pages auto-joined (only when > 1)
+  "feedCount": 20,     // RSS/Atom entries (feeds only)
+  "published": "2026-08-01",  // when the page declares it
+  "author": "...",           // when the page declares it
   "links": []          // only when includeLinks=true
 }
 ```
@@ -208,34 +216,39 @@ const results = await Promise.all([
 
 ## Technical notes
 
-- **Encoding**: three-level detection (HTTP `Content-Type` charset → HTML meta → BOM), built-in `TextDecoder` transcoding (Node 20+ full-icu), GB2312 normalized to GBK, auto-fallback to UTF-8 on mojibake;
-- **Extraction**: prefers `<article>` / `role="main"`, strips `nav/footer/header/aside/form/iframe` and ad-like containers, heuristic fallback to `<body>`;
-- **Markdown**: self-written lightweight tag state machine (headings/paragraphs/lists/blockquotes/code/tables/inline bold-italic-links), zero deps;
-- **Safety**: http/https only; no page scripts executed; responses over 3 MB rejected; 15s timeout; structured errors (HTTP status / timeout / unsupported type / DNS cause such as `getaddrinfo ENOTFOUND` vs blocked-network timeout);
+- **Encoding**: BOM-first detection (UTF-8 / UTF-16LE / UTF-16BE — byte-level evidence beats any declared charset), then HTTP `Content-Type` charset → HTML meta; built-in `TextDecoder` transcoding (Node 20+ full-icu, so declared Shift-JIS/EUC-JP/GBK/Big5 all decode), GB2312 normalized to GBK, auto-fallback to UTF-8 on mojibake;
+- **Content dispatch**: a URL is not always an HTML page — JSON APIs are re-rendered compact (indent 1), RSS 2.0 / Atom feeds parse into an entry list (`title — url` + summary, `feedCount` field, full items via `includeLinks`); XML sitemaps are rejected with a clear reason (no reading value); everything else falls through to the HTML pipeline;
+- **Extraction**: prefers `<article>` / `<main>` / `role="main"`, strips `nav/footer/header/aside/form/iframe` and ad-like containers, heuristic fallback to `<body>`; on the body path a **text-density pass** drops link-dominated segments (related posts, category sidebars, hot-article widgets) — pages with standard containers never reach it;
+- **Pagination**: auto-follows `rel=next` or a short next-page anchor (下一页 / next / › / » — conservative, no fuzzy guessing); same-host only, loop-guarded, repeated paragraphs across the seam de-duplicated; continuation pages take the fast static path (a paginated SPA chain would cost one full render per page);
+- **Metadata**: `published` / `author` harvested from meta tags into the output and the status line; empty-body pages (login walls, JS shells) fall back to `og:description` as a hint instead of nothing;
+- **Markdown**: self-written lightweight tag state machine (headings/paragraphs/lists/blockquotes/code/tables/inline bold-italic-links), zero deps; images with alt text render as `![alt](src)` (decorative empty-alt images are dropped), code fences carry the language hint from `language-*` highlighter classes;
+- **Safety**: http/https only; no page scripts executed; responses over 3 MB rejected; 15s timeout; **429/503 honored with one Retry-After-aware retry** (capped at 5s so the cooperative timeout still bounds the call); structured errors (HTTP status / timeout / unsupported type / DNS cause such as `getaddrinfo ENOTFOUND` vs blocked-network timeout);
 - **Network fallback (proxy, raced)**: when a proxy is configured (env `HTTPS_PROXY`/`HTTP_PROXY`, falling back to the Windows system proxy registry where Clash-type apps persist it), the plugin starts the direct fetch and a proxy `curl` (`-x` passed explicitly, zero npm deps) **at the same time** and uses whichever completes first — so overseas sites that are blocked on direct connect are served through the user's own proxy in ~0.6s instead of waiting out the direct-connect timeout (~11s measured, -94%). The loser is aborted (curl killed / fetch aborted) and never enters the model context, so **token cost is unchanged**. A failed race returns the original direct error with the proxy attempt noted (`已尝试代理 …`); with no proxy configured the behaviour is exactly the plain direct connect;
 - **Privacy**: the plugin never uses the developer's network configuration — the proxy fallback only reads **your own machine's** proxy (env vars or Windows system proxy) at runtime. No telemetry, no analytics, no data collection: the only outbound action is fetching the URL you asked it to read;
 - **Optional enhancement 1 (Firefox Reader Mode algorithm)**: run `npm i @mozilla/readability happy-dom` in the DSH profile directory to auto-enable `@mozilla/readability` (MPL-2.0, referenced unmodified) for higher-quality extraction; falls back to the built-in heuristic when not installed — the core stays zero-dependency;
 - **Optional enhancement 2 (SPA page rendering)**: run `npm i playwright && npx playwright install chromium` in the DSH profile directory to auto-enable it. When the extracted body is empty and the page is script-heavy (likely Vue/React client-rendered), the plugin automatically renders it with headless Chromium before extracting (a `rendered` flag tells the model); rendering waits for the DOM to stabilize (content stops growing) instead of `networkidle` — heartbeat-polling sites never idle, so this avoids 30s timeouts; when not installed it degrades with a clear install hint, never errors — the core stays zero-dependency;
 - **Boundaries**: login-walled pages are not readable; SPA pages need the Playwright enhancement; **structured data (e.g. which like-count belongs to which comment) is out of text-extraction scope** — this plugin flattens HTML into readable text, so exact field↔value associations are lost; for precise fields, intercept the page's actual data API (see "Real-world validation" below).
 
-## Real-world validation (2026-08-19, v0.4.8)
+## Real-world validation (2026-08-21, v1.0.0)
 
-41-site sweep driven by `multi-site.mjs` (committed, re-runnable): **23 OK / 8 expected boundaries / 10 network·anti-bot boundaries / 0 crashes** — overseas sites (BBC/V2EX) served in ~1s via the direct+proxy race; doc sites (vuejs.org) fixed via bare-`<main>` picking; wikipedia/httpbin remain clear attributed network boundaries.
+47-site sweep driven by `multi-site.mjs` (committed, re-runnable): **27 OK / 8 expected boundaries (thin/empty) / 12 attributed network·anti-bot errors / 0 crashes**. New v1.0.0 categories all green on first run: Ruan Yifeng Atom feed (`charset=feed`), GitHub API JSON (`charset=json`), github.blog Atom feed; oschina blog list read via SPA render. The 12 errors are all environment-boundary (proxy switched off during this run: BBC/V2EX/Wikipedia connect-timeout; W3C/Tieba 403; BUPT 412; httpbin service errors) — every one returned as a structured, correctly-attributed error, never a crash. With the user's proxy running (v0.4.8 run), the same overseas sites were served in ~1s via the direct+proxy race.
 
 | Category | Sites | Result |
 |---|---|---|
 | Portal navigation cleaning | Baidu / QQ / NetEase / Sina / Douban / CSDN / Sohu / Ifeng | ✅ clean text, no CSS noise |
-| SPA rendering | Bilibili / Xiaoheihe / Juejin / QQ News / SSPAI | ✅ `rendered` flag, post-JS body |
+| SPA rendering | Bilibili / Xiaoheihe / Juejin / QQ News / SSPAI / oschina | ✅ `rendered` flag, post-JS body |
 | Multi-article aggregation | Cnblogs / Ruan Yifeng blog | ✅ 800+ chars across articles |
-| Static doc pages | MDN / Ruan Yifeng / example.com / GitHub | ✅ clean extraction (example.com = short page, expected) |
-| Login wall | Zhihu / Weibo | ✅ clear content or empty (expected) |
-| **Proxy fallback (overseas)** | BBC Chinese / V2EX | ✅ direct connect blocked → auto-retried through the user's system proxy → clean body |
-| Network / anti-bot boundary | W3C (403 for Chrome UA); Wikipedia (403 via proxy); httpbin (503 service-down); PDF (404); DNS-fail (proxy unreachable) | ✅ accurately attributed errors (HTTP status / 403 / 503 / ENOTFOUND) — not plugin defects |
-| offset continuation | Sina News (12,284 chars) | ✅ 800+800 seamless, cache hit |
+| **Feeds & data APIs (v1.0.0)** | Ruan Yifeng Atom / github.blog Atom / GitHub API JSON | ✅ `charset=feed` / `charset=json` compact render |
+| Static doc pages | MDN / Ruan Yifeng / example.com / GitHub / vuejs.org | ✅ clean extraction (example.com = short page, expected) |
+| Q&A / forum / encyclopedia | Zhihu column / Hupu / Baidu Zhidao / Baike | ✅ clean text (Zhihu homepage = login-wall, expected) |
+| GBK legacy encoding | ZOL | ✅ `charset=gbk`, no mojibake |
+| Government / education | gov.cn / BUPT | ✅ gov.cn clean; BUPT 412 attributed (WAF) |
+| Network / anti-bot boundary | W3C (403); Tieba (403); Wikipedia/BBC/V2EX (connect-timeout, proxy off this run); httpbin (404/503); DNS-fail (ENOTFOUND) | ✅ accurately attributed errors (HTTP status / timeout / ENOTFOUND) — not plugin defects |
+| offset continuation | Sina News (1,602 chars) | ✅ 800+800 seamless, cache hit |
 | Batch + failure isolation | 4-URL mix | ✅ 2/4 ok, failures isolated |
 | Site crawl | Ruan Yifeng blog | ✅ 5/5 pages tree map |
 
-- **42 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard, schema budget, bare-main pick, worst-case timeout budgets, yml string coercion + clamping, strict-host seam degradation) + **10 SPA-test assertions** all green;
+- **60 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard, schema budget, bare-main pick, worst-case timeout budgets, yml string coercion + clamping, strict-host seam degradation, UTF-16 BOM, Shift-JIS, density filter, pagination join/cap/disable, JSON render, RSS parse, sitemap rejection, 429 Retry-After retry, image alt, code-fence language, metadata, og:description fallback) + **10 SPA-test assertions** all green;
 - Real case: on a Xiaoheihe post, comment like-counts (`up` field) could not be attributed from flattened text — **precise fields should come from the page's underlying data API** (e.g. `/bbs/app/link/tree` JSON). This is a shared boundary of text extractors, not a defect.
 
 ## Roadmap
@@ -244,13 +257,19 @@ const results = await Promise.all([
 - [x] On-demand SPA rendering (optional Playwright enhancement, auto-enabled once the browser is installed)
 - [x] Batch reading (`read_url_batch`)
 - [x] Recursive site crawl (`read_url_site`)
+- [x] Native JSON / RSS / Atom support (v1.0.0)
+- [x] Auto-joined paginated articles (v1.0.0)
+- [x] UTF-16 BOM / Shift-JIS encoding boost (v1.0.0)
+- [x] Text-density fallback + metadata harvesting (v1.0.0)
+
+> From v1.0.0 the plugin enters maintenance mode: bug fixes first, updates kept rare.
 
 ## Development
 
 ```bash
 node test.mjs          # zero-dependency self-tests (charset/extract/markdown/truncate)
 node test-spa.mjs      # SPA rendering tests (10 assertions; SKIPs if playwright absent)
-node multi-site.mjs    # 29-site real-world sweep (needs network): portals/SPA/login-walls/static/anti-bot/net-boundaries
+node multi-site.mjs    # 47-site real-world sweep (needs network): portals/SPA/login-walls/static/feeds/JSON/anti-bot/net-boundaries
 
 # End-to-end (requires DSH CLI)
 npx @deepseek-ai/dsh plugin --profile headless add .        # run from the parent dir of the plugin

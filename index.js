@@ -7,8 +7,11 @@
 //     (temporal composability, docs/cordis-primer.md)
 //   - cooperative tool-call timeout via ToolDefinition.timeoutMs + exec.signal
 // Focus: token economy + smarter extraction for DSH agents.
-//   - charset auto-detect (GBK/GB2312/UTF-8/Big5) via built-in TextDecoder
+//   - charset auto-detect (BOM UTF-16 / GBK/GB2312/UTF-8/Big5/Shift-JIS)
+//   - content dispatch: HTML / JSON APIs / RSS-Atom feeds natively
 //   - clean main-content extraction (heuristic; optional @mozilla/readability upgrade path)
+//     + text-density fallback on the body path
+//   - auto-joined pagination, page metadata (published/author)
 //   - HTML -> Markdown / plain text, paragraph-aligned smart truncation
 //   - session-level cache, compact text render (lowest token cost)
 import { TextDecoder } from 'node:util'
@@ -29,6 +32,8 @@ const DEFAULTS = {
   cacheTtlMs: 300000,
   cacheMax: 32,
   spaRender: true,
+  paginate: true,
+  paginateMax: 3,
   userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
 }
 
@@ -51,12 +56,16 @@ function getDecoder(enc) {
 }
 
 function sniffCharset(buffer, contentType) {
+  // BOM first — byte-level evidence beats any declared charset (a UTF-16 body
+  // with a latin1-read <meta> probe garbles the meta match anyway).
+  if (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) return 'utf-8'
+  if (buffer[0] === 0xff && buffer[1] === 0xfe) return 'utf-16le'
+  if (buffer[0] === 0xfe && buffer[1] === 0xff) return 'utf-16be'
   const m = /charset=["']?([\w-]+)/i.exec(contentType || '')
   if (m) return m[1]
   const head = buffer.subarray(0, 2048).toString('latin1').toLowerCase()
   const meta = /<meta[^>]+charset=["']?([\w-]+)/i.exec(head)
   if (meta) return meta[1]
-  if (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) return 'utf-8'
   return null
 }
 
@@ -77,10 +86,22 @@ export function decodeBuffer(buffer, contentType) {
   return { text, charset: enc }
 }
 
-// Direct-connect fetch, extracted so the race path can run it concurrently
-// with the proxy attempt and abort it. Returns { buffer, contentType, finalUrl }
-// on success or { error } — never throws (abort/timeout/network all mapped).
-async function directFetch(url, signal, cfg) {
+// Content types this plugin can consume. Beyond HTML: JSON (data APIs) and
+// XML (RSS/Atom feeds) are read natively — see readUrl's type dispatch.
+// Note "application/rss+xml": the separator before xml is '+', not '/'.
+const FETCHABLE_CT = /text\/html|application\/xhtml|text\/plain|\/json|[+/]xml/i
+
+// Retry-After header (seconds form) → ms, capped; undefined when absent/invalid.
+function retryAfterMs(res) {
+  const v = res.headers.get('retry-after')
+  if (!v) return undefined
+  const sec = Number(v)
+  if (!Number.isFinite(sec) || sec < 0) return undefined
+  return Math.min(sec * 1000, 5000)
+}
+
+// Single fetch attempt. Never throws; maps abort/timeout/network to { error }.
+async function directFetchOnce(url, signal, cfg) {
   try {
     const res = await fetch(url, {
       redirect: 'follow',
@@ -90,9 +111,19 @@ async function directFetch(url, signal, cfg) {
     // Early-return paths must cancel the body stream, or the connection is
     // held open undrained and cannot return to the keep-alive pool.
     const discardBody = () => { if (res.body) res.body.cancel().catch(() => {}) }
-    if (!res.ok) { discardBody(); return { error: `HTTP ${res.status} ${res.statusText}` } }
+    if (!res.ok) {
+      // Rate-limit / temporary-overload: honor Retry-After with one retry
+      // (capped at 5s so the cooperative timeout still bounds the call).
+      if (res.status === 429 || res.status === 503) {
+        const ra = retryAfterMs(res)
+        discardBody()
+        if (ra !== undefined) return { retryAfterMs: ra }
+      }
+      discardBody()
+      return { error: `HTTP ${res.status} ${res.statusText}` }
+    }
     const contentType = res.headers.get('content-type') || ''
-    if (contentType && !/text\/html|application\/xhtml|text\/plain/i.test(contentType)) {
+    if (contentType && !FETCHABLE_CT.test(contentType)) {
       discardBody()
       return { error: `Unsupported content-type: ${contentType.split(';')[0]}` }
     }
@@ -115,6 +146,19 @@ async function directFetch(url, signal, cfg) {
     const cause = e.cause && e.cause.message ? String(e.cause.message).slice(0, 90) : ''
     return { error: cause || (e.message || '').slice(0, 120) }
   }
+}
+
+// Direct-connect fetch with a single Retry-After-aware retry on 429/503.
+async function directFetch(url, signal, cfg) {
+  const first = await directFetchOnce(url, signal, cfg)
+  if (first && first.retryAfterMs !== undefined && !(signal && signal.aborted)) {
+    await new Promise((resolve) => {
+      const t = setTimeout(resolve, first.retryAfterMs)
+      if (signal) signal.addEventListener('abort', () => { clearTimeout(t); resolve() }, { once: true })
+    })
+    return directFetchOnce(url, signal, cfg)
+  }
+  return first
 }
 
 // Settle-all race that resolves with the FIRST SUCCESSFUL result (a value
@@ -245,6 +289,81 @@ function textOnly(html) {
     .trim())
 }
 
+// ---- JSON / RSS / Atom content dispatch ----
+// A URL is not always an HTML page: data APIs answer JSON and content sources
+// answer feeds. Both are model-readable when compacted, so read_url handles
+// them natively instead of erroring with "Unsupported content-type".
+
+function xmlText(s) {
+  return decodeTextEntities(String(s || '')
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim())
+}
+
+// RSS 2.0 <item> / Atom <entry> → compact list "title — url\n  summary".
+function parseFeed(xml, limit) {
+  const isAtom = /<feed[\s>]/i.test(xml)
+  const itemRe = isAtom ? /<entry[\s>][\s\S]*?<\/entry\s*>/gi : /<item[\s>][\s\S]*?<\/item\s*>/gi
+  const items = []
+  let m
+  while ((m = itemRe.exec(xml)) && items.length < limit) {
+    const it = m[0]
+    const title = xmlText(/<title[^>]*>([\s\S]*?)<\/title>/i.exec(it)?.[1] || '')
+    const linkTag = /<link[^>]*>([\s\S]*?)<\/link>/i.exec(it)
+    const linkHref = /<link[^>]+href=["']([^"']+)["']/i.exec(it)
+    const link = (linkTag && xmlText(linkTag[1])) || (linkHref && linkHref[1]) || ''
+    const desc = xmlText(/<(?:description|summary|content)[^>]*>([\s\S]*?)<\/(?:description|summary|content)>/i.exec(it)?.[1] || '')
+    if (!title && !link && !desc) continue
+    items.push({ title: title.slice(0, 120), url: link, summary: desc.slice(0, 200) })
+  }
+  const feedTitle = xmlText(/<title[^>]*>([\s\S]*?)<\/title>/i.exec(xml)?.[1] || '')
+  const lines = []
+  for (const it of items) {
+    lines.push(`- ${it.title}${it.url ? ` — ${it.url}` : ''}`)
+    if (it.summary) lines.push(`  ${it.summary}`)
+  }
+  return { title: feedTitle, count: items.length, items, text: lines.join('\n') }
+}
+
+// ---- Text-density fallback (body path only) ----
+// Pages without <article>/<main> degrade to the whole <body>: semantic noise
+// stripping then still leaves link-dominated blocks (related posts, category
+// sidebars, "hot articles" widgets) that carry little reading value. Split the
+// body at block-level open tags and drop segments whose text is mostly links.
+// Standard-container pages (article/main) never reach this code path.
+const BLOCK_OPEN_RE = /<(?:p|div|section|article|main|h[1-6]|table|tbody|tr|ul|ol|li|blockquote|pre|dl|figure|figcaption|fieldset)\b[^>]*>/gi
+
+function linkTextLength(html) {
+  let n = 0
+  const re = /<a[\s>][\s\S]*?<\/a\s*>/gi
+  let m
+  while ((m = re.exec(html))) n += textOnly(m[0]).length
+  return n
+}
+
+export function densityFilter(html) {
+  const marks = []
+  BLOCK_OPEN_RE.lastIndex = 0
+  let m
+  while ((m = BLOCK_OPEN_RE.exec(html))) marks.push(m.index)
+  if (marks.length < 2) return html
+  const segs = []
+  if (marks[0] > 0) segs.push(html.slice(0, marks[0]))
+  for (let k = 0; k < marks.length; k++) {
+    segs.push(html.slice(marks[k], k + 1 < marks.length ? marks[k + 1] : html.length))
+  }
+  const kept = segs.filter((seg) => {
+    const text = textOnly(seg)
+    if (text.length < 2) return false
+    // short link-dominated segment = nav item / recommendation widget entry
+    if (text.length < 300 && linkTextLength(seg) > text.length * 0.65) return false
+    return true
+  })
+  return kept.length ? kept.join('') : html
+}
+
 export function pickMain(html) {
   // Aggregation pages (e.g. blog homepages) have one <article> per item:
   // collect all of them instead of only the first.
@@ -262,9 +381,9 @@ export function pickMain(html) {
   if (body) {
     const after = html.slice(body.index)
     const end = after.search(/<\/body>/i)
-    return end > 0 ? after.slice(0, end) : after
+    return densityFilter(end > 0 ? after.slice(0, end) : after)
   }
-  return html
+  return densityFilter(html)
 }
 
 // Some sites (e.g. baidu.com) ship CSS/HTML inside hidden <textarea> with
@@ -290,7 +409,33 @@ function escInline(s) {
   return s.replace(/([\\`*_[\]])/g, '\\$1')
 }
 
+// <img> is a void element (never matches the paired-tag regex in either md
+// walker): convert descriptive images to markdown BEFORE the tag walk, via a
+// sentinel so escInline cannot escape the generated brackets. Decorative
+// images (empty alt) are dropped — the model cannot see pixels anyway.
+const IMG_SENTINEL = '\u0001'
+function imgsToMarkdown(html) {
+  const store = []
+  const out = html.replace(/<img\b[^>]*>/gi, (tag) => {
+    const alt = /alt=["']([^"']*)["']/i.exec(tag)
+    const src = /src=["']([^"']+)["']/i.exec(tag)
+    store.push(src && alt && alt[1].trim() ? `![${alt[1].trim()}](${src[1]})` : '')
+    return `${IMG_SENTINEL}${store.length - 1}${IMG_SENTINEL}`
+  })
+  return {
+    html: out,
+    // Unknown sentinel indexes are PRESERVED (a nested walker's restore must
+    // not eat sentinels owned by an outer frame — blockMd recurses into itself).
+    restore: (s) => s.replace(new RegExp(`${IMG_SENTINEL}(\\d+)${IMG_SENTINEL}`, 'g'), (m, i) => {
+      const v = store[Number(i)]
+      return v === undefined ? m : v
+    }),
+  }
+}
+
 export function inlineMd(html) {
+  const img = imgsToMarkdown(html)
+  html = img.html
   let out = ''
   const re = /<([a-zA-Z0-9]+)((?:"[^"]*"|'[^']*'|[^'">])*)>([\s\S]*?)<\/\1>|<[^>]+>|([^<]+)/g
   let m
@@ -312,11 +457,13 @@ export function inlineMd(html) {
     else if (tag === 'br') out += '  \n'
     else out += inner
   }
-  return out.replace(/[ \t]+/g, ' ').trim()
+  return img.restore(out.replace(/[ \t]+/g, ' ').trim())
 }
 
 export function blockMd(html) {
   let out = ''
+  const img = imgsToMarkdown(html)
+  html = img.html
   const re = /<([a-zA-Z0-9]+)((?:"[^"]*"|'[^']*'|[^'">])*)>([\s\S]*?)<\/\1>|<[^>]+>|([^<]+)/g
   let m
   while ((m = re.exec(html))) {
@@ -345,7 +492,11 @@ export function blockMd(html) {
       out += `\n\n> ${t.replace(/\n/g, '\n> ')}`
     } else if (tag === 'pre') {
       const code = inner.replace(/<[^>]+>/g, '').trim()
-      out += `\n\n\`\`\`\n${code}\n\`\`\``
+      // Language hint from common highlighter conventions: the model reads
+      // ```js fenced blocks far more accurately than unlabelled ones.
+      const lang =
+        /<code[^>]+class=["'][^"']*(?:language|lang)-([\w#+.-]+)["']/i.exec(inner)?.[1] || ''
+      out += `\n\n\`\`\`${lang}\n${code}\n\`\`\``
     } else if (tag === 'code') {
       out += `\`${textOnly(inner)}\``
     } else if (tag === 'ul' || tag === 'ol') {
@@ -388,7 +539,24 @@ export function blockMd(html) {
       if (t) out += t
     }
   }
-  return out
+  return img.restore(out)
+}
+
+// Page-level metadata the model actually asks about (who wrote it, when) —
+// cheap to harvest from <meta>, previously thrown away.
+function extractMeta(html) {
+  const get = (names) => {
+    for (const n of names) {
+      const m = new RegExp(`<meta[^>]+(?:property|name)=["']${n}["'][^>]+content=["']([^"']+)["']`, 'i').exec(html)
+      if (m) return decodeTextEntities(m[1]).trim().slice(0, 80)
+    }
+    return ''
+  }
+  return {
+    published: get(['article:published_time', 'og:published_time', 'pubdate', 'publishdate', 'date', 'dc.date']),
+    author: get(['author', 'article:author', 'og:article:author']),
+    description: get(['og:description', 'description']),
+  }
 }
 
 export function extract(html, mode) {
@@ -403,11 +571,23 @@ export function extract(html, mode) {
   } else {
     bodyText = textOnly(main).replace(/ +/g, ' ').trim()
   }
+  const meta = extractMeta(html)
+  // Empty-body pages (login walls, JS-only shells) still carry og:description
+  // — surface it as a fallback hint instead of nothing.
+  let text = bodyText
+  let usedDescription = false
+  if (!text && meta.description) {
+    text = meta.description
+    usedDescription = true
+  }
   return {
     title: titleMatch ? textOnly(titleMatch[1]) || titleMatch[1].trim() : '',
     siteName: siteName ? siteName[1] : '',
     lang: langMatch ? langMatch[1] : '',
-    text: bodyText,
+    published: meta.published,
+    author: meta.author,
+    text,
+    usedDescription,
   }
 }
 
@@ -508,6 +688,53 @@ function hostOf(url) {
   }
 }
 
+// ---- Pagination: auto-follow "next page" ----
+// Long articles on novel/news/forum sites are split into pages; without this
+// the model had to notice the truncation and re-call the tool per page. The
+// recognition is deliberately conservative: rel=next (standard) or a short
+// anchor whose whole text is a next-page marker — no fuzzy guessing.
+const NEXT_TEXT_RE = /^(?:下一页|下页|后一页|下一頁|下頁|next page|next|›{1,3}|»{1,3}|>|older entries)$/i
+
+export function findNextLink(html, baseUrl) {
+  const resolve = (href) => {
+    try {
+      const u = new URL(href, baseUrl)
+      return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null
+    } catch {
+      return null
+    }
+  }
+  const rel = /<(?:link|a)\b[^>]+rel=["']next["'][^>]*>/i.exec(html || '')
+  if (rel) {
+    const href = /href=["']([^"']+)["']/i.exec(rel[0])
+    const r = href && resolve(href[1])
+    if (r) return r
+  }
+  const re = /<a\b[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a\s*>/gi
+  let m
+  while ((m = re.exec(html || ''))) {
+    const t = textOnly(m[2])
+    if (t.length <= 16 && NEXT_TEXT_RE.test(t)) {
+      const r = resolve(m[1])
+      if (r) return r
+    }
+  }
+  return null
+}
+
+// Join two page bodies, dropping a repeated suffix/prefix overlap (many
+// paginated sites repeat the last paragraph or a heading on the next page).
+function joinPageText(a, b) {
+  const max = Math.min(300, a.length, b.length)
+  for (let n = max; n >= 30; n--) {
+    if (a.slice(a.length - n) === b.slice(0, n)) {
+      const rest = b.slice(n).trim()
+      return rest ? `${a}\n\n${rest}` : a
+    }
+  }
+  return `${a}\n\n${b}`
+}
+
 function sliceFrom(full, offset, maxChars) {
   const s = smartTruncate(full.fullText, maxChars, offset)
   const out = {
@@ -525,6 +752,10 @@ function sliceFrom(full, offset, maxChars) {
   }
   if (full.rendered) out.rendered = true
   if (full.spaHint) out.spaHint = full.spaHint
+  if (full.paginated > 1) out.paginated = full.paginated
+  if (full.feedCount) out.feedCount = full.feedCount
+  if (full.published) out.published = full.published
+  if (full.author) out.author = full.author
   if (Array.isArray(full.links)) out.links = full.links
   return out
 }
@@ -562,26 +793,69 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     }
   }
 
-  let html, finalUrl, charset
-  const viaSeam = await fetchViaWebSeam(ctx, url, externalSignal, cfg)
-  if (viaSeam) {
-    html = viaSeam.html
-    finalUrl = viaSeam.finalUrl
-    charset = 'provider-decoded'
-  } else {
-    const page = await fetchPage(url, externalSignal, cfg)
-    if (page.error) {
-      // Brief error cache: a failing URL usually stays failing for a while,
-      // so serve the same error from cache instead of re-fetching.
-      if (cache.size >= cfg.cacheMax) cache.delete(cache.keys().next().value)
-      cache.set(cacheKey, { time: Date.now(), error: page.error })
-      return { error: page.error }
-    }
-    const decoded = decodeBuffer(page.buffer, page.contentType)
-    html = decoded.text
-    finalUrl = page.finalUrl || url
-    charset = decoded.charset
+  const failWith = (error) => {
+    if (cache.size >= cfg.cacheMax) cache.delete(cache.keys().next().value)
+    cache.set(cacheKey, { time: Date.now(), error })
+    return { error }
   }
+
+  // Non-HTML payloads (JSON APIs, RSS/Atom feeds) are read natively: fetch,
+  // dispatch by content-type / payload shape, render compact. Falls back to
+  // the HTML pipeline for everything else.
+  const dispatch = async () => {
+    const viaSeam = await fetchViaWebSeam(ctx, url, externalSignal, cfg)
+    if (viaSeam) {
+      const t = viaSeam.html.trim()
+      if (t.startsWith('{') || t.startsWith('[')) {
+        try {
+          return { kind: 'json', text: JSON.stringify(JSON.parse(t), null, 1) }
+        } catch { /* not JSON — keep HTML pipeline */ }
+      }
+      return { kind: 'html', html: viaSeam.html, finalUrl: viaSeam.finalUrl, charset: 'provider-decoded' }
+    }
+    const page = await fetchPage(url, externalSignal, cfg)
+    if (page.error) return { error: page.error }
+    const ct = (page.contentType || '').split(';')[0].toLowerCase().trim()
+    const decoded = decodeBuffer(page.buffer, page.contentType)
+    if (/json$/.test(ct)) {
+      try {
+        return { kind: 'json', text: JSON.stringify(JSON.parse(decoded.text), null, 1) }
+      } catch { /* invalid JSON — serve through the HTML pipeline as text */ }
+    }
+    if (/[+/]xml$/.test(ct)) {
+      if (/<urlset[\s>]/i.test(decoded.text) || /<sitemapindex[\s>]/i.test(decoded.text)) {
+        return { error: 'Unsupported content (XML sitemap)' }
+      }
+      if (/<rss[\s>]/i.test(decoded.text) || /<feed[\s>]/i.test(decoded.text)) {
+        return { kind: 'feed', feed: parseFeed(decoded.text, cfg.maxLinks) }
+      }
+    }
+    return { kind: 'html', html: decoded.text, finalUrl: page.finalUrl || url, charset: decoded.charset }
+  }
+  const payload = await dispatch()
+  if (payload.error) return failWith(payload.error)
+
+  if (payload.kind === 'json') {
+    const full = { url, title: '', siteName: hostOf(url), lang: '', charset: 'json', mode: 'json', fullText: payload.text, paginated: 1 }
+    if (cache.size >= cfg.cacheMax) cache.delete(cache.keys().next().value)
+    cache.set(cacheKey, { time: Date.now(), full })
+    return sliceFrom(full, offset, maxChars)
+  }
+  if (payload.kind === 'feed') {
+    const f = payload.feed
+    const full = {
+      url, title: f.title || '', siteName: hostOf(url), lang: '', charset: 'feed',
+      mode: 'feed', fullText: f.text, paginated: 1, feedCount: f.count,
+      links: args.includeLinks === true ? f.items : undefined,
+    }
+    if (cache.size >= cfg.cacheMax) cache.delete(cache.keys().next().value)
+    cache.set(cacheKey, { time: Date.now(), full })
+    return sliceFrom(full, offset, maxChars)
+  }
+
+  let html = payload.html
+  let finalUrl = payload.finalUrl || url
+  const charset = payload.charset
 
   let extracted = extract(html, mode)
   // Optional readability upgrade: cleaner article extraction when installed.
@@ -622,6 +896,34 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     }
   }
 
+  // Auto-pagination: follow the "next page" chain (bounded, same-host, no
+  // loops). Continuation pages go through the fast static path — a paginated
+  // SPA chain would cost one full render per page, out of proportion.
+  let paginated = 1
+  const paginateMax = cfg.paginate === false ? 1 : Math.max(1, Math.min(10, Number(cfg.paginateMax) || 3))
+  const startHost = hostOf(finalUrl || url)
+  const seen = new Set([normalizeUrl(finalUrl || url)])
+  let nextUrl = paginateMax > 1 ? findNextLink(renderedHtml || html, finalUrl || url) : null
+  while (
+    nextUrl && paginated < paginateMax &&
+    sameHost(nextUrl, startHost) &&
+    !(externalSignal && externalSignal.aborted)
+  ) {
+    const nu = normalizeUrl(nextUrl)
+    if (!nu || seen.has(nu)) break
+    seen.add(nu)
+    const page = await fetchPage(nextUrl, externalSignal, cfg)
+    if (page.error) break
+    const ct = (page.contentType || '').split(';')[0].toLowerCase().trim()
+    if (!/html|xhtml/.test(ct)) break
+    const nextHtml = decodeBuffer(page.buffer, page.contentType).text
+    const nextEx = extract(nextHtml, mode)
+    if (!nextEx.text || nextEx.text.length < 20) break
+    extracted.text = joinPageText(extracted.text, nextEx.text)
+    paginated++
+    nextUrl = findNextLink(nextHtml, page.finalUrl || nextUrl)
+  }
+
   const full = {
     url: finalUrl,
     title: extracted.title || '',
@@ -632,6 +934,9 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     fullText: extracted.text,
     rendered,
     spaHint,
+    paginated,
+    published: extracted.published || '',
+    author: extracted.author || '',
     // Links come from the rendered DOM when available — otherwise the SPA
     // chain (content -> links -> next page) would break for JS-only pages.
     links: args.includeLinks === true ? extractLinks(renderedHtml || html, cfg.maxLinks, finalUrl) : undefined,
@@ -652,7 +957,11 @@ function renderResult(value) {
   const meta = []
   if (r.siteName && r.siteName !== host) meta.push(r.siteName)
   if (r.lang) meta.push(r.lang)
-  if (r.charset) meta.push(`charset ${r.charset}`)
+  if (r.charset && r.charset !== 'json' && r.charset !== 'feed') meta.push(`charset ${r.charset}`)
+  if (r.published) meta.push(r.published)
+  if (r.author) meta.push(`by ${r.author}`)
+  if (r.feedCount) meta.push(`feed · ${r.feedCount} 条`)
+  if (r.mode === 'json') meta.push('json')
   if (meta.length) lines.push(meta.join(' · '))
   if (r.charsStart > 0) {
     lines.push(`(chars ${r.charsStart}+${r.charsReturned}/${r.charsTotal} — offset 续读)`)
@@ -662,6 +971,7 @@ function renderResult(value) {
     lines.push(`(chars ${r.charsTotal})`)
   }
   if (r.cached) lines.push('(cached)')
+  if (r.paginated > 1) lines.push(`(已自动拼接 ${r.paginated} 页)`)
   if (r.rendered) lines.push('(rendered — JS 执行后内容)')
   if (!r.text) {
     if (r.charsStart > 0 && !r.truncated) {
@@ -1035,8 +1345,10 @@ export function apply(ctx, config) {
   cfg.maxLinks = clamp(cfg.maxLinks, DEFAULTS.maxLinks, 1, 50)
   cfg.cacheTtlMs = clamp(cfg.cacheTtlMs, DEFAULTS.cacheTtlMs, 0, 3600000)
   cfg.cacheMax = clamp(cfg.cacheMax, DEFAULTS.cacheMax, 1, 256)
+  cfg.paginateMax = clamp(cfg.paginateMax, DEFAULTS.paginateMax, 1, 10)
   if (typeof cfg.userAgent !== 'string' || !cfg.userAgent.trim()) cfg.userAgent = DEFAULTS.userAgent
   if (typeof cfg.spaRender !== 'boolean') cfg.spaRender = DEFAULTS.spaRender
+  if (typeof cfg.paginate !== 'boolean') cfg.paginate = DEFAULTS.paginate
 
   // Temporal composability: unload must fully revert side effects.
   ctx.effect(() => () => {
@@ -1065,10 +1377,11 @@ export function apply(ctx, config) {
       },
       required: ['url'],
     },
-    // Pipeline budget must cover the real worst case: full fetch timeout
-    // (cfg.timeoutMs) + SPA render (playwright goto 30s cap + DOM-stability
-    // poll 10s) + margin. Derived from load-time cfg — scale with it, never clamp it.
-    timeoutMs: Math.max(45000, cfg.timeoutMs + 45000),
+    // Pipeline budget must cover the real worst case: first page fetch +
+    // SPA render (goto 30s cap + DOM-stability poll 10s) + up to paginateMax
+    // continuation fetches (static, no render). Derived from load-time cfg —
+    // scale with it, never clamp it.
+    timeoutMs: Math.max(45000, cfg.timeoutMs * (cfg.paginate === false ? 1 : cfg.paginateMax + 1) + 45000),
     output: {
       schema: {
         type: 'object',
