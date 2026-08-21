@@ -16,7 +16,7 @@
 //   - session-level cache, compact text render (lowest token cost)
 import { TextDecoder } from 'node:util'
 import { looksLikeSpa, renderPage, closeBrowser } from './spa.js'
-import { detectProxy, fetchViaCurlProxy } from './proxy-fallback.js'
+import { detectProxy, fetchViaCurlProxy, looksBinary } from './proxy-fallback.js'
 // Re-export for tests / programmatic (PTC) cleanup.
 export { closeBrowser, renderPage, looksLikeSpa } from './spa.js'
 
@@ -135,7 +135,12 @@ async function directFetchOnce(url, signal, cfg) {
       if (size > cfg.maxBytes) { discardBody(); return { error: `Page exceeds ${cfg.maxBytes} bytes` } }
       chunks.push(chunk)
     }
-    return { buffer: Buffer.concat(chunks), contentType, finalUrl: res.url }
+    const buffer = Buffer.concat(chunks)
+    // Headerless responses: gate binary bodies out of the HTML pipeline.
+    if (!contentType && looksBinary(buffer)) {
+      return { error: 'Unsupported content-type (no header, binary body)' }
+    }
+    return { buffer, contentType, finalUrl: res.url }
   } catch (e) {
     if (e.name === 'AbortError' || e.name === 'TimeoutError') {
       return { error: `Timeout after ${cfg.timeoutMs}ms or cancelled` }
@@ -295,11 +300,16 @@ function textOnly(html) {
 // them natively instead of erroring with "Unsupported content-type".
 
 function xmlText(s) {
-  return decodeTextEntities(String(s || '')
-    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim())
+  let t = String(s || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+  // Feeds double-escape HTML in descriptions (&lt;a href=…&gt;查看全文&lt;/a&gt;):
+  // one strip-then-decode pass leaves literal tags in the rendered text
+  // (measured on sspai.com/feed). Iterate strip → decode until stable.
+  for (let i = 0; i < 3; i++) {
+    const prev = t
+    t = decodeTextEntities(t.replace(/<[^>]+>/g, ' '))
+    if (t === prev) break
+  }
+  return t.replace(/\s+/g, ' ').trim()
 }
 
 // RSS 2.0 <item> / Atom <entry> → compact list "title — url\n  summary".
@@ -364,19 +374,49 @@ export function densityFilter(html) {
   return kept.length ? kept.join('') : html
 }
 
+// Depth-counted block extraction: returns html from the opening tag at
+// openIdx through its BALANCED closing tag. A non-greedy regex stops at the
+// first nested </div> — measured: gnu.org "content" div cut to 2700 chars,
+// naver.com "container" to 115 (zero text). Container divs nest heavily.
+function tagBlockAt(html, openIdx, tagName) {
+  const re = new RegExp(`</?${tagName}(?=[\\s>])`, 'gi')
+  re.lastIndex = openIdx
+  let depth = 0
+  let m
+  while ((m = re.exec(html))) {
+    depth += m[0][1] === '/' ? -1 : 1
+    if (depth === 0) {
+      const close = html.indexOf('>', m.index)
+      return close > 0 ? html.slice(openIdx, close + 1) : null
+    }
+  }
+  return null
+}
+
 export function pickMain(html) {
   // Aggregation pages (e.g. blog homepages) have one <article> per item:
-  // collect all of them instead of only the first.
+  // collect all of them instead of only the first. A tiny <article> (e.g. a
+  // newsletter card — measured on about.gitlab.com: 71 chars of text while
+  // the real content sits in <main>) falls through to <main> when present.
   const articles = [...html.matchAll(/<article[\s>][\s\S]*?<\/article\s*>/gi)]
-  if (articles.length) return articles.map((a) => a[0]).join('\n')
-  const mainTag =
-    /<(main|div)[^>]*role=["']main["'][\s>][\s\S]*?<\/\1\s*>/i.exec(html) ||
-    // Bare <main> without role="main": doc generators (VitePress/VuePress,
-    // MDN, MDX sites) mark the body with a plain <main> tag. Falling back to
-    // the whole <body> would drag in the top/local nav (menu, outline, skip
-    // link) — the extraction quality loss we saw on vuejs.org.
-    /<main[\s>][\s\S]*?<\/main\s*>/i.exec(html)
-  if (mainTag) return mainTag[0]
+  const hasMain = /<main[\s>]/i.test(html)
+  if (articles.length && (!hasMain || textOnly(articles.map((a) => a[0]).join('')).length >= 200)) {
+    return articles.map((a) => a[0]).join('\n')
+  }
+  const roleMain = /<(main|div)[^>]*role=["']main["'][\s>]/i.exec(html)
+  if (roleMain) {
+    const block = tagBlockAt(html, roleMain.index, roleMain[1].toLowerCase())
+    if (block) return block
+  }
+  // Bare <main> without role="main": doc generators (VitePress/VuePress,
+  // MDN, MDX sites) mark the body with a plain <main> tag. Falling back to
+  // the whole <body> would drag in the top/local nav (menu, outline, skip
+  // link) — the extraction quality loss we saw on vuejs.org.
+  const bareMain = /<main[\s>]/i.exec(html)
+  if (bareMain) {
+    const block = tagBlockAt(html, bareMain.index, 'main')
+    if (block) return block
+  }
   const body = /<body[\s>]/i.exec(html)
   if (body) {
     const after = html.slice(body.index)
@@ -548,7 +588,7 @@ function extractMeta(html) {
   const get = (names) => {
     for (const n of names) {
       const m = new RegExp(`<meta[^>]+(?:property|name)=["']${n}["'][^>]+content=["']([^"']+)["']`, 'i').exec(html)
-      if (m) return decodeTextEntities(m[1]).trim().slice(0, 80)
+      if (m) return decodeTextEntities(m[1]).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80)
     }
     return ''
   }
@@ -878,18 +918,33 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
 
   // Optional SPA enhancement: if the page looks client-rendered and static
   // extraction found almost nothing, try headless rendering (playwright).
+  // Beyond script-heavy shells (looksLikeSpa, ≥5 <script> tags), a page whose
+  // extraction is EMPTY but carries any <script> may be a JS-redirect shell
+  // (measured: taptap.cn — 2 scripts, empty <body>, redirects via JS) — with
+  // no text to lose, rendering is always worth one bounded attempt. Pages
+  // with no scripts at all cannot change under rendering and are skipped.
   let rendered = false
   let spaHint = ''
   let renderedHtml = null
-  if (cfg.spaRender !== false && looksLikeSpa(html) && (!extracted.text || extracted.text.length < 200)) {
+  const needsRender = !extracted.text || extracted.text.length < 200
+  const scriptShell = !extracted.text && /<script[\s>]/i.test(html)
+  if (cfg.spaRender !== false && needsRender && (looksLikeSpa(html) || scriptShell)) {
     const rr = await renderPage(finalUrl || url, externalSignal)
     if (rr.html) {
       renderedHtml = rr.html
       const r2 = upgrade(extract(rr.html, mode), rr.html)
-      if (r2.text && r2.text.length > extracted.text.length + 50) {
+      // Accept the rendered text when it meaningfully beats the static one.
+      // From an EMPTY static extraction even a short body is a real gain
+      // (measured: taptap-style JS shells render 30-60 chars of real content
+      // that the fixed +50 margin would reject).
+      const gain = r2.text.length - extracted.text.length
+      const accept = r2.text && (gain > 50 || (!extracted.text && r2.text.length >= 20))
+      if (accept) {
         extracted = r2
         finalUrl = rr.finalUrl || finalUrl
         rendered = true
+      } else if (!extracted.text) {
+        spaHint = '已渲染仍无可读内容（可能登录墙或反爬拦截）'
       }
     } else {
       spaHint = rr.error
@@ -1047,8 +1102,10 @@ function readLinksTool(ctx, cfg) {
       }
       let links = extractLinks(html, limit, finalUrl)
       // SPA fallback: a JS-only page yields no links from its static HTML;
-      // render it and re-extract when the static result looks empty.
-      if (links.length < 3 && cfg.spaRender !== false && looksLikeSpa(html)) {
+      // render it and re-extract when the static result looks empty. Any
+      // <script> counts as renderable when there are no links at all — the
+      // static shell may be a JS-redirect (same rationale as read_url).
+      if (links.length < 3 && cfg.spaRender !== false && (looksLikeSpa(html) || (links.length === 0 && /<script[\s>]/i.test(html)))) {
         const rr = await renderPage(finalUrl || url, exec && exec.signal)
         if (rr.html) {
           const rl = extractLinks(rr.html, limit, rr.finalUrl || finalUrl)

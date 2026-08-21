@@ -232,24 +232,28 @@ const results = await Promise.all([
 
 ## 真实世界验证（2026-08-21，v1.0.0）
 
-47 站全量实测（`multi-site.mjs` 已提交可复跑）：**27 OK / 8 预期边界（薄/空） / 12 网络·反爬归因错误 / 0 崩溃**。v1.0.0 新类型首跑全绿：阮一峰 Atom 订阅源（`charset=feed`）、GitHub API JSON（`charset=json`）、github.blog Atom 源；开源中国博客列表经 SPA 渲染读取。12 个错误全部是环境边界（本轮 Clash 代理未开：BBC/V2EX/维基连接超时；W3C/贴吧 403；北邮 412；httpbin 服务端故障）——每一个都返回结构化、准确归因的错误，无一崩溃。用户代理开启时（v0.4.8 轮），同样的海外站经直连+代理竞速 ~1s 读回。
+152 站全量实测（`multi-site.mjs` 已提交可复跑，8 并发）：**113 OK / 16 预期边界（登录墙·验证页·静态小页） / 23 网络·反爬归因错误 / 0 崩溃**。覆盖国内门户 / 媒体 / 电商（京东·淘宝·拼多多·苏宁·当当）/ 视频（B 站·爱奇艺·优酷·芒果）/ 音乐 / 游戏 / 小说（起点·纵横·晋江 legacy GBK）/ 问答 / 论坛 / 政府 / 高校（清北复交等 8 所）/ 港台繁体（PTT·自由时报·联合报）/ 日韩（Yahoo JP·Hatena·goo·naver·daum）/ 海外技术站（GitHub·dev.to·react.dev·nodejs·rust·go·python docs）/ 订阅源 / JSON API / 编码压力（GBK·GB2312·Big5·gb18030）/ 反爬与网络边界。23 个错误全部环境归因（维基/Reddit/UDN 连接超时；W3C/贴吧/NGA/StackOverflow 403；北邮 412；httpbin 服务端 503；DNS 失败）——每一个都返回结构化、准确归因的错误，无一崩溃。
+
+扫描驱动的发布前修复（全部带单测锁定）：RSS 双重转义、无头二进制嗅探、JS 跳转壳渲染、**`role="main"` 嵌套 div 截断**（gnu.org 165→800 字符）、**小 article 劫持主内容**（gitlab 71→800 字符）、渲染接受门槛放宽。
 
 | 类别 | 站点 | 结果 |
 |---|---|---|
 | 门户导航净化 | 百度 / 腾讯 / 网易 / 新浪 / 豆瓣 / CSDN / 搜狐 / 凤凰 | ✅ 干净正文，无 CSS 噪音 |
-| **SPA 渲染** | B 站 / 小黑盒 / 掘金 / QQ 新闻 / 少数派 / 开源中国 | ✅ `rendered` 标记 + JS 执行后正文 |
-| 多 article 聚合 | 博客园 / 阮一峰博客 | ✅ 800+ 字符多篇聚合 |
-| **订阅源与数据 API（v1.0.0）** | 阮一峰 Atom / github.blog Atom / GitHub API JSON | ✅ `charset=feed` / `charset=json` 紧凑渲染 |
-| 静态文档页 | MDN / 阮一峰 / example.com / GitHub / vuejs.org | ✅ 干净提取（example.com 简单页，预期） |
+| **SPA 渲染** | B 站 / 小黑盒 / 掘金 / QQ 新闻 / 少数派 / 开源中国 / 澎湃 / 雪球 / 唯品会 / TapTap | ✅ `rendered` 标记 + JS 执行后正文 |
+| 多 article 聚合 | 博客园 / 阮一峰博客 / 豆瓣小组 / Hacker News | ✅ 800+ 字符多篇聚合（含分页拼接 paginated=2~3） |
+| **订阅源与数据 API（v1.0.0）** | 阮一峰 Atom / github.blog Atom / v2ex Atom / Solidot RSS / 少数派 RSS / GitHub API / HN API | ✅ `charset=feed` / `charset=json` 紧凑渲染 |
+| 静态文档页 | MDN / 阮一峰 / example.com / GitHub / vuejs.org / react.dev / nodejs.org / go.dev / svelte.dev | ✅ 干净提取（example.com 简单页，预期） |
+| **legacy 布局修复** | gnu.org（嵌套 div 容器）/ gitlab（小 article 劫持） | ✅ 修复后 800 字符满额（修复前 165 / 71 字符） |
 | 问答 / 论坛 / 百科 | 知乎专栏 / 虎扑 / 百度知道 / 百科 | ✅ 干净正文（知乎首页登录墙，预期） |
-| GBK 老编码 | 中关村在线 | ✅ `charset=gbk`，无乱码 |
-| 政府 / 教育 | gov.cn / 北邮 | ✅ gov.cn 干净；北邮 412 已归因（WAF） |
-| 网络·反爬边界 | W3C（403）；贴吧（403）；维基/BBC/V2EX（连接超时，本轮代理未开）；httpbin（404/503）；DNS 失败（ENOTFOUND） | ✅ 错误全部准确归因（HTTP 状态/超时/ENOTFOUND），非插件缺陷 |
+| GBK 老编码 | 中关村在线 / 当当 / 晋江（gb18030） / 人民网（GB2312） | ✅ 无乱码 |
+| 电商 / 视频 / 音乐 | 京东 / 淘宝 / 拼多多 / B 站 / 爱奇艺 / 网易云 / QQ 音乐 | ✅ 干净提取（亚马逊跳转按钮页、快手登录墙，预期） |
+| 政府 / 教育 | gov.cn / 教育部 / 工信部 / 统计局 / 清华北大等 8 所高校 | ✅ 干净；北邮 412 已归因（WAF） |
+| 网络·反爬边界 | W3C·贴吧·NGA·StackOverflow（403）；维基·Reddit·UDN（连接超时）；httpbin（503/二进制拒绝）；DNS 失败（ENOTFOUND） | ✅ 错误全部准确归因（HTTP 状态/超时/ENOTFOUND），非插件缺陷 |
 | **offset 续读** | 新浪新闻（1602 字符） | ✅ 800+800 无缝衔接、命中缓存 |
 | **批量 + 失败隔离** | 4 URL 混合 | ✅ 2/4 成功、失败隔离 |
 | **整站爬取** | 阮一峰博客 | ✅ 5/5 页树状站点地图 |
 
-- **60 个单元断言**（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级、UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 Retry-After 重试、图片 alt、代码语言、元数据、og:description 回落）+ **10 个 SPA 测试断言**全绿；
+- **72 个单元断言**（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级、UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 Retry-After 重试、图片 alt、代码语言、元数据、og:description 回落、双转义 feed、无头二进制嗅探、嵌套 role=main、薄 article 回落、不平衡标签降级）+ **12 个 SPA 测试断言**全绿；
 - 一个真实案例：小黑盒帖子的评论点赞数（`up` 字段）无法从扁平文本确定归属——**精确字段应走页面背后的数据 API**（如 `/bbs/app/link/tree` JSON），这是同类文本提取器的共同边界，不是缺陷。
 
 ## Roadmap
@@ -271,9 +275,9 @@ const results = await Promise.all([
 node test.mjs          # 单元自测（转码/提取/Markdown/截断/批量/站点爬取/缓存隔离/配置钳制）
 
 # SPA 渲染真实测试（需 playwright 已安装，未装自动 SKIP）
-node test-spa.mjs      # 10 断言：JS 正文/渲染后链接/工具不崩溃/缓存隔离
+node test-spa.mjs      # 12 断言：JS 正文/渲染后链接/工具不崩溃/缓存隔离/JS 跳转壳
 
-# 47 站真实世界验证（需联网）
+# 152 站真实世界验证（需联网，CONC=8 可调并发）
 node multi-site.mjs    # 门户/SPA/登录墙/静态/订阅源/JSON/反爬/网络边界，输出分级结果
 
 # 端到端验证（需已安装 DSH CLI）

@@ -38,6 +38,16 @@
 
 **测试**：42 → **60 断言**（+UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 重试、图片 alt、代码语言、元数据、og:description 回落）+ test-spa 10 全绿 + **47 站真实回归**（新增 ruanyifeng Atom / github-blog Atom / v2ex Atom / GitHub API JSON / 起点·开源中国分页候选站）
 
+**发布前实测修复（152 站全量扫描 + 逐站诊断定位）**
+- RSS 描述双重转义（`&lt;a&gt;` 嵌套实体）→ `xmlText` 迭代「剥标签+解实体」直到稳定，正文不再出现字面 `<a href>`
+- 无 Content-Type 头的二进制响应（字节级嗅探：NUL 字节或控制字符占比 > 30%）被当 HTML 解码出乱码 → `looksBinary` 嗅探拒绝，直连与代理路径统一防护
+- JS 跳转壳（script 数低于 SPA 阈值但 body 为空，实测 taptap.cn 形态）不触发渲染 → 空 body 且含任意 `<script>` 即渲染
+- **`role="main"` 容器被非贪婪正则截断**：`<div role="main">` 内嵌套 div 时匹配到第一个 `</div>` 就停（实测 gnu.org 只取到 2700/20000+ 字符，naver.com 只取到 115 字符即 0 文本）→ `tagBlockAt` 深度计数找平衡闭合标签
+- **小 `<article>` 劫持主内容**：页面存在无关小 article（如订阅卡片，实测 about.gitlab.com 71 字符）时优先级高于 `<main>` → article 文本 < 200 字符且页面有 `<main>` 时回落 main
+- **渲染结果接受门槛过严**：静态提取为空时，渲染出 20–50 字符的短正文（JS 壳典型形态）被 `+50` 增量门槛拒绝 → 空静态 + 渲染 ≥ 20 字符即接受
+
+**测试（发布前终态）**：**72 断言**（+双转义 feed、无头二进制拒绝、嵌套 role=main、薄 article 回落 main、不平衡标签降级）+ test-spa **12 全绿**（+JS 跳转壳渲染）+ **152 站真实回归**（113 OK / 16 预期边界 THIN / 23 环境类 ERR / 0 崩溃；对比修复前 THIN 20 → 16，gnu.org 165→800 字符、gitlab 71→800 字符）
+
 **发布策略**：大版本收敛——此后以修 bug 为主，减少更新频率。
 
 ## [0.4.9] - 2026-08-20

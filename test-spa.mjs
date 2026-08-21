@@ -8,6 +8,8 @@
 //   2. includeLinks extracts links from the RENDERED DOM (chain entry)
 //   3. read_url_links falls back to rendering when static links are empty
 //   4. cache key isolates links/no-links variants
+//   5. a JS shell with only 2 scripts and an EMPTY <body> (looksLikeSpa below
+//      the ≥5 threshold, measured on taptap.cn) still triggers rendering
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import * as m from './index.js'
@@ -27,6 +29,14 @@ const SPA_HTML = `<!DOCTYPE html>
 <script src="/app.js"></script>
 </body></html>`
 
+// 2 scripts (< looksLikeSpa threshold) + empty body: only the empty-text
+// render rule can rescue this shape.
+const SHELL_HTML = `<!DOCTYPE html>
+<html><head><title>JS 跳转壳</title>
+<script src="/fill.js"></script>
+<script src="/fill.js"></script>
+</head><body></body></html>`
+
 const APP_JS = `
 setTimeout(() => {
   const app = document.getElementById('app')
@@ -39,12 +49,26 @@ setTimeout(() => {
 }, 300)
 `
 
+const FILL_JS = `
+setTimeout(() => {
+  document.body.innerHTML =
+    '<article><h1>壳页渲染标题</h1>' +
+    '<p>JS 跳转壳经渲染后产出的正文段落，静态抓取时 body 完全为空。</p></article>'
+}, 200)
+`
+
 function startServer() {
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.url === '/app.js') {
         res.setHeader('content-type', 'application/javascript; charset=utf-8')
         res.end(APP_JS)
+      } else if (req.url === '/fill.js') {
+        res.setHeader('content-type', 'application/javascript; charset=utf-8')
+        res.end(FILL_JS)
+      } else if (req.url === '/shell') {
+        res.setHeader('content-type', 'text/html; charset=utf-8')
+        res.end(SHELL_HTML)
       } else {
         res.setHeader('content-type', 'text/html; charset=utf-8')
         res.end(SPA_HTML)
@@ -100,6 +124,12 @@ try {
   const r2b = await m.readUrl({ url, maxChars: 800, includeLinks: true })
   ok('缓存隔离：无links调用不带links字段', !Array.isArray(r1b.links))
   ok('缓存隔离：带links调用仍返回链接', Array.isArray(r2b.links) && r2b.links.length > 0)
+
+  // 5) JS 跳转壳：script 数低于 looksLikeSpa 阈值、body 为空 → 仍应渲染
+  const shellUrl = `http://127.0.0.1:${PORT}/shell`
+  const r5 = await m.readUrl({ url: shellUrl, maxChars: 800 })
+  ok('JS 跳转壳（2 scripts + 空 body）触发渲染', r5.rendered === true)
+  ok('JS 跳转壳渲染后返回正文', (r5.text || '').includes('壳页渲染标题'))
 } finally {
   server.close()
   await m.closeBrowser().catch(() => {})

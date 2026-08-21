@@ -109,6 +109,47 @@ ok('markdown mode preserves structure', () => {
   assert.ok(r.text.includes('```'))
 })
 
+console.log('pickMain fixes (152-site sweep findings)')
+ok('role=main container with nested divs is not cut short (gnu.org pattern)', () => {
+  const nested = `<html><body><div id="wrap"><div id="content" role="main">
+<p>第一段正文内容，讲了一些需要被提取的事情。</p>
+<div class="inner"><p>嵌套 div 里的第二段内容，非贪婪匹配会在这里截断。</p>
+<div class="deep"><p>更深层嵌套的第三段，验证深度计数闭合。</p></div></div>
+<p>收尾段落，位于嵌套块之后，只有平衡闭合才能取到。</p>
+</div></div><footer>页脚</footer></body></html>`
+  const r = extract(nested, 'text')
+  assert.ok(r.text.includes('第一段正文内容'), `head text extracted: ${r.text.slice(0, 80)}`)
+  assert.ok(r.text.includes('嵌套 div 里的第二段'), `nested text kept: ${r.text.slice(0, 120)}`)
+  assert.ok(r.text.includes('更深层嵌套的第三段'), `deeply nested text kept: ${r.text.slice(0, 160)}`)
+  assert.ok(r.text.includes('收尾段落'), `text after nested block kept: ${r.text.slice(0, 200)}`)
+  assert.ok(!r.text.includes('页脚'), 'footer after balanced close is excluded')
+})
+
+ok('tiny <article> falls through to <main> when present (gitlab pattern)', () => {
+  const page = `<html><body>
+<article><h3>订阅我们的通讯</h3><p>Stay updated.</p></article>
+<main><h1>真正的页面标题</h1><p>${'主要内容段落。'.repeat(60)}</p></main>
+</body></html>`
+  const r = extract(page, 'text')
+  assert.ok(r.text.includes('真正的页面标题'), `main content wins: ${r.text.slice(0, 80)}`)
+  assert.ok(!r.text.includes('Stay updated'), 'tiny article card is not the main content')
+})
+
+ok('tiny <article> is still used when no <main> exists', () => {
+  const page = `<html><body>
+<article><h1>唯一文章标题</h1><p>虽然短但页面只有这个 article。</p></article>
+</body></html>`
+  const r = extract(page, 'text')
+  assert.ok(r.text.includes('唯一文章标题'), `article kept without main fallback: ${r.text.slice(0, 80)}`)
+})
+
+ok('unbalanced role=main div degrades to body path, never returns null', () => {
+  const broken = `<html><body><div role="main"><p>打开的 div 从未闭合。</p>
+<p>正文第二段继续。</p></body></html>`
+  const r = extract(broken, 'text')
+  assert.ok(r.text.includes('正文第二段'), `body fallback works: ${r.text.slice(0, 80)}`)
+})
+
 console.log('smartTruncate / paragraph alignment')
 ok('truncates at paragraph boundary', () => {
   const text = 'aaaa\n\nbbbb\n\ncccc\ndddd'
@@ -735,6 +776,79 @@ ok('empty body falls back to og:description instead of nothing', () => {
   const html = '<html><head><title>登录墙页</title><meta property="og:description" content="这篇文章的导语摘要，需要登录后阅读全文。"></head><body><div id="app"></div></body></html>'
   const r = extract(html, 'text')
   assert.ok(r.text.includes('导语摘要'), `description fallback: ${r.text.slice(0, 60)}`)
+})
+
+console.log('pre-release sweep fixes (feed / binary sniff)')
+{
+  // Feed descriptions double-escape HTML (&lt;a href=&#34;…&#34;&gt;查看全文&lt;/a&gt;,
+  // measured on sspai.com/feed): one strip-then-decode pass left literal tags.
+  const http = await import('node:http')
+  const rss2 = `<?xml version="1.0"?><rss version="2.0"><channel><title>双转义源</title>` +
+    `<item><title>带双转义描述的条目</title><link>https://example.com/d</link>` +
+    `<description>摘要开头内容。&lt;a href=&#34;https://example.com/d&#34; target=&#34;_blank&#34;&gt;查看全文&lt;/a&gt;</description></item>` +
+    `</channel></rss>`
+  const server = http.createServer((req, res) => {
+    if (req.url === '/feed2') {
+      res.setHeader('content-type', 'application/rss+xml')
+      res.end(rss2)
+    } else if (req.url === '/bin') {
+      // No content-type header on purpose: the type gate has nothing to test,
+      // only the binary sniff can keep the PDF out of the HTML pipeline.
+      res.end(Buffer.concat([Buffer.from('%PDF-1.4\n%\xe2\xe3\xcf\xd3\n'), Buffer.alloc(600, 0)]))
+    } else if (req.url === '/noheader-html') {
+      // No content-type but a text body: must still be read as HTML.
+      res.end('<html><head><title>无头页</title></head><body><article><p>没有 content-type 头的普通 HTML 正文。</p></article></body></html>')
+    } else { res.statusCode = 404; res.end('x') }
+  })
+  await new Promise((r) => server.listen(18099, r))
+  const base = 'http://127.0.0.1:18099'
+  {
+    const r = await m.readUrl({ url: `${base}/feed2`, maxChars: 5000 }, undefined, undefined, undefined)
+    assert.ok(!r.error, `feed2 read ok: ${JSON.stringify(r).slice(0, 80)}`)
+    assert.ok(r.text.includes('查看全文'), `decoded text visible: ${r.text.slice(0, 100)}`)
+    assert.ok(!r.text.includes('<a href'), `no literal tags in feed text: ${r.text.slice(0, 100)}`)
+    passed++
+    console.log('  ok - double-escaped feed description renders without literal tags')
+  }
+  {
+    const r = await m.readUrl({ url: `${base}/bin`, maxChars: 5000 }, undefined, undefined, undefined)
+    assert.ok(r.error && r.error.includes('binary'), `headerless binary rejected: ${JSON.stringify(r).slice(0, 120)}`)
+    passed++
+    console.log('  ok - headerless binary body rejected by sniff (no mojibake pipeline)')
+  }
+  {
+    const r = await m.readUrl({ url: `${base}/noheader-html`, maxChars: 5000 }, undefined, undefined, undefined)
+    assert.ok(!r.error, `headerless html read ok: ${JSON.stringify(r).slice(0, 80)}`)
+    assert.ok(r.text.includes('普通 HTML 正文'), `body extracted: ${r.text.slice(0, 60)}`)
+    passed++
+    console.log('  ok - headerless text body still read as HTML')
+  }
+  server.close()
+}
+
+{
+  const { looksBinary } = await import('./proxy-fallback.js')
+  ok('looksBinary: PDF with NUL bytes detected', () => {
+    assert.equal(looksBinary(Buffer.concat([Buffer.from('%PDF-1.4\n'), Buffer.alloc(64, 0)])), true)
+  })
+  ok('looksBinary: plain ASCII/HTML not binary', () => {
+    assert.equal(looksBinary(Buffer.from('<html><body>hello world 你好</body></html>')), false)
+  })
+  ok('looksBinary: UTF-8 CJK text not binary', () => {
+    assert.equal(looksBinary(Buffer.from('你好世界，这是正文内容。'.repeat(10))), false)
+  })
+  ok('looksBinary: empty buffer not binary', () => {
+    assert.equal(looksBinary(Buffer.alloc(0)), false)
+  })
+}
+
+ok('og:description with double-escaped tags yields clean text', () => {
+  const html = '<html><head><title>墙页</title>' +
+    '<meta property="og:description" content="&lt;b&gt;加粗&lt;/b&gt;的导语摘要，需登录阅读。"></head>' +
+    '<body><div id="app"></div></body></html>'
+  const r = extract(html, 'text')
+  assert.ok(r.text.includes('导语摘要'), `description kept: ${r.text.slice(0, 60)}`)
+  assert.ok(!r.text.includes('<b>'), `no literal tags: ${r.text.slice(0, 60)}`)
 })
 
 console.log(`\n${passed} assertions passed`)

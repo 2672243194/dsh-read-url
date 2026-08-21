@@ -231,24 +231,28 @@ const results = await Promise.all([
 
 ## Real-world validation (2026-08-21, v1.0.0)
 
-47-site sweep driven by `multi-site.mjs` (committed, re-runnable): **27 OK / 8 expected boundaries (thin/empty) / 12 attributed network·anti-bot errors / 0 crashes**. New v1.0.0 categories all green on first run: Ruan Yifeng Atom feed (`charset=feed`), GitHub API JSON (`charset=json`), github.blog Atom feed; oschina blog list read via SPA render. The 12 errors are all environment-boundary (proxy switched off during this run: BBC/V2EX/Wikipedia connect-timeout; W3C/Tieba 403; BUPT 412; httpbin service errors) — every one returned as a structured, correctly-attributed error, never a crash. With the user's proxy running (v0.4.8 run), the same overseas sites were served in ~1s via the direct+proxy race.
+152-site sweep driven by `multi-site.mjs` (committed, re-runnable, 8-way concurrent): **113 OK / 16 expected boundaries (login-walls·captcha·short static pages) / 23 attributed network·anti-bot errors / 0 crashes**. Coverage: CN portals/media, e-commerce (JD/Taobao/Pinduoduo/Suning/Dangdang), video (Bilibili/iQiyi/Youku/Mango), music, games, novels (Qidian/Zongheng/JJWXC legacy GBK), Q&A/forums, government, universities (Tsinghua/PKU/Fudan/SJTU…), Traditional-Chinese TW/HK (PTT/LTN/UDN), JP/KR portals (Yahoo JP/Hatena/goo/naver/daum), overseas tech docs (GitHub/dev.to/react.dev/nodejs.org/rust/go/python), feeds, JSON APIs, encoding stress (GBK/GB2312/Big5/gb18030), anti-bot & network boundaries. All 23 errors are environment-attributed (Wikipedia/Reddit/UDN connect-timeout; W3C/Tieba/NGA/StackOverflow 403; BUPT 412; httpbin server 503; DNS-fail) — every one returned as a structured, correctly-attributed error, never a crash.
+
+Sweep-driven pre-release fixes (each locked by unit tests): double-escaped RSS descriptions, headerless binary sniffing, JS-redirect shell rendering, **`role="main"` container cut short by nested divs** (gnu.org 165→800 chars), **tiny `<article>` hijacking the main content** (gitlab 71→800 chars), relaxed render-acceptance threshold.
 
 | Category | Sites | Result |
 |---|---|---|
 | Portal navigation cleaning | Baidu / QQ / NetEase / Sina / Douban / CSDN / Sohu / Ifeng | ✅ clean text, no CSS noise |
-| SPA rendering | Bilibili / Xiaoheihe / Juejin / QQ News / SSPAI / oschina | ✅ `rendered` flag, post-JS body |
-| Multi-article aggregation | Cnblogs / Ruan Yifeng blog | ✅ 800+ chars across articles |
-| **Feeds & data APIs (v1.0.0)** | Ruan Yifeng Atom / github.blog Atom / GitHub API JSON | ✅ `charset=feed` / `charset=json` compact render |
-| Static doc pages | MDN / Ruan Yifeng / example.com / GitHub / vuejs.org | ✅ clean extraction (example.com = short page, expected) |
+| SPA rendering | Bilibili / Xiaoheihe / Juejin / QQ News / SSPAI / oschina / ThePaper / Xueqiu / Vipshop / TapTap | ✅ `rendered` flag, post-JS body |
+| Multi-article aggregation | Cnblogs / Ruan Yifeng blog / Douban group / Hacker News | ✅ 800+ chars across articles (pagination-joined paginated=2~3) |
+| **Feeds & data APIs (v1.0.0)** | Ruan Yifeng Atom / github.blog Atom / V2EX Atom / Solidot RSS / SSPAI RSS / GitHub API / HN API | ✅ `charset=feed` / `charset=json` compact render |
+| Static doc pages | MDN / Ruan Yifeng / example.com / GitHub / vuejs.org / react.dev / nodejs.org / go.dev / svelte.dev | ✅ clean extraction (example.com = short page, expected) |
+| **Legacy-layout fixes** | gnu.org (nested-div container) / gitlab (tiny-article hijack) | ✅ 800 chars after fix (165 / 71 chars before) |
 | Q&A / forum / encyclopedia | Zhihu column / Hupu / Baidu Zhidao / Baike | ✅ clean text (Zhihu homepage = login-wall, expected) |
-| GBK legacy encoding | ZOL | ✅ `charset=gbk`, no mojibake |
-| Government / education | gov.cn / BUPT | ✅ gov.cn clean; BUPT 412 attributed (WAF) |
-| Network / anti-bot boundary | W3C (403); Tieba (403); Wikipedia/BBC/V2EX (connect-timeout, proxy off this run); httpbin (404/503); DNS-fail (ENOTFOUND) | ✅ accurately attributed errors (HTTP status / timeout / ENOTFOUND) — not plugin defects |
+| GBK legacy encoding | ZOL / Dangdang / JJWXC (gb18030) / People.com.cn (GB2312) | ✅ no mojibake |
+| E-commerce / video / music | JD / Taobao / Pinduoduo / Bilibili / iQiyi / NetEase Music / QQ Music | ✅ clean extraction (Amazon CN button page & Kuaishou login-wall, expected) |
+| Government / education | gov.cn / MOE / MIIT / Stats Bureau / 8 universities | ✅ clean; BUPT 412 attributed (WAF) |
+| Network / anti-bot boundary | W3C·Tieba·NGA·StackOverflow (403); Wikipedia·Reddit·UDN (connect-timeout); httpbin (503/binary rejected); DNS-fail (ENOTFOUND) | ✅ accurately attributed errors (HTTP status / timeout / ENOTFOUND) — not plugin defects |
 | offset continuation | Sina News (1,602 chars) | ✅ 800+800 seamless, cache hit |
 | Batch + failure isolation | 4-URL mix | ✅ 2/4 ok, failures isolated |
 | Site crawl | Ruan Yifeng blog | ✅ 5/5 pages tree map |
 
-- **60 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard, schema budget, bare-main pick, worst-case timeout budgets, yml string coercion + clamping, strict-host seam degradation, UTF-16 BOM, Shift-JIS, density filter, pagination join/cap/disable, JSON render, RSS parse, sitemap rejection, 429 Retry-After retry, image alt, code-fence language, metadata, og:description fallback) + **10 SPA-test assertions** all green;
+- **72 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard, schema budget, bare-main pick, worst-case timeout budgets, yml string coercion + clamping, strict-host seam degradation, UTF-16 BOM, Shift-JIS, density filter, pagination join/cap/disable, JSON render, RSS parse, sitemap rejection, 429 Retry-After retry, image alt, code-fence language, metadata, og:description fallback, double-escaped feed, headerless binary sniff, nested role=main, tiny-article fallback, unbalanced-tag degradation) + **12 SPA-test assertions** all green;
 - Real case: on a Xiaoheihe post, comment like-counts (`up` field) could not be attributed from flattened text — **precise fields should come from the page's underlying data API** (e.g. `/bbs/app/link/tree` JSON). This is a shared boundary of text extractors, not a defect.
 
 ## Roadmap
@@ -268,8 +272,8 @@ const results = await Promise.all([
 
 ```bash
 node test.mjs          # zero-dependency self-tests (charset/extract/markdown/truncate)
-node test-spa.mjs      # SPA rendering tests (10 assertions; SKIPs if playwright absent)
-node multi-site.mjs    # 47-site real-world sweep (needs network): portals/SPA/login-walls/static/feeds/JSON/anti-bot/net-boundaries
+node test-spa.mjs      # SPA rendering tests (12 assertions; SKIPs if playwright absent)
+node multi-site.mjs    # 152-site real-world sweep (needs network, CONC=8 tunable): portals/SPA/login-walls/static/feeds/JSON/anti-bot/net-boundaries
 
 # End-to-end (requires DSH CLI)
 npx @deepseek-ai/dsh plugin --profile headless add .        # run from the parent dir of the plugin

@@ -15,6 +15,23 @@
 // model/user can act (turn the proxy on, or accept the network boundary).
 import { execFile, execFileSync } from 'node:child_process'
 
+// Some servers omit the Content-Type header entirely; the content-type gate
+// then has nothing to test and a binary body (PDF/PNG/zip) would flow into
+// the HTML pipeline as mojibake. Sniff the leading bytes instead: text
+// documents never contain NUL bytes or a run of control characters.
+// Shared by the direct path (index.js) and the curl proxy path below.
+export function looksBinary(buffer) {
+  const n = Math.min(buffer.length, 512)
+  if (!n) return false
+  let ctrl = 0
+  for (let i = 0; i < n; i++) {
+    const b = buffer[i]
+    if (b === 0) return true
+    if (b < 9 || (b > 13 && b < 32)) ctrl++
+  }
+  return ctrl / n > 0.3
+}
+
 let sysProxyCache = null // '' = checked & absent; string = proxy URL
 let sysProxyCheckedAt = 0 // cache timestamp; a failed read is re-tried after 60s
 const SYS_PROXY_RETRY_MS = 60 * 1000
@@ -98,6 +115,13 @@ export async function fetchViaCurlProxy(url, cfg, externalSignal, proxyOverride)
     const [codeStr, ...ctParts] = meta.split(' ')
     const code = Number(codeStr)
     const contentType = ctParts.join(' ')
+    if (code >= 200 && code < 300) {
+      // Headerless responses: gate binary bodies out (same rule as the direct
+      // path — curl writes an empty %{content_type} then).
+      if (!contentType && looksBinary(body)) {
+        return { error: 'Unsupported content-type (no header, binary body)' }
+      }
+    }
     if (!(code >= 200 && code < 300)) return { error: `HTTP ${code}` }
     if (contentType && !/text\/html|application\/xhtml|text\/plain|\/json|[+/]xml/i.test(contentType)) {
       return { error: `Unsupported content-type: ${contentType.split(';')[0]}` }
