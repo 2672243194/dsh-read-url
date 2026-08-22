@@ -221,7 +221,7 @@ const results = await Promise.all([
 ## 技术说明
 
 - **编码**：BOM 优先探测（UTF-8 / UTF-16LE / UTF-16BE——字节级证据优先于任何声明），其次 HTTP `Content-Type` charset → HTML meta；内置 `TextDecoder` 转码（Node 20+ full-icu，页面声明的 Shift-JIS/EUC-JP/GBK/Big5 均可正确解码），GB2312 归一为 GBK，检测到乱码自动回退 UTF-8；
-- **内容类型分发**：URL 不一定是 HTML——JSON 接口紧凑重排渲染（缩进 1 格），RSS 2.0 / Atom 订阅源解析为条目列表（`标题 — 链接` + 摘要，`feedCount` 字段，`includeLinks` 时附完整 items；条目摘要迭代「剥标签+解实体」直到稳定，双重转义的 `&lt;a&gt;` 不会漏成字面标签）；XML sitemap 明确拒绝（对模型无阅读价值）；其余全部走 HTML 管线；
+- **内容类型分发**：URL 不一定是 HTML——JSON 接口紧凑重排渲染（无缩进，超长字符串值 >1500 字符截断并标注，v1.2.0 起缩进 1 格改为完全紧凑），RSS 2.0 / Atom 订阅源解析为条目列表（`标题 — 链接` + 摘要，`feedCount` 字段，`includeLinks` 时附完整 items；条目摘要迭代「剥标签+解实体」直到稳定，双重转义的 `&lt;a&gt;` 不会漏成字面标签）；XML sitemap 明确拒绝（对模型无阅读价值）；其余全部走 HTML 管线；
 - **正文提取**：优先 `<article>`（聚合页多篇合并；无关小卡片 article——如订阅挂件——文本不足 200 字符且页面有 `<main>` 时自动回落 main）/ `<main>` / `role="main"`，`role="main"` 容器用**深度计数找平衡闭合标签**（嵌套 div 不会在第一个 `</div>` 被截断——实测 gnu.org 曾因此只取到 1/8 正文）；剥离 `nav/footer/header/aside/form/iframe` 及广告类容器，启发式回归到 `<body>`；body 路径上追加**文本密度过滤**——丢弃链接主导的短块（相关推荐/分类侧栏/热门文章挂件），标准容器页面完全不走此路径；
 - **分页拼接**：识别 `rel=next`（标准）或纯「下一页 / next / › / »」短锚文本（刻意保守，不做模糊猜测）；同域限定 + 防环；跨页重复段落自动去重；续页走静态快路径（分页 SPA 链每页一次完整渲染不划算）；
 - **元数据**：`published` / `author` 从 meta 标签提取进输出字段与状态行；页面无相关 meta 时（如阮一峰博客零 meta 标签）从**正文头部 600 字符的署名行兜底**（「作者：X / 日期：2026年8月21日」，meta 优先、正文深部提及不误采、markdown 链接语法不泄漏）；空正文页（登录墙/JS 壳）回落到 `og:description` 作为提示，不再返回空；
@@ -258,7 +258,7 @@ const results = await Promise.all([
 | **批量 + 失败隔离** | 4 URL 混合 | ✅ 2/4 成功、失败隔离 |
 | **整站爬取** | 阮一峰博客 | ✅ 5/5 页树状站点地图 |
 
-- **79 个单元断言**（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级、UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 Retry-After 重试、图片 alt、代码语言、元数据、og:description 回落、双转义 feed、无头二进制嗅探、嵌套 role=main、薄 article 回落、不平衡标签降级、byline 兜底、人机验证页识别、isConcurrencySafe 声明 + 并发缓存竞态烟雾）+ **12 个 SPA 测试断言**全绿；
+- **88 个单元断言**（v1.2.0 新增：长段落句级对齐、紧凑 JSON、分页变体、对抗输入限时、散文 &lt; 保留、深 JSON 降级）（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级、UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 Retry-After 重试、图片 alt、代码语言、元数据、og:description 回落、双转义 feed、无头二进制嗅探、嵌套 role=main、薄 article 回落、不平衡标签降级、byline 兜底、人机验证页识别、isConcurrencySafe 声明 + 并发缓存竞态烟雾）+ **12 个 SPA 测试断言**全绿；
 - 一个真实案例：小黑盒帖子的评论点赞数（`up` 字段）无法从扁平文本确定归属——**精确字段应走页面背后的数据 API**（如 `/bbs/app/link/tree` JSON），这是同类文本提取器的共同边界，不是缺陷。
 
 ## Roadmap
@@ -274,6 +274,8 @@ const results = await Promise.all([
 - [x] 人机验证页防御（Cloudflare 指纹页识别 + 等待自动跳转 + 拒绝误采，v1.0.0）
 - [x] 无 meta 页面署名行兜底（author / published，v1.0.0）
 - [x] 并行工具调用声明（isConcurrencySafe，多源阅读墙钟时间按最慢一站计，v1.1.0）
+- [x] 失败缓存独立（不再挤占成功缓存名额）、race 错误按 label 归因、长段落句级对齐截断、JSON 完全紧凑渲染 + 长值截断（约省 21%）、状态行合并、分页箭头变体（v1.2.0）
+- [x] 对抗页面线性化（无配对尖括号/无闭合标签/属性扫描加界 + 递归深度帽，修复 60KB→2.2s 的二次复杂度 DoS 向量）、散文 &lt; 不再被吞、代理重定向保留最终 URL、深 JSON 降级不崩溃（v1.2.0 第二轮）
 
 > v1.0.0 起进入维护期：以修 bug 为主，减少更新频率。
 

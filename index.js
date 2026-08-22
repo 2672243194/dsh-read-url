@@ -37,9 +37,20 @@ const DEFAULTS = {
   userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
 }
 
-// Session-level cache: url -> { time, full } on success, { time, error } on
-// failure (short TTL so a broken URL is not re-fetched in a loop).
+// Session-level cache: url -> { time, full }. Failures live in a separate
+// small map so 30 s error entries never evict hot success pages from the
+// main cache (they used to share the FIFO budget).
 const cache = new Map()
+const failCache = new Map()
+const FAIL_CACHE_MAX = 8
+function cacheFail(key, error) {
+  if (failCache.size >= FAIL_CACHE_MAX) failCache.delete(failCache.keys().next().value)
+  failCache.set(key, { time: Date.now(), error })
+}
+function cacheStore(key, full, cacheMax) {
+  if (cache.size >= cacheMax) cache.delete(cache.keys().next().value)
+  cache.set(key, { time: Date.now(), full })
+}
 const decoders = new Map()
 
 function getDecoder(enc) {
@@ -207,6 +218,15 @@ async function raceFetch(url, externalSignal, cfg, proxy) {
   const winner = await raceFirstSuccess([direct, proxied])
   directCtrl.abort()
   proxyCtrl.abort()
+  if (!winner.success) {
+    // Attach channel labels where the attempt order is defined, so callers
+    // never have to guess which slot is the proxy error.
+    const labels = ['direct', 'proxy']
+    winner.failures = winner.failures.map((f, i) => ({
+      label: labels[i],
+      error: f && f.error ? String(f.error) : 'unknown error',
+    }))
+  }
   return winner
 }
 
@@ -215,10 +235,10 @@ async function fetchPage(url, externalSignal, cfg) {
   if (proxy) {
     const winner = await raceFetch(url, externalSignal, cfg, proxy)
     if (winner.success) return winner.value
-    const dErr = winner.failures[0] && winner.failures[0].error
-    const pErr = winner.failures[1]
-    const px = pErr && pErr.error ? `，代理返回 ${pErr.error}` : '，代理未连通'
-    return { error: `Fetch failed: ${dErr}（直连失败；已尝试代理 ${proxy}${px}）` }
+    const dErr = winner.failures.find((f) => f.label === 'direct')
+    const pErr = winner.failures.find((f) => f.label === 'proxy')
+    const px = pErr ? `，代理返回 ${pErr.error}` : '，代理未连通'
+    return { error: `Fetch failed: ${dErr ? dErr.error : 'unknown error'}（直连失败；已尝试代理 ${proxy}${px}）` }
   }
   // No proxy configured: plain direct connect (the original behaviour).
   const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs)
@@ -282,14 +302,26 @@ export function decodeTextEntities(text) {
   })
 }
 
+// Quadratic-cost guard: a '<' that has NO '>' after it can never start a real
+// tag, yet every "<...>"-style regex rescans to the end of the string at each
+// such position (measured: 10k stray '<'s in 60KB → seconds; a 3MB page would
+// stall the tool call). Neutralize stray '<' in the no-'>' tail — text content
+// is preserved, only the impossible tag-openings go away. Short tails
+// ("a < b" in prose) are left untouched.
+function defuseLt(html) {
+  const from = html.lastIndexOf('>') + 1
+  if (html.length - from < 512 || !html.includes('<', from)) return html
+  return html.slice(0, from) + html.slice(from).replace(/</g, ' ')
+}
+
 function textOnly(html) {
-  return decodeTextEntities(html
+  return decodeTextEntities(defuseLt(html)
     .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<textarea[\s\S]*?<\/textarea\s*>/gi, ' ')
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
+    .replace(/<script[\s>][\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s>][\s\S]*?<\/style>/gi, ' ')
+    .replace(/<textarea[\s>][\s\S]*?<\/textarea\s*>/gi, ' ')
+    .replace(/<noscript[\s>][\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<[^>]{1,1000}>/g, ' ')
     .replace(/[ \t\r\n]+/g, ' ')
     .trim())
 }
@@ -306,7 +338,7 @@ function xmlText(s) {
   // (measured on sspai.com/feed). Iterate strip → decode until stable.
   for (let i = 0; i < 3; i++) {
     const prev = t
-    t = decodeTextEntities(t.replace(/<[^>]+>/g, ' '))
+    t = decodeTextEntities(t.replace(/<[^>]{1,1000}>/g, ' '))
     if (t === prev) break
   }
   return t.replace(/\s+/g, ' ').trim()
@@ -314,11 +346,15 @@ function xmlText(s) {
 
 // RSS 2.0 <item> / Atom <entry> → compact list "title — url\n  summary".
 function parseFeed(xml, limit) {
+  xml = defuseLt(xml) // no-'>' tail would make the lazy item scan quadratic
   const isAtom = /<feed[\s>]/i.test(xml)
   const itemRe = isAtom ? /<entry[\s>][\s\S]*?<\/entry\s*>/gi : /<item[\s>][\s\S]*?<\/item\s*>/gi
+  // No-closer guard: unclosed items would rescan the rest of the feed from
+  // every <item> position.
+  const closable = isAtom ? /<\/entry\s*>/i.test(xml) : /<\/item\s*>/i.test(xml)
   const items = []
   let m
-  while ((m = itemRe.exec(xml)) && items.length < limit) {
+  while (closable && (m = itemRe.exec(xml)) && items.length < limit) {
     const it = m[0]
     const title = xmlText(/<title[^>]*>([\s\S]*?)<\/title>/i.exec(it)?.[1] || '')
     const linkTag = /<link[^>]*>([\s\S]*?)<\/link>/i.exec(it)
@@ -343,9 +379,10 @@ function parseFeed(xml, limit) {
 // sidebars, "hot articles" widgets) that carry little reading value. Split the
 // body at block-level open tags and drop segments whose text is mostly links.
 // Standard-container pages (article/main) never reach this code path.
-const BLOCK_OPEN_RE = /<(?:p|div|section|article|main|h[1-6]|table|tbody|tr|ul|ol|li|blockquote|pre|dl|figure|figcaption|fieldset)\b[^>]*>/gi
+const BLOCK_OPEN_RE = /<(?:p|div|section|article|main|h[1-6]|table|tbody|tr|ul|ol|li|blockquote|pre|dl|figure|figcaption|fieldset)\b[^>]{0,1000}>/gi
 
 function linkTextLength(html) {
+  if (!/<\/a/i.test(html)) return 0 // no anchor can pair — skip the scan
   let n = 0
   const re = /<a[\s>][\s\S]*?<\/a\s*>/gi
   let m
@@ -398,12 +435,14 @@ export function pickMain(html) {
   // collect all of them instead of only the first. A tiny <article> (e.g. a
   // newsletter card — measured on about.gitlab.com: 71 chars of text while
   // the real content sits in <main>) falls through to <main> when present.
-  const articles = [...html.matchAll(/<article[\s>][\s\S]*?<\/article\s*>/gi)]
+  const articles = /<\/article/i.test(html)
+    ? [...html.matchAll(/<article[\s>][\s\S]*?<\/article\s*>/gi)]
+    : [] // no closer anywhere: matchAll would rescan per open (quadratic)
   const hasMain = /<main[\s>]/i.test(html)
   if (articles.length && (!hasMain || textOnly(articles.map((a) => a[0]).join('')).length >= 200)) {
     return articles.map((a) => a[0]).join('\n')
   }
-  const roleMain = /<(main|div)[^>]*role=["']main["'][\s>]/i.exec(html)
+  const roleMain = /<(main|div)[^>]{0,1000}role=["']main["'][\s>]/i.exec(html)
   if (roleMain) {
     const block = tagBlockAt(html, roleMain.index, roleMain[1].toLowerCase())
     if (block) return block
@@ -427,21 +466,43 @@ export function pickMain(html) {
 }
 
 // Some sites (e.g. baidu.com) ship CSS/HTML inside hidden <textarea> with
-// entity-escaped tags (&lt;style&gt;...). Reveal them so noise rules can strip
-// them; then run noise removal again.
+// entity-escaped tags (&lt;style&gt;...). Reveal TAG-SHAPED sequences so noise
+// rules can strip them. A blanket &lt; → < decode would turn prose "a &lt; b"
+// into a raw "<", and the tag stripper would then swallow everything from it
+// to the next real ">" — measured content loss on pages with escaped
+// comparison operators. So: &lt; is revealed only when a tag name follows;
+// bare &gt; / &quot; are safe to reveal (they never open a strip span).
 function revealEscapedTags(html) {
   return html
-    .replace(/&lt;/gi, '<')
+    .replace(/&lt;(?=\/?[a-zA-Z!])/gi, '<')
     .replace(/&gt;/gi, '>')
     .replace(/&quot;/gi, '"')
 }
 
 function stripNoise(mainHtml) {
-  return mainHtml
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(textarea|style|script|noscript|template)[\s>][\s\S]*?<\/\1\s*>/gi, ' ')
-    .replace(/<(nav|footer|header|aside|form|iframe|svg|canvas|dialog)[\s>][\s\S]*?<\/\1>/gi, ' ')
-    .replace(/<([a-z][a-z0-9]*)[^>]+class=["'][^"']*(ad-|ads|advert|banner|sidebar|social|share|comment|popup|modal|cookie)[^"']*["'][^>]*>[\s\S]*?<\/\1>/gi, ' ')
+  // Attribute runs are bounded: an unbounded [^>]+ rescans toward the next
+  // '>' at every '<' position — adversarial markup with one distant '>' made
+  // this quadratic (measured: 40k '<style' + one '>' → 82s). Real attributes
+  // never approach 1000 chars.
+  // Container groups are built from closers that actually exist: absent
+  // closing tags made the lazy body scan walk the rest of the string per
+  // opening position for nothing.
+  const closers = new Set()
+  for (const c of mainHtml.matchAll(/<\/([a-z0-9]+)/gi)) closers.add(c[1].toLowerCase())
+  const group = (names) => names.filter((n) => closers.has(n))
+  const raw = group(['textarea', 'style', 'script', 'noscript', 'template'])
+  const box = group(['nav', 'footer', 'header', 'aside', 'form', 'iframe', 'svg', 'canvas', 'dialog'])
+  let out = mainHtml.replace(/<!--[\s\S]*?-->/g, ' ')
+  if (raw.length) {
+    out = out.replace(new RegExp(`<(${raw.join('|')})[\\s>][\\s\\S]*?<\\/\\1\\s*>`, 'gi'), ' ')
+  }
+  if (box.length) {
+    out = out.replace(new RegExp(`<(${box.join('|')})[\\s>][\\s\\S]*?<\\/\\1>`, 'gi'), ' ')
+  }
+  return out.replace(
+    /<([a-z][a-z0-9]*)[^>]{1,1000}class=["'][^"']{0,300}(ad-|ads|advert|banner|sidebar|social|share|comment|popup|modal|cookie)[^"']{0,300}["'][^>]{0,1000}>[\s\S]*?<\/\1>/gi,
+    ' ',
+  )
 }
 
 // ---- HTML -> Markdown (lightweight, tag-state machine) ----
@@ -456,7 +517,7 @@ function escInline(s) {
 const IMG_SENTINEL = '\u0001'
 function imgsToMarkdown(html) {
   const store = []
-  const out = html.replace(/<img\b[^>]*>/gi, (tag) => {
+  const out = html.replace(/<img\b[^>]{0,1000}>/gi, (tag) => {
     const alt = /alt=["']([^"']*)["']/i.exec(tag)
     const src = /src=["']([^"']+)["']/i.exec(tag)
     store.push(src && alt && alt[1].trim() ? `![${alt[1].trim()}](${src[1]})` : '')
@@ -473,11 +534,31 @@ function imgsToMarkdown(html) {
   }
 }
 
-export function inlineMd(html) {
+// An open tag whose closing tag appears NOWHERE in the input can never pair:
+// the paired alternative of the walker regex would rescan the rest of the
+// string at every such position (measured: 10k unclosed <div>s in 60KB →
+// 2.2s quadratic; a 3MB page would stall the tool call for minutes). Pre-
+// stripping unmatched openers is behaviour-identical — they previously fell
+// through to the single-tag branch, which drops them — and makes the walk
+// linear. Depth cap: recursion on 100+-deep nesting would overflow the stack
+// long before real pages nest that far; degrade to plain text instead.
+const OPEN_TAG_RE = /<([a-zA-Z0-9]+)((?:"[^"]*"|'[^']*'|[^'">]){0,1000})>/g
+const MD_MAX_DEPTH = 100
+function stripUnmatchedOpeners(html) {
+  const closers = new Set()
+  for (const m of html.matchAll(/<\/([a-zA-Z0-9]+)/g)) closers.add(m[1].toLowerCase())
+  html = defuseLt(html)
+  return html.replace(OPEN_TAG_RE, (m, name) => (closers.has(name.toLowerCase()) ? m : ''))
+}
+
+export function inlineMd(html, depth = 0) {
+  if (depth > MD_MAX_DEPTH) {
+    return escInline(decodeTextEntities(html.replace(/<[^>]{1,1000}>/g, ' ')).replace(/\s+/g, ' ').trim())
+  }
   const img = imgsToMarkdown(html)
-  html = img.html
+  html = stripUnmatchedOpeners(img.html)
   let out = ''
-  const re = /<([a-zA-Z0-9]+)((?:"[^"]*"|'[^']*'|[^'">])*)>([\s\S]*?)<\/\1>|<[^>]+>|([^<]+)/g
+  const re = /<([a-zA-Z0-9]+)((?:"[^"]*"|'[^']*'|[^'">]){0,1000})>([\s\S]*?)<\/\1>|<[^>]{1,1000}>|([^<]+)/g
   let m
   while ((m = re.exec(html))) {
     if (m[4] !== undefined) {
@@ -487,7 +568,7 @@ export function inlineMd(html) {
     if (!m[1]) continue
     const tag = m[1].toLowerCase()
     if (tag === 'style' || tag === 'script' || tag === 'textarea' || tag === 'template' || tag === 'noscript') continue
-    const inner = inlineMd(m[3])
+    const inner = inlineMd(m[3], depth + 1)
     if (tag === 'a') {
       const href = /href=["']([^"']+)["']/i.exec(m[2])
       out += href ? `[${inner}](${href[1]})` : inner
@@ -500,11 +581,14 @@ export function inlineMd(html) {
   return img.restore(out.replace(/[ \t]+/g, ' ').trim())
 }
 
-export function blockMd(html) {
-  let out = ''
+export function blockMd(html, depth = 0) {
+  if (depth > MD_MAX_DEPTH) {
+    return decodeTextEntities(html.replace(/<[^>]{1,1000}>/g, ' ')).replace(/\s+/g, ' ').trim()
+  }
   const img = imgsToMarkdown(html)
-  html = img.html
-  const re = /<([a-zA-Z0-9]+)((?:"[^"]*"|'[^']*'|[^'">])*)>([\s\S]*?)<\/\1>|<[^>]+>|([^<]+)/g
+  html = stripUnmatchedOpeners(img.html)
+  let out = ''
+  const re = /<([a-zA-Z0-9]+)((?:"[^"]*"|'[^']*'|[^'">]){0,1000})>([\s\S]*?)<\/\1>|<[^>]{1,1000}>|([^<]+)/g
   let m
   while ((m = re.exec(html))) {
     if (m[4] !== undefined) {
@@ -520,18 +604,18 @@ export function blockMd(html) {
     }
     if (tag === 'h1' || tag === 'h2' || tag === 'h3' || tag === 'h4' || tag === 'h5' || tag === 'h6') {
       const level = '#'.repeat(Number(tag[1]))
-      out += `\n\n${level} ${inlineMd(inner)}`
+      out += `\n\n${level} ${inlineMd(inner, depth + 1)}`
     } else if (tag === 'p') {
-      const t = inlineMd(inner)
+      const t = inlineMd(inner, depth + 1)
       if (t) out += `\n\n${t}`
     } else if (tag === 'div' || tag === 'section' || tag === 'article' || tag === 'main') {
-      const t = blockMd(inner)
+      const t = blockMd(inner, depth + 1)
       if (t) out += `\n\n${t}`
     } else if (tag === 'blockquote') {
-      const t = blockMd(inner).trim()
+      const t = blockMd(inner, depth + 1).trim()
       out += `\n\n> ${t.replace(/\n/g, '\n> ')}`
     } else if (tag === 'pre') {
-      const code = inner.replace(/<[^>]+>/g, '').trim()
+      const code = inner.replace(/<[^>]{1,1000}>/g, '').trim()
       // Language hint from common highlighter conventions: the model reads
       // ```js fenced blocks far more accurately than unlabelled ones.
       const lang =
@@ -540,29 +624,39 @@ export function blockMd(html) {
     } else if (tag === 'code') {
       out += `\`${textOnly(inner)}\``
     } else if (tag === 'ul' || tag === 'ol') {
-      const liRe = /<li[^>]*>([\s\S]*?)<\/li>/gi
-      let lm, idx = 1, items = []
-      while ((lm = liRe.exec(inner))) {
-        const t = inlineMd(lm[1])
-        items.push(tag === 'ol' ? `${idx}. ${t}` : `- ${t}`)
-        idx++
+      // No-closer guard: <li>s without a single </li> would make the lazy
+      // scan walk the rest of inner from every open position (quadratic).
+      const items = []
+      if (inner.includes('</li')) {
+        const liRe = /<li[^>]{0,1000}>([\s\S]*?)<\/li>/gi
+        let lm, idx = 1
+        while ((lm = liRe.exec(inner))) {
+          const t = inlineMd(lm[1], depth + 1)
+          items.push(tag === 'ol' ? `${idx}. ${t}` : `- ${t}`)
+          idx++
+        }
       }
       if (items.length) out += `\n\n${items.join('\n')}`
     } else if (tag === 'li') {
-      out += `\n- ${inlineMd(inner)}`
+      out += `\n- ${inlineMd(inner, depth + 1)}`
     } else if (tag === 'br') {
       out += '  \n'
     } else if (tag === 'hr') {
       out += '\n\n---'
     } else if (tag === 'table') {
-      const trRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi
-      let tm, rows = []
-      while ((tm = trRe.exec(inner))) {
-        const cells = []
-        const tdRe = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi
-        let cm
-        while ((cm = tdRe.exec(tm[1]))) cells.push(inlineMd(cm[1]).replace(/\|/g, '\\|'))
-        if (cells.length) rows.push(`| ${cells.join(' | ')} |`)
+      const rows = []
+      if (inner.includes('</tr')) {
+        const trRe = /<tr[^>]{0,1000}>([\s\S]*?)<\/tr>/gi
+        let tm
+        while ((tm = trRe.exec(inner))) {
+          const cells = []
+          if (tm[1].includes('</t')) {
+            const tdRe = /<t[dh][^>]{0,1000}>([\s\S]*?)<\/t[dh]>/gi
+            let cm
+            while ((cm = tdRe.exec(tm[1]))) cells.push(inlineMd(cm[1], depth + 1).replace(/\|/g, '\\|'))
+          }
+          if (cells.length) rows.push(`| ${cells.join(' | ')} |`)
+        }
       }
       if (rows.length) {
         const header = rows[0]
@@ -572,10 +666,10 @@ export function blockMd(html) {
         out += `\n\n${rows.join('\n')}\n${sep}`
       }
     } else if (tag === 'a' || tag === 'strong' || tag === 'b' || tag === 'em' || tag === 'i') {
-      const t = inlineMd(inner)
+      const t = inlineMd(inner, depth + 1)
       if (t) out += t
     } else {
-      const t = blockMd(inner)
+      const t = blockMd(inner, depth + 1)
       if (t) out += t
     }
   }
@@ -587,8 +681,8 @@ export function blockMd(html) {
 function extractMeta(html) {
   const get = (names) => {
     for (const n of names) {
-      const m = new RegExp(`<meta[^>]+(?:property|name)=["']${n}["'][^>]+content=["']([^"']+)["']`, 'i').exec(html)
-      if (m) return decodeTextEntities(m[1]).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80)
+      const m = new RegExp(`<meta[^>]{1,1000}(?:property|name)=["']${n}["'][^>]{1,1000}content=["']([^"']+)["']`, 'i').exec(html)
+      if (m) return decodeTextEntities(m[1]).replace(/<[^>]{1,1000}>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80)
     }
     return ''
   }
@@ -621,9 +715,10 @@ function bylineFallback(text, meta) {
 }
 
 export function extract(html, mode) {
-  const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html) || /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i.exec(html)
-  const siteName = /<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']+)["']/i.exec(html)
-  const langMatch = /<html[^>]+lang=["']([\w-]+)["']/i.exec(html)
+  html = defuseLt(html) // kills the no-'>'-tail quadratic scans before any picker runs
+  const titleMatch = /<title[^>]{0,1000}>([\s\S]*?)<\/title>/i.exec(html) || /<meta[^>]{1,1000}property=["']og:title["'][^>]{1,1000}content=["']([^"']+)["']/i.exec(html)
+  const siteName = /<meta[^>]{1,1000}property=["']og:site_name["'][^>]{1,1000}content=["']([^"']+)["']/i.exec(html)
+  const langMatch = /<html[^>]{1,1000}lang=["']([\w-]+)["']/i.exec(html)
   let main = stripNoise(pickMain(html))
   main = stripNoise(revealEscapedTags(main))
   let bodyText
@@ -701,7 +796,19 @@ export function smartTruncate(text, maxChars, offset = 0) {
     if (acc.length + p.length + (acc ? 2 : 0) > maxChars) break
     acc += (acc ? '\n\n' : '') + p
   }
-  if (!acc && maxChars > 0) acc = text.slice(offset, offset + maxChars)
+  if (!acc && maxChars > 0) {
+    // The first paragraph after the offset is itself longer than maxChars.
+    // Keep the alignment promise at sentence level before hard-slicing.
+    const p = paragraphs[start] || ''
+    const rel = Math.max(0, offset - pos)
+    const rest = p.length > rel ? p.slice(rel) : text.slice(offset)
+    const sentences = rest.match(/[^.!?\n。！？]+[.!?\n。！？]*/g) || [rest]
+    for (const s of sentences) {
+      if (acc.length + s.length > maxChars) break
+      acc += s
+    }
+    if (!acc) acc = rest.slice(0, maxChars)
+  }
   return {
     text: acc,
     truncated: offset + acc.length < total,
@@ -732,6 +839,9 @@ function extractLinks(html, limit, baseUrl) {
     } catch {
       continue
     }
+    // Only web links are followable by the model / crawler — ftp: etc. would
+    // pass new URL() resolution and pollute link lists and crawl queues.
+    if (!/^https?:/i.test(url)) continue
     // dedupe: nav bars repeat the same links many times — one entry per URL
     // keeps the link list compact (tokens) without losing coverage
     if (seen.has(url)) continue
@@ -755,7 +865,7 @@ function hostOf(url) {
 // the model had to notice the truncation and re-call the tool per page. The
 // recognition is deliberately conservative: rel=next (standard) or a short
 // anchor whose whole text is a next-page marker — no fuzzy guessing.
-const NEXT_TEXT_RE = /^(?:下一页|下页|后一页|下一頁|下頁|next page|next|›{1,3}|»{1,3}|>|older entries)$/i
+const NEXT_TEXT_RE = /^(?:[›»>]+\s*)?(?:下一页|下页|下一篇|下一頁|下頁|后一页|後一頁|next page|next|older entries|[›»>]{1,3})(?:\s*[›»>]+)?$/i
 
 export function findNextLink(html, baseUrl) {
   const resolve = (href) => {
@@ -774,7 +884,10 @@ export function findNextLink(html, baseUrl) {
   }
   const re = /<a\b[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a\s*>/gi
   let m
-  while ((m = re.exec(html || ''))) {
+  let scans = 0
+  // Bounded like extractLinks: a nav bar with thousands of anchors must not
+  // scan the whole DOM hunting for a next-marker.
+  while ((m = re.exec(html || '')) && scans++ < 400) {
     const t = textOnly(m[2])
     if (t.length <= 16 && NEXT_TEXT_RE.test(t)) {
       const r = resolve(m[1])
@@ -822,6 +935,37 @@ function sliceFrom(full, offset, maxChars) {
   return out
 }
 
+// ---- JSON payloads: compact render ----
+// Indented JSON spends a newline + indent per key — pure token overhead for
+// the model. Render compact, and clip monster string values (embedded HTML,
+// base64 blobs) with a visible marker so the model knows there is more.
+const JSON_STR_MAX = 1500
+export function compactJson(value) {
+  const clip = (s) =>
+    s.length > JSON_STR_MAX ? s.slice(0, JSON_STR_MAX) + `…[+${s.length - JSON_STR_MAX} chars]` : s
+  const walk = (v, depth) => {
+    if (typeof v === 'string') return clip(v)
+    if (Array.isArray(v)) return v.map((x) => walk(x, depth + 1))
+    if (v && typeof v === 'object' && depth < 12) {
+      const o = {}
+      for (const k of Object.keys(v)) o[k] = walk(v[k], depth + 1)
+      return o
+    }
+    return v
+  }
+  try {
+    return JSON.stringify(walk(value, 0))
+  } catch {
+    // Extreme nesting/size where even native stringify exhausts the stack —
+    // degrade to a clipped raw render instead of crashing the tool call.
+    try {
+      return clip(String(value))
+    } catch {
+      return '[unserializable json]'
+    }
+  }
+}
+
 export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   const url = String((args && args.url) || '').trim()
   if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
@@ -842,22 +986,21 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     /* keep raw url on parse failure */
   }
   const cacheKey = `${cacheUrl}|${mode}|${args.includeLinks === true ? 'links' : 'no-links'}`
+  // Failed fetches are cached briefly so the model doesn't re-request a
+  // broken URL in a loop (token + latency saver).
+  const fh = failCache.get(cacheKey)
+  if (fh) {
+    if (Date.now() - fh.time < 30000) return { error: fh.error, cached: true }
+    failCache.delete(cacheKey)
+  }
   const hit = cache.get(cacheKey)
-  if (hit) {
-    // Failed fetches are cached briefly so the model doesn't re-request a
-    // broken URL in a loop (token + latency saver).
-    if (hit.error) {
-      if (Date.now() - hit.time < 30000) return { error: hit.error, cached: true }
-      cache.delete(cacheKey)
-    } else if (Date.now() - hit.time < cfg.cacheTtlMs) {
-      const sliced = sliceFrom(hit.full, offset, maxChars)
-      return { ...sliced, cached: true }
-    }
+  if (hit && Date.now() - hit.time < cfg.cacheTtlMs) {
+    const sliced = sliceFrom(hit.full, offset, maxChars)
+    return { ...sliced, cached: true }
   }
 
   const failWith = (error) => {
-    if (cache.size >= cfg.cacheMax) cache.delete(cache.keys().next().value)
-    cache.set(cacheKey, { time: Date.now(), error })
+    cacheFail(cacheKey, error)
     return { error }
   }
 
@@ -870,7 +1013,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
       const t = viaSeam.html.trim()
       if (t.startsWith('{') || t.startsWith('[')) {
         try {
-          return { kind: 'json', text: JSON.stringify(JSON.parse(t), null, 1) }
+          return { kind: 'json', text: compactJson(JSON.parse(t)) }
         } catch { /* not JSON — keep HTML pipeline */ }
       }
       return { kind: 'html', html: viaSeam.html, finalUrl: viaSeam.finalUrl, charset: 'provider-decoded' }
@@ -881,7 +1024,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     const decoded = decodeBuffer(page.buffer, page.contentType)
     if (/json$/.test(ct)) {
       try {
-        return { kind: 'json', text: JSON.stringify(JSON.parse(decoded.text), null, 1) }
+        return { kind: 'json', text: compactJson(JSON.parse(decoded.text)) }
       } catch { /* invalid JSON — serve through the HTML pipeline as text */ }
     }
     if (/[+/]xml$/.test(ct)) {
@@ -899,8 +1042,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
 
   if (payload.kind === 'json') {
     const full = { url, title: '', siteName: hostOf(url), lang: '', charset: 'json', mode: 'json', fullText: payload.text, paginated: 1 }
-    if (cache.size >= cfg.cacheMax) cache.delete(cache.keys().next().value)
-    cache.set(cacheKey, { time: Date.now(), full })
+    cacheStore(cacheKey, full, cfg.cacheMax)
     return sliceFrom(full, offset, maxChars)
   }
   if (payload.kind === 'feed') {
@@ -910,8 +1052,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
       mode: 'feed', fullText: f.text, paginated: 1, feedCount: f.count,
       links: args.includeLinks === true ? f.items : undefined,
     }
-    if (cache.size >= cfg.cacheMax) cache.delete(cache.keys().next().value)
-    cache.set(cacheKey, { time: Date.now(), full })
+    cacheStore(cacheKey, full, cfg.cacheMax)
     return sliceFrom(full, offset, maxChars)
   }
 
@@ -1030,8 +1171,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     links: args.includeLinks === true ? extractLinks(renderedHtml || html, cfg.maxLinks, finalUrl) : undefined,
   }
 
-  if (cache.size >= cfg.cacheMax) cache.delete(cache.keys().next().value)
-  cache.set(cacheKey, { time: Date.now(), full })
+  cacheStore(cacheKey, full, cfg.cacheMax)
   return sliceFrom(full, offset, maxChars)
 }
 
@@ -1045,22 +1185,24 @@ function renderResult(value) {
   const meta = []
   if (r.siteName && r.siteName !== host) meta.push(r.siteName)
   if (r.lang) meta.push(r.lang)
-  if (r.charset && r.charset !== 'json' && r.charset !== 'feed') meta.push(`charset ${r.charset}`)
+  if (r.charset && r.charset !== 'utf-8' && r.charset !== 'json' && r.charset !== 'feed') {
+    meta.push(`charset ${r.charset}`)
+  }
   if (r.published) meta.push(r.published)
   if (r.author) meta.push(`by ${r.author}`)
   if (r.feedCount) meta.push(`feed · ${r.feedCount} 条`)
   if (r.mode === 'json') meta.push('json')
   if (meta.length) lines.push(meta.join(' · '))
-  if (r.charsStart > 0) {
-    lines.push(`(chars ${r.charsStart}+${r.charsReturned}/${r.charsTotal} — offset 续读)`)
-  } else if (r.truncated) {
-    lines.push(`(chars ${r.charsReturned}/${r.charsTotal} — 截断，offset 续读)`)
-  } else if (typeof r.charsTotal === 'number') {
-    lines.push(`(chars ${r.charsTotal})`)
-  }
-  if (r.cached) lines.push('(cached)')
-  if (r.paginated > 1) lines.push(`(已自动拼接 ${r.paginated} 页)`)
-  if (r.rendered) lines.push('(rendered — JS 执行后内容)')
+  // One compact status line instead of several parenthetical lines — the
+  // flags are hints, not content, so they share a single line of tokens.
+  const flags = []
+  if (r.charsStart > 0) flags.push(`chars ${r.charsStart}+${r.charsReturned}/${r.charsTotal}`, 'offset 续读')
+  else if (r.truncated) flags.push(`chars ${r.charsReturned}/${r.charsTotal}`, '截断', 'offset 续读')
+  else if (typeof r.charsTotal === 'number') flags.push(`chars ${r.charsTotal}`)
+  if (r.cached) flags.push('cached')
+  if (r.paginated > 1) flags.push(`已拼接${r.paginated}页`)
+  if (r.rendered) flags.push('rendered')
+  if (flags.length) lines.push(`(${flags.join(' · ')})`)
   if (!r.text) {
     if (r.charsStart > 0 && !r.truncated) {
       lines.push('(offset 已到文末，无更多内容)')
@@ -1453,6 +1595,7 @@ export function apply(ctx, config) {
   // Temporal composability: unload must fully revert side effects.
   ctx.effect(() => () => {
     cache.clear()
+    failCache.clear()
     closeBrowser().catch(() => {})
   })
 

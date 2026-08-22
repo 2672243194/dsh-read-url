@@ -728,6 +728,71 @@ ok('findNextLink: ordinary links never match', () => {
   assert.equal(m.findNextLink(html, 'https://x.com/'), null)
 })
 
+console.log('v1.2.0 fixes / token savings')
+ok('smartTruncate: oversized paragraph degrades to sentence alignment, not hard slice', () => {
+  // One huge paragraph after offset 0 — must cut at a sentence boundary.
+  const sentences = Array.from({ length: 30 }, (_, i) => `这是第${i}句话。`).join('')
+  const r = smartTruncate(sentences, 33)
+  assert.ok(r.text.endsWith('。'), `sentence-aligned cut: ...${r.text.slice(-12)}`)
+  assert.ok(r.text.length <= 33, `within budget: ${r.text.length}`)
+})
+
+ok('smartTruncate: sentence fallback still terminates on a single giant sentence', () => {
+  const r = smartTruncate('一'.repeat(100), 10)
+  assert.equal(r.text.length, 10)
+})
+
+ok('compactJson: no indentation, long string values clipped with marker', () => {
+  const out = m.compactJson({ a: 1, html: 'x'.repeat(2000), list: [{ b: 'ok' }] })
+  assert.ok(!out.includes('\n'), 'single-line render')
+  assert.ok(out.includes('…[+500 chars]'), 'clip marker present')
+  assert.ok(out.includes('"b":"ok"'), 'nested values kept')
+})
+
+ok('compactJson: short JSON passes through unchanged', () => {
+  assert.equal(m.compactJson({ a: [1, 2] }), '{"a":[1,2]}')
+})
+
+console.log('v1.2.0 hardening (adversarial input)')
+ok('extract: pathological unclosed-tag pages stay bounded (was quadratic)', () => {
+  // 10k unclosed <div>s took 2.2s+ before the linearization guards; the
+  // bounded walkers finish far under a second now.
+  const t0 = Date.now()
+  const r = m.extract(`<body>${'<div>'.repeat(10000)}</body>`, 'text')
+  const ms = Date.now() - t0
+  assert.ok(ms < 900, `pathological divs finished in ${ms}ms`)
+  assert.ok(typeof r.text === 'string')
+})
+
+ok('extract: img/style/article bombs stay bounded', () => {
+  const t0 = Date.now()
+  m.extract('<img'.repeat(10000) + '<p>x</p>', 'markdown')
+  m.extract('<style'.repeat(10000) + '<p>x</p>', 'text')
+  m.extract('<article'.repeat(10000) + '<p>x</p>', 'text')
+  const ms = Date.now() - t0
+  assert.ok(ms < 3000, `three bombs finished in ${ms}ms (was 20s+ pre-fix)`)
+})
+
+ok('prose "a < b" is not mangled by the no-tag-tail guard', () => {
+  const r = m.extract('<body><p>x &lt; y 且 a &lt; b 结尾</p></body>', 'text')
+  assert.ok(r.text.includes('x < y'), `kept: ${r.text}`)
+})
+
+ok('compactJson: extreme nesting degrades instead of crashing', () => {
+  let v = 'x'
+  for (let i = 0; i < 5000; i++) v = { a: v }
+  const out = m.compactJson(v)
+  assert.ok(typeof out === 'string' && out.length > 0)
+})
+
+
+ok('findNextLink: arrow-wrapped and traditional variants matched', () => {
+  assert.equal(m.findNextLink('<a href="/n1">下一页 ›</a>', 'https://x.com/a'), 'https://x.com/n1')
+  assert.equal(m.findNextLink('<a href="/n2">Next »</a>', 'https://x.com/a'), 'https://x.com/n2')
+  assert.equal(m.findNextLink('<a href="/n3">下一頁</a>', 'https://x.com/a'), 'https://x.com/n3')
+})
+
+
 {
   // e2e: 3-page article auto-joined, plus cap enforcement.
   const http = await import('node:http')

@@ -97,7 +97,12 @@ export async function fetchViaCurlProxy(url, cfg, externalSignal, proxyOverride)
     '--max-filesize', String(cfg.maxBytes), // unit is BYTES, not KB
     '-x', proxy,
     '-A', cfg.userAgent,
-    '-w', '\n%{http_code} %{content_type}',
+    // trailing metadata line: "<http_code> <content_type> <url_effective>"
+    // (url_effective last: content_type may be empty, URLs never contain
+    // unencoded spaces — parse from both ends). Without it a redirected
+    // fetch kept the ORIGINAL url as finalUrl and same-host pagination /
+    // link resolution ran against the wrong host.
+    '-w', '\n%{http_code} %{content_type} %{url_effective}',
     url,
   ]
   try {
@@ -107,14 +112,16 @@ export async function fetchViaCurlProxy(url, cfg, externalSignal, proxyOverride)
         resolve(stdout)
       })
     })
-    // tail line carries the metadata: "<http_code> <content_type>"
+    // tail line carries the metadata: "<code> <content_type> <url_effective>"
     const nl = buf.lastIndexOf(0x0a)
     if (nl < 0) return null // no trailing metadata — abnormal response, treat as failure
     const meta = buf.subarray(nl + 1).toString('latin1').trim()
     const body = buf.subarray(0, nl)
-    const [codeStr, ...ctParts] = meta.split(' ')
+    const parts = meta.split(' ')
+    const codeStr = parts.shift()
+    const finalUrlEff = parts.length > 1 ? parts.pop() : url
     const code = Number(codeStr)
-    const contentType = ctParts.join(' ')
+    const contentType = parts.join(' ')
     if (code >= 200 && code < 300) {
       // Headerless responses: gate binary bodies out (same rule as the direct
       // path — curl writes an empty %{content_type} then).
@@ -126,7 +133,7 @@ export async function fetchViaCurlProxy(url, cfg, externalSignal, proxyOverride)
     if (contentType && !/text\/html|application\/xhtml|text\/plain|\/json|[+/]xml/i.test(contentType)) {
       return { error: `Unsupported content-type: ${contentType.split(';')[0]}` }
     }
-    return { buffer: body, contentType, finalUrl: url, viaProxy: proxy }
+    return { buffer: body, contentType, finalUrl: finalUrlEff, viaProxy: proxy }
   } catch (err) {
     // curl error 63 = exceeded --max-filesize (page too large, not a proxy
     // problem — report it as such instead of "proxy unreachable")

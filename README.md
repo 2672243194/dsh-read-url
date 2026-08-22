@@ -107,7 +107,7 @@ chars 800+800/12398 · cached
 
 ### Tools
 
-**`read_url(url, maxChars?, offset?, mode?, includeLinks?)`** — fetch and extract clean body. Handles HTML pages, JSON APIs (compact re-indented render) and RSS/Atom feeds (entry list + `feedCount`); paginated articles (novel/news/forum) are auto-joined up to `paginateMax` pages; page metadata (`published`, `author`) is harvested automatically — meta tags first, with a byline fallback from the body text when meta is absent
+**`read_url(url, maxChars?, offset?, mode?, includeLinks?)`** — fetch and extract clean body. Handles HTML pages, JSON APIs (fully compact render with long-value clipping) and RSS/Atom feeds (entry list + `feedCount`); paginated articles (novel/news/forum) are auto-joined up to `paginateMax` pages; page metadata (`published`, `author`) is harvested automatically — meta tags first, with a byline fallback from the body text when meta is absent
 
 | Param | Type | Default | Description |
 |---|---|---|---|
@@ -221,7 +221,7 @@ const results = await Promise.all([
 ## Technical notes
 
 - **Encoding**: BOM-first detection (UTF-8 / UTF-16LE / UTF-16BE — byte-level evidence beats any declared charset), then HTTP `Content-Type` charset → HTML meta; built-in `TextDecoder` transcoding (Node 20+ full-icu, so declared Shift-JIS/EUC-JP/GBK/Big5 all decode), GB2312 normalized to GBK, auto-fallback to UTF-8 on mojibake;
-- **Content dispatch**: a URL is not always an HTML page — JSON APIs are re-rendered compact (indent 1), RSS 2.0 / Atom feeds parse into an entry list (`title — url` + summary, `feedCount` field, full items via `includeLinks`; entry summaries are iteratively tag-stripped and entity-decoded until stable, so double-escaped `&lt;a&gt;` never leaks as a literal tag); XML sitemaps are rejected with a clear reason (no reading value); everything else falls through to the HTML pipeline;
+- **Content dispatch**: a URL is not always an HTML page — JSON APIs are re-rendered fully compact with no indentation, and string values over 1500 chars are clipped with a visible marker (since v1.2.0), RSS 2.0 / Atom feeds parse into an entry list (`title — url` + summary, `feedCount` field, full items via `includeLinks`; entry summaries are iteratively tag-stripped and entity-decoded until stable, so double-escaped `&lt;a&gt;` never leaks as a literal tag); XML sitemaps are rejected with a clear reason (no reading value); everything else falls through to the HTML pipeline;
 - **Extraction**: prefers `<article>` (all articles joined on aggregation pages; an unrelated tiny article — e.g. a newsletter card — falls through to `<main>` when its text is under 200 chars and `<main>` exists) / `<main>` / `role="main"`; `role="main"` containers are closed via **depth counting of balanced tags** (nested divs no longer cut the block at the first `</div>` — measured: gnu.org used to lose 7/8 of its body this way); strips `nav/footer/header/aside/form/iframe` and ad-like containers, heuristic fallback to `<body>`; on the body path a **text-density pass** drops link-dominated segments (related posts, category sidebars, hot-article widgets) — pages with standard containers never reach it;
 - **Pagination**: auto-follows `rel=next` or a short next-page anchor (下一页 / next / › / » — conservative, no fuzzy guessing); same-host only, loop-guarded, repeated paragraphs across the seam de-duplicated; continuation pages take the fast static path (a paginated SPA chain would cost one full render per page);
 - **Metadata**: `published` / `author` harvested from meta tags into the output and the status line; when the page has no such meta (ruanyifeng.com ships zero author/date tags) a **byline fallback** harvests the body head (600-char window: `作者：X / 日期：Y` — meta wins, deep-body mentions ignored, markdown link syntax stripped); empty-body pages (login walls, JS shells) fall back to `og:description` as a hint instead of nothing;
@@ -258,7 +258,7 @@ Plus a **15-item DSH acceptance round** (a real agent driving every read_url too
 | Batch + failure isolation | 4-URL mix | ✅ 2/4 ok, failures isolated |
 | Site crawl | Ruan Yifeng blog | ✅ 5/5 pages tree map |
 
-- **79 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard, schema budget, bare-main pick, worst-case timeout budgets, yml string coercion + clamping, strict-host seam degradation, UTF-16 BOM, Shift-JIS, density filter, pagination join/cap/disable, JSON render, RSS parse, sitemap rejection, 429 Retry-After retry, image alt, code-fence language, metadata, og:description fallback, double-escaped feed, headerless binary sniff, nested role=main, tiny-article fallback, unbalanced-tag degradation, byline fallback, challenge-page detection, isConcurrencySafe declaration + concurrent cache-race smoke) + **12 SPA-test assertions** all green;
+- **88 zero-dep assertions** (v1.2.0 adds: sentence-aligned truncation, compact JSON, pagination variants, adversarial-input time bounds, prose &lt; preservation, deep-JSON degradation) (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard, schema budget, bare-main pick, worst-case timeout budgets, yml string coercion + clamping, strict-host seam degradation, UTF-16 BOM, Shift-JIS, density filter, pagination join/cap/disable, JSON render, RSS parse, sitemap rejection, 429 Retry-After retry, image alt, code-fence language, metadata, og:description fallback, double-escaped feed, headerless binary sniff, nested role=main, tiny-article fallback, unbalanced-tag degradation, byline fallback, challenge-page detection, isConcurrencySafe declaration + concurrent cache-race smoke) + **12 SPA-test assertions** all green;
 - Real case: on a Xiaoheihe post, comment like-counts (`up` field) could not be attributed from flattened text — **precise fields should come from the page's underlying data API** (e.g. `/bbs/app/link/tree` JSON). This is a shared boundary of text extractors, not a defect.
 
 ## Roadmap
@@ -274,6 +274,8 @@ Plus a **15-item DSH acceptance round** (a real agent driving every read_url too
 - [x] Bot-challenge defense (Cloudflare interstitial detection + auto-redirect wait + rejection, v1.0.0)
 - [x] Byline fallback for meta-less pages (author / published, v1.0.0)
 - [x] Parallel tool-call declaration (isConcurrencySafe; multi-source wall-clock time = slowest site, v1.1.0)
+- [x] Separate failure cache, label-based race attribution, sentence-aligned truncation, fully compact JSON render (~21% smaller), merged status flags, arrow-wrapped pagination variants (v1.2.0)
+- [x] Adversarial-page linearization (unclosed-tag/unpaired-lt/attribute-scan bounds + recursion depth cap, fixing a quadratic DoS vector), prose &lt; preservation, proxy-path redirects keep the final URL, deep-JSON degradation instead of crash (v1.2.0 round 2)
 
 > From v1.0.0 the plugin enters maintenance mode: bug fixes first, updates kept rare.
 
