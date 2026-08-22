@@ -38,8 +38,7 @@ const DEFAULTS = {
 }
 
 // Session-level cache: url -> { time, full }. Failures live in a separate
-// small map so 30 s error entries never evict hot success pages from the
-// main cache (they used to share the FIFO budget).
+// small map so short-lived error entries never evict hot success pages.
 const cache = new Map()
 const failCache = new Map()
 const FAIL_CACHE_MAX = 8
@@ -219,8 +218,8 @@ async function raceFetch(url, externalSignal, cfg, proxy) {
   directCtrl.abort()
   proxyCtrl.abort()
   if (!winner.success) {
-    // Attach channel labels where the attempt order is defined, so callers
-    // never have to guess which slot is the proxy error.
+    // Each failure is tagged with its channel so callers read errors by
+    // label ('direct' | 'proxy') rather than by array position.
     const labels = ['direct', 'proxy']
     winner.failures = winner.failures.map((f, i) => ({
       label: labels[i],
@@ -302,12 +301,11 @@ export function decodeTextEntities(text) {
   })
 }
 
-// Quadratic-cost guard: a '<' that has NO '>' after it can never start a real
-// tag, yet every "<...>"-style regex rescans to the end of the string at each
-// such position (measured: 10k stray '<'s in 60KB → seconds; a 3MB page would
-// stall the tool call). Neutralize stray '<' in the no-'>' tail — text content
-// is preserved, only the impossible tag-openings go away. Short tails
-// ("a < b" in prose) are left untouched.
+// A '<' with no '>' after it can never start a real tag, but tag-scanning
+// regexes still probe the rest of the string at every such position, degrading
+// to quadratic time on pathological input. Neutralize stray '<' in the no-'>'
+// tail: text content is preserved, impossible tag openings disappear, and
+// scanning stays linear. Short tails ("a < b" in prose) are left untouched.
 function defuseLt(html) {
   const from = html.lastIndexOf('>') + 1
   if (html.length - from < 512 || !html.includes('<', from)) return html
@@ -334,8 +332,8 @@ function textOnly(html) {
 function xmlText(s) {
   let t = String(s || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
   // Feeds double-escape HTML in descriptions (&lt;a href=…&gt;查看全文&lt;/a&gt;):
-  // one strip-then-decode pass leaves literal tags in the rendered text
-  // (measured on sspai.com/feed). Iterate strip → decode until stable.
+  // one strip-then-decode pass leaves literal tags in the rendered text.
+  // Iterate strip → decode until stable.
   for (let i = 0; i < 3; i++) {
     const prev = t
     t = decodeTextEntities(t.replace(/<[^>]{1,1000}>/g, ' '))
@@ -346,11 +344,10 @@ function xmlText(s) {
 
 // RSS 2.0 <item> / Atom <entry> → compact list "title — url\n  summary".
 function parseFeed(xml, limit) {
-  xml = defuseLt(xml) // no-'>' tail would make the lazy item scan quadratic
+  xml = defuseLt(xml) // keeps the item scan linear
   const isAtom = /<feed[\s>]/i.test(xml)
   const itemRe = isAtom ? /<entry[\s>][\s\S]*?<\/entry\s*>/gi : /<item[\s>][\s\S]*?<\/item\s*>/gi
-  // No-closer guard: unclosed items would rescan the rest of the feed from
-  // every <item> position.
+  // Without a single closing tag nothing can pair, so the scan is skipped.
   const closable = isAtom ? /<\/entry\s*>/i.test(xml) : /<\/item\s*>/i.test(xml)
   const items = []
   let m
@@ -412,9 +409,8 @@ export function densityFilter(html) {
 }
 
 // Depth-counted block extraction: returns html from the opening tag at
-// openIdx through its BALANCED closing tag. A non-greedy regex stops at the
-// first nested </div> — measured: gnu.org "content" div cut to 2700 chars,
-// naver.com "container" to 115 (zero text). Container divs nest heavily.
+// openIdx through its BALANCED closing tag. A non-greedy regex would stop at
+// the first nested </div>, truncating heavily nested container divs.
 function tagBlockAt(html, openIdx, tagName) {
   const re = new RegExp(`</?${tagName}(?=[\\s>])`, 'gi')
   re.lastIndex = openIdx
@@ -433,11 +429,11 @@ function tagBlockAt(html, openIdx, tagName) {
 export function pickMain(html) {
   // Aggregation pages (e.g. blog homepages) have one <article> per item:
   // collect all of them instead of only the first. A tiny <article> (e.g. a
-  // newsletter card — measured on about.gitlab.com: 71 chars of text while
-  // the real content sits in <main>) falls through to <main> when present.
+  // newsletter card while the real content sits in <main>) falls through to
+  // <main> when present.
   const articles = /<\/article/i.test(html)
     ? [...html.matchAll(/<article[\s>][\s\S]*?<\/article\s*>/gi)]
-    : [] // no closer anywhere: matchAll would rescan per open (quadratic)
+    : [] // without a closer in the document nothing can pair
   const hasMain = /<main[\s>]/i.test(html)
   if (articles.length && (!hasMain || textOnly(articles.map((a) => a[0]).join('')).length >= 200)) {
     return articles.map((a) => a[0]).join('\n')
@@ -467,11 +463,10 @@ export function pickMain(html) {
 
 // Some sites (e.g. baidu.com) ship CSS/HTML inside hidden <textarea> with
 // entity-escaped tags (&lt;style&gt;...). Reveal TAG-SHAPED sequences so noise
-// rules can strip them. A blanket &lt; → < decode would turn prose "a &lt; b"
-// into a raw "<", and the tag stripper would then swallow everything from it
-// to the next real ">" — measured content loss on pages with escaped
-// comparison operators. So: &lt; is revealed only when a tag name follows;
-// bare &gt; / &quot; are safe to reveal (they never open a strip span).
+// rules can strip them. &lt; is revealed only when a tag name follows: a bare
+// &lt; from prose ("a &lt; b") would be swallowed by the tag stripper up to
+// the next real '>'. Bare &gt; / &quot; never open a strip span and are
+// revealed unconditionally.
 function revealEscapedTags(html) {
   return html
     .replace(/&lt;(?=\/?[a-zA-Z!])/gi, '<')
@@ -480,13 +475,11 @@ function revealEscapedTags(html) {
 }
 
 function stripNoise(mainHtml) {
-  // Attribute runs are bounded: an unbounded [^>]+ rescans toward the next
-  // '>' at every '<' position — adversarial markup with one distant '>' made
-  // this quadratic (measured: 40k '<style' + one '>' → 82s). Real attributes
-  // never approach 1000 chars.
-  // Container groups are built from closers that actually exist: absent
-  // closing tags made the lazy body scan walk the rest of the string per
-  // opening position for nothing.
+  // Attribute runs are bounded so a '<' whose '>' is far away costs a bounded
+  // scan instead of a run to that '>'; real attributes never approach 1000
+  // chars. Container groups only include tags whose closing tag exists in the
+  // input — absent closers cannot pair, so scanning for their body is wasted
+  // work.
   const closers = new Set()
   for (const c of mainHtml.matchAll(/<\/([a-z0-9]+)/gi)) closers.add(c[1].toLowerCase())
   const group = (names) => names.filter((n) => closers.has(n))
@@ -534,14 +527,12 @@ function imgsToMarkdown(html) {
   }
 }
 
-// An open tag whose closing tag appears NOWHERE in the input can never pair:
-// the paired alternative of the walker regex would rescan the rest of the
-// string at every such position (measured: 10k unclosed <div>s in 60KB →
-// 2.2s quadratic; a 3MB page would stall the tool call for minutes). Pre-
-// stripping unmatched openers is behaviour-identical — they previously fell
-// through to the single-tag branch, which drops them — and makes the walk
-// linear. Depth cap: recursion on 100+-deep nesting would overflow the stack
-// long before real pages nest that far; degrade to plain text instead.
+// An open tag whose closing tag appears nowhere in the input can never pair;
+// removing such openers up front keeps the walker from rescanning the rest of
+// the string at every position, so the walk stays linear. The walkers drop
+// these tags either way, so the rendered output is unchanged. The depth cap
+// bounds recursion — real pages never nest hundreds of levels; beyond the cap
+// the walker degrades to plain text.
 const OPEN_TAG_RE = /<([a-zA-Z0-9]+)((?:"[^"]*"|'[^']*'|[^'">]){0,1000})>/g
 const MD_MAX_DEPTH = 100
 function stripUnmatchedOpeners(html) {
@@ -624,8 +615,7 @@ export function blockMd(html, depth = 0) {
     } else if (tag === 'code') {
       out += `\`${textOnly(inner)}\``
     } else if (tag === 'ul' || tag === 'ol') {
-      // No-closer guard: <li>s without a single </li> would make the lazy
-      // scan walk the rest of inner from every open position (quadratic).
+      // Without a single </li> nothing can pair, so the item scan is skipped.
       const items = []
       if (inner.includes('</li')) {
         const liRe = /<li[^>]{0,1000}>([\s\S]*?)<\/li>/gi
@@ -677,7 +667,7 @@ export function blockMd(html, depth = 0) {
 }
 
 // Page-level metadata the model actually asks about (who wrote it, when) —
-// cheap to harvest from <meta>, previously thrown away.
+// cheap to harvest from <meta>.
 function extractMeta(html) {
   const get = (names) => {
     for (const n of names) {
@@ -693,9 +683,8 @@ function extractMeta(html) {
   }
 }
 
-// Meta-less pages (measured: ruanyifeng.com carries ZERO author/date meta
-// tags) still print the byline inside the body head: "作者：阮一峰 日期：
-// 2026年8月21日". Fill ONLY the missing fields, and only from the first
+// Meta-less pages still print the byline inside the body head: "作者：阮一峰
+// 日期：2026年8月21日". Fill ONLY the missing fields, and only from the first
 // 600 chars of body text — deeper matches are content, not bylines.
 const BYLINE_AUTHOR_RE = /(?:作者|責任編輯|責任主编|editor)[：:\s]{1,3}([^\s，,。/|()（）[\]]{2,24})/
 const BYLINE_DATE_RE = /(?:发表日期|发布日期|发表时间|发布时间|日期|发表于|发布于|published(?:\s+on)?)[：:\s]{0,3}(\d{4}[-/.年]\s?\d{1,2}[-/.月]\s?\d{1,2}日?|\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2})?)/i
@@ -839,8 +828,9 @@ function extractLinks(html, limit, baseUrl) {
     } catch {
       continue
     }
-    // Only web links are followable by the model / crawler — ftp: etc. would
-    // pass new URL() resolution and pollute link lists and crawl queues.
+    // Only http(s) links are followable by the model / crawler; other schemes
+    // (ftp:, data:) survive URL resolution and would pollute link lists and
+    // crawl queues.
     if (!/^https?:/i.test(url)) continue
     // dedupe: nav bars repeat the same links many times — one entry per URL
     // keeps the link list compact (tokens) without losing coverage
@@ -1083,9 +1073,9 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   // extraction found almost nothing, try headless rendering (playwright).
   // Beyond script-heavy shells (looksLikeSpa, ≥5 <script> tags), a page whose
   // extraction is EMPTY but carries any <script> may be a JS-redirect shell
-  // (measured: taptap.cn — 2 scripts, empty <body>, redirects via JS) — with
-  // no text to lose, rendering is always worth one bounded attempt. Pages
-  // with no scripts at all cannot change under rendering and are skipped.
+  // (2 scripts, empty <body>, redirect issued from JS) — with no text to
+  // lose, rendering is always worth one bounded attempt. Pages with no
+  // scripts at all cannot change under rendering and are skipped.
   let rendered = false
   let spaHint = ''
   let renderedHtml = null
@@ -1097,8 +1087,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
       renderedHtml = rr.html
       // A challenge interstitial (Cloudflare "Just a moment...") must never
       // be accepted as an improvement — it can carry MORE text than the real
-      // static body (measured: 259 chars of verification prose vs 135 chars
-      // of real content on ruanyifeng.com) and would evict the latter.
+      // static body and would evict the latter.
       if (looksLikeChallenge(rr.html)) {
         renderedHtml = null // pagination/links must not read the interstitial DOM
         spaHint = extracted.text
@@ -1108,8 +1097,8 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
         const r2 = upgrade(extract(rr.html, mode), rr.html)
         // Accept the rendered text when it meaningfully beats the static one.
         // From an EMPTY static extraction even a short body is a real gain
-        // (measured: taptap-style JS shells render 30-60 chars of real content
-        // that the fixed +50 margin would reject).
+        // (JS shells can render just 30-60 chars of real content, below the
+        // fixed +50 margin).
         const gain = r2.text.length - extracted.text.length
         const accept = r2.text && (gain > 50 || (!extracted.text && r2.text.length >= 20))
         if (accept) {

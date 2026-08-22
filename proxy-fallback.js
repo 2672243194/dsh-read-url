@@ -97,11 +97,10 @@ export async function fetchViaCurlProxy(url, cfg, externalSignal, proxyOverride)
     '--max-filesize', String(cfg.maxBytes), // unit is BYTES, not KB
     '-x', proxy,
     '-A', cfg.userAgent,
-    // trailing metadata line: "<http_code> <content_type> <url_effective>"
+    // trailing metadata line: "<code> <content_type> <url_effective>"
     // (url_effective last: content_type may be empty, URLs never contain
-    // unencoded spaces — parse from both ends). Without it a redirected
-    // fetch kept the ORIGINAL url as finalUrl and same-host pagination /
-    // link resolution ran against the wrong host.
+    // unencoded spaces — parse from both ends so the final URL of a redirect
+    // chain survives).
     '-w', '\n%{http_code} %{content_type} %{url_effective}',
     url,
   ]

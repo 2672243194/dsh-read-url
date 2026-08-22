@@ -8,8 +8,8 @@
 //   2. includeLinks extracts links from the RENDERED DOM (chain entry)
 //   3. read_url_links falls back to rendering when static links are empty
 //   4. cache key isolates links/no-links variants
-//   5. a JS shell with only 2 scripts and an EMPTY <body> (looksLikeSpa below
-//      the ≥5 threshold, measured on taptap.cn) still triggers rendering
+//   5. a JS shell with only 2 scripts and an EMPTY <body> (below the
+//      looksLikeSpa ≥5-script threshold) still triggers rendering
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import * as m from './index.js'

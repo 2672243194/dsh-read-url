@@ -109,7 +109,7 @@ ok('markdown mode preserves structure', () => {
   assert.ok(r.text.includes('```'))
 })
 
-console.log('pickMain fixes (152-site sweep findings)')
+console.log('pickMain heuristics')
 ok('role=main container with nested divs is not cut short (gnu.org pattern)', () => {
   const nested = `<html><body><div id="wrap"><div id="content" role="main">
 <p>第一段正文内容，讲了一些需要被提取的事情。</p>
@@ -150,7 +150,7 @@ ok('unbalanced role=main div degrades to body path, never returns null', () => {
   assert.ok(r.text.includes('正文第二段'), `body fallback works: ${r.text.slice(0, 80)}`)
 })
 
-console.log('post-test fixes (15-item DSH test findings)')
+console.log('render hints / challenge detection')
 ok('byline fallback harvests author/date from meta-less body head', () => {
   const page = `<html><head><title>周刊</title></head><body><main>
 <h1>科技爱好者周刊（第 409 期）</h1>
@@ -670,7 +670,7 @@ console.log('read_url_site (local multi-page site, real fetch)')
   server.close()
 }
 
-console.log('v1.0.0 charset / encoding')
+console.log('charset / encoding')
 ok('UTF-16LE BOM detected and decoded', () => {
   const body = '<html><body><p>你好世界</p></body></html>'
   const utf16 = Buffer.from('\ufeff' + body, 'utf16le')
@@ -692,7 +692,7 @@ ok('Shift-JIS meta charset decodes Japanese', () => {
   assert.ok(text.includes('こんにちは'), `decoded text: ${text.slice(0, 60)}`)
 })
 
-console.log('v1.0.0 text-density fallback (body path)')
+console.log('text-density fallback (body path)')
 ok('densityFilter drops link-dominated segments, keeps prose', () => {
   const html =
     '<div><a href="/n1">新闻一</a> <a href="/n2">新闻二</a> <a href="/n3">新闻三</a></div>' +
@@ -712,7 +712,7 @@ ok('article/main pages bypass densityFilter (no behavior change)', () => {
   assert.ok(r.text.includes('正文文字'), 'article content survives')
 })
 
-console.log('v1.0.0 pagination')
+console.log('pagination')
 ok('findNextLink: rel=next wins', () => {
   const html = '<html><body><a href="/p2" rel="next">go on</a></body></html>'
   assert.equal(m.findNextLink(html, 'https://x.com/p1'), 'https://x.com/p2')
@@ -728,7 +728,7 @@ ok('findNextLink: ordinary links never match', () => {
   assert.equal(m.findNextLink(html, 'https://x.com/'), null)
 })
 
-console.log('v1.2.0 fixes / token savings')
+console.log('truncation / compact render / pagination variants')
 ok('smartTruncate: oversized paragraph degrades to sentence alignment, not hard slice', () => {
   // One huge paragraph after offset 0 — must cut at a sentence boundary.
   const sentences = Array.from({ length: 30 }, (_, i) => `这是第${i}句话。`).join('')
@@ -753,10 +753,9 @@ ok('compactJson: short JSON passes through unchanged', () => {
   assert.equal(m.compactJson({ a: [1, 2] }), '{"a":[1,2]}')
 })
 
-console.log('v1.2.0 hardening (adversarial input)')
-ok('extract: pathological unclosed-tag pages stay bounded (was quadratic)', () => {
-  // 10k unclosed <div>s took 2.2s+ before the linearization guards; the
-  // bounded walkers finish far under a second now.
+console.log('adversarial input handling')
+ok('extract: pathological unclosed-tag pages stay bounded', () => {
+  // Bounded scanning keeps pathological inputs well inside the tool budget.
   const t0 = Date.now()
   const r = m.extract(`<body>${'<div>'.repeat(10000)}</body>`, 'text')
   const ms = Date.now() - t0
@@ -770,10 +769,10 @@ ok('extract: img/style/article bombs stay bounded', () => {
   m.extract('<style'.repeat(10000) + '<p>x</p>', 'text')
   m.extract('<article'.repeat(10000) + '<p>x</p>', 'text')
   const ms = Date.now() - t0
-  assert.ok(ms < 3000, `three bombs finished in ${ms}ms (was 20s+ pre-fix)`)
+  assert.ok(ms < 3000, `three bombs finished in ${ms}ms`)
 })
 
-ok('prose "a < b" is not mangled by the no-tag-tail guard', () => {
+ok('prose "a < b" survives entity decoding', () => {
   const r = m.extract('<body><p>x &lt; y 且 a &lt; b 结尾</p></body>', 'text')
   assert.ok(r.text.includes('x < y'), `kept: ${r.text}`)
 })
@@ -835,7 +834,7 @@ ok('findNextLink: arrow-wrapped and traditional variants matched', () => {
   server.close()
 }
 
-console.log('v1.0.0 JSON / RSS / retry')
+console.log('JSON / RSS / retry')
 {
   const http = await import('node:http')
   let retryHits = 0
@@ -901,7 +900,7 @@ console.log('v1.0.0 JSON / RSS / retry')
   server.close()
 }
 
-console.log('v1.0.0 markdown / metadata enhancements')
+console.log('markdown / metadata')
 ok('markdown mode emits image alt text', () => {
   const html = '<html><body><article><p>图解如下：</p><img src="/chart.png" alt="架构图：三层结构"><img src="/spacer.gif" alt=""></article></body></html>'
   const r = extract(html, 'markdown')
@@ -931,10 +930,10 @@ ok('empty body falls back to og:description instead of nothing', () => {
   assert.ok(r.text.includes('导语摘要'), `description fallback: ${r.text.slice(0, 60)}`)
 })
 
-console.log('pre-release sweep fixes (feed / binary sniff)')
+console.log('feed / binary sniff')
 {
-  // Feed descriptions double-escape HTML (&lt;a href=&#34;…&#34;&gt;查看全文&lt;/a&gt;,
-  // measured on sspai.com/feed): one strip-then-decode pass left literal tags.
+  // Feed descriptions double-escape HTML; one strip-then-decode pass
+  // leaves literal tags in the rendered text.
   const http = await import('node:http')
   const rss2 = `<?xml version="1.0"?><rss version="2.0"><channel><title>双转义源</title>` +
     `<item><title>带双转义描述的条目</title><link>https://example.com/d</link>` +
