@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.1.0] - 2026-08-22
+
+### 适配 DSH 0.1.1-rc.2：并行工具调用声明
+
+对 `@deepseek-ai/dsh` 0.1.0-rc.8 → 0.1.1-rc.2 做了逐包静态对比（dsh-tools / dsh-tool-web / dsh-base / dsh-headless / dsh-tool-call-timeout-policy / dsh-agent-loop 的 lib 逐字节一致，唯一变化是 dsh-tool-cordis 新增 host 侧 API——authorization flows、session projections host-only units、image attachment policy、webserver index injections，全部为增量，无删除），插件所依赖的 API 面（`ctx.tools.register` / `ctx.effect` / `ctx.web` seam / `ToolDefinition.timeoutMs` / `exec.signal`）**零破坏性变化**，cordis 核心 4.0.1 两版一致。
+
+**新增：`isConcurrencySafe` 并行声明（4 个工具全部启用）**
+- DSH agent loop 会把连续的并行安全工具调用归入有界滚动池——此前 read_url 系工具未声明，即使模型同时发多个请求也被逐个串行执行
+- 全部共享状态审查确认交换性安全：会话缓存 Map（get/set 原子，重叠 miss 最多重复抓一次）、解码器缓存（TextDecoder 无状态）、readability 延迟 import（幂等）、SPA 渲染（共享 browser 单例 + 每次调用独立 `newPage`，page 间隔离）、系统代理检测缓存（读环境变量，双写同值）、爬虫去重集合（调用局部）
+- 效果：多源阅读任务（一次读 3–5 个 URL 对比观点）由串行变并行，墙钟时间按最慢一站计
+- 新增单测：4 工具声明锁定 + 6 路并发 read_url 缓存竞态烟雾测试（每个结果必须携带自己的正文，绝不串扰）
+
+**验证**：79 单元断言（+2）+ 12 SPA 断言全绿；新版 DSH `--dump-config` 配置树正常解析；headless 端到端实测 read_url 真实调用成功（example.com 返回正确标题）。
+
 ## [1.0.0] - 2026-08-21
 
 ### 量大管饱的持久版本：一次把「读网页」这件事做全

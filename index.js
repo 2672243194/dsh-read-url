@@ -1105,6 +1105,7 @@ function readLinksTool(ctx, cfg) {
     },
     // Covers SPA-render fallback: full fetch timeout + playwright render cap.
     timeoutMs: Math.max(45000, cfg.timeoutMs + 45000),
+    isConcurrencySafe: () => true,
     output: {
       schema: {
         type: 'object',
@@ -1209,6 +1210,9 @@ function readUrlBatchTool(ctx, cfg) {
     },
     // Worst case: ceil(10/4)=3 concurrency waves, each (fetch + SPA render).
     timeoutMs: Math.max(60000, cfg.timeoutMs * 3 + 135000),
+    // Concurrent batch calls multiply fetch pressure but stay isolated (each
+    // call owns its result array; the session cache is commutative).
+    isConcurrencySafe: () => true,
     output: {
       schema: {
         type: 'object',
@@ -1379,6 +1383,10 @@ function readUrlSiteTool(ctx, cfg) {
     // Worst case: ceil(maxPages/2)=25 waves of paired fetches (no SPA render
     // here); the cooperative signal stops the loop early once the budget is hit.
     timeoutMs: Math.max(120000, cfg.timeoutMs * 25),
+    // Crawl state (visited set, queue) is call-local; only the shared session
+    // cache is global and commutative — parallel crawls of different hosts
+    // are safe and useful (one task mapping several sites).
+    isConcurrencySafe: () => true,
     output: {
       schema: {
         type: 'object',
@@ -1474,6 +1482,11 @@ export function apply(ctx, config) {
     // continuation fetches (static, no render). Derived from load-time cfg —
     // scale with it, never clamp it.
     timeoutMs: Math.max(45000, cfg.timeoutMs * (cfg.paginate === false ? 1 : cfg.paginateMax + 1) + 45000),
+    // All shared state is commutative-safe under concurrent calls (session
+    // cache Map get/set, decoder cache, one shared browser with isolated
+    // pages per render), so the agent may fan out several read_url calls in
+    // one parallel group — a real win for multi-source reading tasks.
+    isConcurrencySafe: () => true,
     output: {
       schema: {
         type: 'object',

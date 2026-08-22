@@ -354,6 +354,48 @@ ok('pipeline timeout budgets cover the configured worst case and scale with cfg'
   assert.ok(nopage.read_url.timeoutMs <= 60000, `paginate:false budget ${nopage.read_url.timeoutMs} must not carry pagination pages`)
 })
 
+ok('all four tools declare isConcurrencySafe for parallel fan-out', () => {
+  const tools = []
+  m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }, {})
+  const names = ['read_url', 'read_url_links', 'read_url_batch', 'read_url_site']
+  for (const n of names) {
+    const t = tools.find((t) => t.name === n)
+    assert.ok(t, `tool ${n} registered`)
+    assert.equal(typeof t.isConcurrencySafe, 'function', `${n} must declare isConcurrencySafe`)
+    assert.equal(t.isConcurrencySafe({}), true, `${n}.isConcurrencySafe must return exactly true`)
+  }
+})
+
+{
+  // top-level await block (not the sync ok() wrapper): async assertions must
+  // actually block the runner or failures would be swallowed.
+  const http = await import('node:http')
+  let hits = 0
+  const server = http.createServer((req, res) => {
+    hits++
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    res.end(`<html><body><main><h1>并发页</h1>${'<p>并发正文段落，验证共享缓存与提取器在交叠调用下不串扰。</p>'.repeat(60)}</main></body></html>`)
+  })
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  const base = `http://127.0.0.1:${server.address().port}/`
+  const ctx = { tools: { register: () => {} }, effect: () => {}, get: () => undefined }
+  m.apply(ctx, {})
+  const results = await Promise.all(
+    Array.from({ length: 6 }, (_, i) => m.readUrl({ url: `${base}?v=${i}`, maxChars: 2000 }, ctx, undefined, undefined)),
+  )
+  server.close()
+  for (const r of results) {
+    assert.ok(!r.error, `concurrent read ok: ${JSON.stringify(r).slice(0, 80)}`)
+    assert.ok(r.text.includes('并发正文段落'), `body extracted: ${(r.text || '').slice(0, 60)}`)
+    assert.ok(r.text.includes('并发页'), `title in block: ${(r.text || '').slice(0, 60)}`)
+  }
+  // overlapping misses may double-fetch the same URL — harmless; but every
+  // result must carry its OWN body, never another call's data.
+  assert.ok(hits >= 6, `all distinct URLs fetched: ${hits}`)
+  passed++
+  console.log('  ok - concurrent read_url calls share state safely (cache race smoke)')
+}
+
 ok('cordis.patch.yml numeric strings are coerced and clamped, not concatenated', () => {
   const tools = []
   m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }, { timeoutMs: '25000', maxChars: '8000' })

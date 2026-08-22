@@ -41,7 +41,8 @@ DSH 的 Agent 能搜索（返回链接和片段），但缺"把 URL 读成干净
 1. **网络访问走 `ctx.web` 能力缝**——所有 web 访问优先通过 `ctx.web.fetch()`（seam 内解析 provider，与官方 `tool-web` 一致），seam 缺失时回退全局 fetch。网络层可替换，不绑定任何具体 provider；
 2. **可逆副作用**——会话缓存注册在 `ctx.effect` 下，插件卸载即自动清理（时间可组合性）；
 3. **协作式工具调用超时**——`ToolDefinition.timeoutMs` 声明预算，`execute(args, exec)` 把 `exec.signal` 转发给 fetch，超时策略由管线强制执行，不把超时暴露给模型；
-4. **模型视角精简**——render 输出紧凑文本（`title:` 头部 + 正文），模型直接消费，无需解析 JSON；默认参数最省 token，结构化能力按需开启。
+4. **模型视角精简**——render 输出紧凑文本（`title:` 头部 + 正文），模型直接消费，无需解析 JSON；默认参数最省 token，结构化能力按需开启；
+5. **并行工具调用**——4 个工具全部声明 `isConcurrencySafe`（v1.1.0 起）：共享状态（会话缓存 / 解码器缓存 / SPA 浏览器 page 隔离）均满足交换性安全，agent loop 可把多个 read_url 调用归入并行池——多源阅读任务的墙钟时间按最慢一站计，而非各站之和。
 
 ## 安装
 
@@ -232,7 +233,7 @@ const results = await Promise.all([
 - **可选增强二（SPA 页面渲染）**：在 DSH profile 目录执行 `npm i playwright && npx playwright install chromium` 后自动启用。检测到正文为空且（页面脚本密集 疑似 Vue/React 客户端渲染，或 body 为空的 JS 跳转壳——script 数不多但正文全靠跳转）时，自动用无头 Chromium 渲染后再提取（`rendered` 标记告知模型）；渲染结果仅在**显著优于**静态提取时采用（静态为空时 ≥20 字符即接受，防短正文被拒）；**人机验证页防御**——Cloudflare「Just a moment...」等指纹页识别后额外轮询 8s 供其自动跳转，仍未通过则拒绝渲染结果、保留静态正文（指纹页文字量可能超过真实正文，实测 259 vs 135 字符，绝不当作提升），指纹页 DOM 也不污染分页/链接提取；渲染采用 `domcontentloaded` + **DOM 稳定轮询**（内容停止增长即收，上限 10s）而非 `networkidle`——心跳轮询站永不空闲，避免 30s 超时；未安装时优雅提示安装方法、不报错——核心保持零依赖；
 - **边界**：登录墙页面无法读取；SPA 页面需安装 Playwright 增强后渲染读取（未安装时返回明确提示）；**结构化数据（如评论的点赞数归属、榜单数值）不在文本提取范围**——本插件把 HTML 扁平化为可读文本，字段与数值的精确对应关系会丢失；需要精确字段时，用 Playwright 拦截页面实际调用的数据 API 获取（见下方「真实世界验证」）。
 
-## 真实世界验证（2026-08-21，v1.0.0）
+## 真实世界验证（2026-08-21，v1.0.0；2026-08-22 适配 DSH 0.1.1-rc.2 复验）
 
 152 站全量实测（`multi-site.mjs` 已提交可复跑，8 并发）：**115 OK / 17 预期边界（登录墙·验证页·静态小页） / 20 网络·反爬归因错误 / 0 崩溃**（含全部发布前修复的终态轮；网络类错误逐轮有 ±5 波动，均为环境归因）。覆盖国内门户 / 媒体 / 电商（京东·淘宝·拼多多·苏宁·当当）/ 视频（B 站·爱奇艺·优酷·芒果）/ 音乐 / 游戏 / 小说（起点·纵横·晋江 legacy GBK）/ 问答 / 论坛 / 政府 / 高校（清北复交等 8 所）/ 港台繁体（PTT·自由时报·联合报）/ 日韩（Yahoo JP·Hatena·goo·naver·daum）/ 海外技术站（GitHub·dev.to·react.dev·nodejs·rust·go·python docs）/ 订阅源 / JSON API / 编码压力（GBK·GB2312·Big5·gb18030）/ 反爬与网络边界。错误全部环境归因（维基/Reddit/UDN 连接超时；W3C/贴吧/NGA/StackOverflow 403；北邮 412；DNS 失败等）——每一个都返回结构化、准确归因的错误，无一崩溃。
 
@@ -257,7 +258,7 @@ const results = await Promise.all([
 | **批量 + 失败隔离** | 4 URL 混合 | ✅ 2/4 成功、失败隔离 |
 | **整站爬取** | 阮一峰博客 | ✅ 5/5 页树状站点地图 |
 
-- **77 个单元断言**（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级、UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 Retry-After 重试、图片 alt、代码语言、元数据、og:description 回落、双转义 feed、无头二进制嗅探、嵌套 role=main、薄 article 回落、不平衡标签降级、byline 兜底、人机验证页识别）+ **12 个 SPA 测试断言**全绿；
+- **79 个单元断言**（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级、UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 Retry-After 重试、图片 alt、代码语言、元数据、og:description 回落、双转义 feed、无头二进制嗅探、嵌套 role=main、薄 article 回落、不平衡标签降级、byline 兜底、人机验证页识别、isConcurrencySafe 声明 + 并发缓存竞态烟雾）+ **12 个 SPA 测试断言**全绿；
 - 一个真实案例：小黑盒帖子的评论点赞数（`up` 字段）无法从扁平文本确定归属——**精确字段应走页面背后的数据 API**（如 `/bbs/app/link/tree` JSON），这是同类文本提取器的共同边界，不是缺陷。
 
 ## Roadmap
@@ -272,6 +273,7 @@ const results = await Promise.all([
 - [x] 文本密度兜底 + 元数据提取（v1.0.0）
 - [x] 人机验证页防御（Cloudflare 指纹页识别 + 等待自动跳转 + 拒绝误采，v1.0.0）
 - [x] 无 meta 页面署名行兜底（author / published，v1.0.0）
+- [x] 并行工具调用声明（isConcurrencySafe，多源阅读墙钟时间按最慢一站计，v1.1.0）
 
 > v1.0.0 起进入维护期：以修 bug 为主，减少更新频率。
 

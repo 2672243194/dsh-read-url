@@ -41,7 +41,8 @@ Implemented per official docs (`docs/capability-seams.md`, `docs/cordis-primer.m
 1. **Web access via the `ctx.web` capability seam** — all web requests go through `ctx.web.fetch()` first (provider resolved inside the seam, same as official `tool-web`), falling back to global fetch when the seam is absent. The network layer is replaceable, not bound to any provider;
 2. **Reversible side effects** — the session cache is registered under `ctx.effect`, auto-cleared on plugin unload (temporal composability);
 3. **Cooperative tool-call timeout** — `ToolDefinition.timeoutMs` declares the budget, `execute(args, exec)` forwards `exec.signal` to fetch; the timeout policy is enforced by the pipeline, never exposed to the model;
-4. **Model-facing simplicity** — render emits compact text (`title:` header + body); the model consumes it directly with no JSON parsing. Defaults are the most token-efficient; structured output is opt-in.
+4. **Model-facing simplicity** — render emits compact text (`title:` header + body); the model consumes it directly with no JSON parsing. Defaults are the most token-efficient; structured output is opt-in;
+5. **Parallel tool calls** — all four tools declare `isConcurrencySafe` (since v1.1.0): every piece of shared state (session cache, decoder cache, per-render isolated browser pages) is commutative-safe, so the agent loop may fan out several read_url calls into one parallel group — the wall-clock time of a multi-source reading task is that of the slowest site, not the sum.
 
 ## Install
 
@@ -232,7 +233,7 @@ const results = await Promise.all([
 - **Optional enhancement 2 (SPA page rendering)**: run `npm i playwright && npx playwright install chromium` in the DSH profile directory to auto-enable it. When the extracted body is empty and the page is script-heavy (likely Vue/React client-rendered) or a JS-redirect shell (few scripts but an empty `<body>`), the plugin automatically renders it with headless Chromium before extracting (a `rendered` flag tells the model); the rendered text is accepted only when it meaningfully beats the static one (≥20 chars from an empty static extraction — short real content is no longer rejected); **bot-challenge defense** — Cloudflare-style interstitials ("Just a moment...") get an extra 8s poll for the auto-redirect, and if the page still looks like a challenge the rendered result is rejected and the static body kept (an interstitial can carry MORE text than the real body — measured 259 vs 135 chars — and must never be mistaken for an improvement); the interstitial DOM never feeds pagination/link extraction either; rendering waits for the DOM to stabilize (content stops growing) instead of `networkidle` — heartbeat-polling sites never idle, so this avoids 30s timeouts; when not installed it degrades with a clear install hint, never errors — the core stays zero-dependency;
 - **Boundaries**: login-walled pages are not readable; SPA pages need the Playwright enhancement; **structured data (e.g. which like-count belongs to which comment) is out of text-extraction scope** — this plugin flattens HTML into readable text, so exact field↔value associations are lost; for precise fields, intercept the page's actual data API (see "Real-world validation" below).
 
-## Real-world validation (2026-08-21, v1.0.0)
+## Real-world validation (2026-08-21, v1.0.0; re-verified 2026-08-22 against DSH 0.1.1-rc.2)
 
 152-site sweep driven by `multi-site.mjs` (committed, re-runnable, 8-way concurrent): **115 OK / 17 expected boundaries (login-walls·captcha·short static pages) / 20 attributed network·anti-bot errors / 0 crashes** (final round with all pre-release fixes in; network-class errors vary ±5 between runs, all environment-attributed). Coverage: CN portals/media, e-commerce (JD/Taobao/Pinduoduo/Suning/Dangdang), video (Bilibili/iQiyi/Youku/Mango), music, games, novels (Qidian/Zongheng/JJWXC legacy GBK), Q&A/forums, government, universities (Tsinghua/PKU/Fudan/SJTU…), Traditional-Chinese TW/HK (PTT/LTN/UDN), JP/KR portals (Yahoo JP/Hatena/goo/naver/daum), overseas tech docs (GitHub/dev.to/react.dev/nodejs.org/rust/go/python), feeds, JSON APIs, encoding stress (GBK/GB2312/Big5/gb18030), anti-bot & network boundaries. All errors are environment-attributed (Wikipedia/Reddit/UDN connect-timeout; W3C/Tieba/NGA/StackOverflow 403; BUPT 412; DNS-fail…) — every one returned as a structured, correctly-attributed error, never a crash.
 
@@ -257,7 +258,7 @@ Plus a **15-item DSH acceptance round** (a real agent driving every read_url too
 | Batch + failure isolation | 4-URL mix | ✅ 2/4 ok, failures isolated |
 | Site crawl | Ruan Yifeng blog | ✅ 5/5 pages tree map |
 
-- **77 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard, schema budget, bare-main pick, worst-case timeout budgets, yml string coercion + clamping, strict-host seam degradation, UTF-16 BOM, Shift-JIS, density filter, pagination join/cap/disable, JSON render, RSS parse, sitemap rejection, 429 Retry-After retry, image alt, code-fence language, metadata, og:description fallback, double-escaped feed, headerless binary sniff, nested role=main, tiny-article fallback, unbalanced-tag degradation, byline fallback, challenge-page detection) + **12 SPA-test assertions** all green;
+- **79 zero-dep assertions** (incl. entity decoding, description-budget guard, link dedupe, table-separator escaping, proxy-fallback function, missing-args tolerance, race logic, empty-race guard, schema budget, bare-main pick, worst-case timeout budgets, yml string coercion + clamping, strict-host seam degradation, UTF-16 BOM, Shift-JIS, density filter, pagination join/cap/disable, JSON render, RSS parse, sitemap rejection, 429 Retry-After retry, image alt, code-fence language, metadata, og:description fallback, double-escaped feed, headerless binary sniff, nested role=main, tiny-article fallback, unbalanced-tag degradation, byline fallback, challenge-page detection, isConcurrencySafe declaration + concurrent cache-race smoke) + **12 SPA-test assertions** all green;
 - Real case: on a Xiaoheihe post, comment like-counts (`up` field) could not be attributed from flattened text — **precise fields should come from the page's underlying data API** (e.g. `/bbs/app/link/tree` JSON). This is a shared boundary of text extractors, not a defect.
 
 ## Roadmap
@@ -272,6 +273,7 @@ Plus a **15-item DSH acceptance round** (a real agent driving every read_url too
 - [x] Text-density fallback + metadata harvesting (v1.0.0)
 - [x] Bot-challenge defense (Cloudflare interstitial detection + auto-redirect wait + rejection, v1.0.0)
 - [x] Byline fallback for meta-less pages (author / published, v1.0.0)
+- [x] Parallel tool-call declaration (isConcurrencySafe; multi-source wall-clock time = slowest site, v1.1.0)
 
 > From v1.0.0 the plugin enters maintenance mode: bug fixes first, updates kept rare.
 
