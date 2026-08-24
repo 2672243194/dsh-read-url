@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.3.0] - 2026-08-24
+
+### 四项改进：NUL 防护 + JSON-LD 元数据 + base href + meta-refresh 跟随
+
+延续维护期原则：零运行时依赖、静态 schema 保 KV-cache（工具 schema 无任何变更）、fail-open 不报错。
+
+**修复（实体解码安全）**
+- **NUL/控制字符实体防护**：`decodeTextEntities` 原先对 `&#0;`（NUL）、`&#127;`（DEL）及 C1 控制区直接 `String.fromCodePoint`，控制字符会混入正文与模型上下文。新增 `fromSafeCodePoint`：C0/C1 中非空白控制字符（0–8、11–12、14–31、127–159）输出空格；`\t\n\r` 作为合法 HTML 空白实体保留（页面用 `&#10;` 表示换行，压成空格会破坏 markdown 段落结构）；surrogate 区（U+D800–DFFF）输出 U+FFFD，不再泄漏孤立代码单元。
+
+**功能补全**
+- **JSON-LD 元数据（jsonLdMeta）**：大量新闻/文章站的发布时间、作者只存在于 schema.org `<script type="application/ld+json">`。解析首个含 datePublished/author 的 JSON-LD 块（容忍损坏 JSON；支持 @graph、@type 数组、author 为字符串/对象/数组形态；块大小有界防恶意大 script）。合并链：**meta → JSON-LD → byline**——显式 `article:`/`og:` meta 日期保持权威；JSON-LD 的 datePublished 高于通用 `date`/`dc.date` meta（后者常是 last-modified 而非发布时间）。
+- **base href 链接解析（detectBaseHref）**：老论坛/框架页声明 `<base href>` 时，页面内相对链接按文档 URL 解析会落错主机。新增 `detectBaseHref(html, finalUrl)`（head 内第一个 base，属性序无关、协议相对按文档协议解析、空值忽略），`extractLinks` 与 `findNextLink` 统一使用——链接列表、分页跟随、整站爬虫三处同时受益。
+- **meta-refresh 跟随（metaRefreshTarget + 有界循环）**：`<meta http-equiv="refresh" content="0;url=...">` 壳页（链接跳板、反盗链中转、无 JS 的 SPA 入口）只返回跳板 HTML，正文在第二个 URL。新增纯函数 `metaRefreshTarget`（属性顺序无关、大小写不敏感、content 内引号剥离、相对目标按文档 URL 或 base href 解析、非 http(s) 拒绝、**只跟随立即跳转**——定时自刷新如 `content="30; url=..."` 是正常页面，不跟随）。插入点：dispatch 返回 HTML 之后、extract() 之前——先于 SPA 渲染判断，命中时省掉一次 playwright 全渲染。有界跟随最多 3 跳 + normalizeUrl seen-set 防循环；复用 fetchPage 直连/代理竞速路径；**fail-open**：跟随失败（网络错/非 HTML）保留原 HTML 继续静态提取，不报错；跟随后的页面不单独写全局缓存（调用方缓存键仍是原始 URL，壳页重请求会重新跟随）。输出 schema 不变，`finalUrl` 自然反映最终地址。
+
+**验证**
+- 单元断言 **88 → 114**（新增 26 条：控制字符实体 6、JSON-LD 5、metaRefreshTarget 纯函数 9、base href 链接 3、readUrl 集成跟随 4——含 2 跳链、循环终止、fail-open）+ 12 SPA 断言全绿；
+- probe.mjs 对抗探针全绿，性能无回归（新增路径全部线性）；
+- 实网：24 扩展站 **18/24 OK**（失败均境外连接超时/403 环境边界）；152 站回归 **93 OK / 24 THIN+EMPTY / 35 ERR / 0 THREW**，0 崩溃、0 内容性回归（ERR 全为境外超时与 403/412 反爬，与 v1.2.0 基线一致）；
+- taptap.cn 当前已上阿里云 WAF JS 验证页（非 meta-refresh 壳页），壳页场景由本地集成测试覆盖（标准/相对/2 跳/循环/fail-open）。
+
 ## [1.2.0] - 2026-08-22
 
 ### 修复三处隐患 + 进一步省 token

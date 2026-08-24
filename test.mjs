@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import * as m from './index.js'
 import { looksLikeSpa, looksLikeChallenge } from './spa.js'
-const { decodeBuffer, extract, smartTruncate, blockMd, inlineMd, decodeTextEntities, raceFirstSuccess } = m
+const { decodeBuffer, extract, smartTruncate, blockMd, inlineMd, decodeTextEntities, raceFirstSuccess, metaRefreshTarget, findNextLink } = m
 
 let passed = 0
 function ok(name, fn) {
@@ -1002,6 +1002,177 @@ ok('og:description with double-escaped tags yields clean text', () => {
   assert.ok(r.text.includes('导语摘要'), `description kept: ${r.text.slice(0, 60)}`)
   assert.ok(!r.text.includes('<b>'), `no literal tags: ${r.text.slice(0, 60)}`)
 })
+
+console.log('v1.3.0: control-char entities / JSON-LD / base href / meta-refresh')
+ok('&#0; and C0/C1 controls decode to space, not control chars', () => {
+  assert.equal(decodeTextEntities('a&#0;b'), 'a b')
+  assert.equal(decodeTextEntities('a&#127;b'), 'a b')
+  assert.equal(decodeTextEntities('a&#x1F;b'), 'a b')
+  assert.equal(decodeTextEntities('a&#x9F;b'), 'a b')
+  assert.equal(decodeTextEntities('a&#8;b'), 'a b')
+  assert.equal(decodeTextEntities('a&#14;b'), 'a b')
+})
+ok('\\t\\n\\r entities preserved as whitespace', () => {
+  assert.equal(decodeTextEntities('a&#9;b'), 'a\tb')
+  assert.equal(decodeTextEntities('a&#10;b'), 'a\nb')
+  assert.equal(decodeTextEntities('a&#13;b'), 'a\rb')
+})
+ok('lone surrogate entity decodes to U+FFFD', () => {
+  assert.equal(decodeTextEntities('a&#xD800;b'), 'a\uFFFDb')
+  assert.equal(decodeTextEntities('a&#55296;b'), 'a\uFFFDb')
+  assert.equal(decodeTextEntities('a&#xDFFF;b'), 'a\uFFFDb')
+})
+ok('extract: NUL entity never reaches body text', () => {
+  const r = extract('<html><body><article><p>正文&#0;内容</p></article></body></html>', 'text')
+  assert.ok(!r.text.includes('\u0000'), `no NUL in output: ${JSON.stringify(r.text)}`)
+  assert.ok(r.text.includes('正文 内容'), `control replaced with space: ${JSON.stringify(r.text)}`)
+})
+ok('extract: markdown mode keeps entity line breaks', () => {
+  const r = extract('<html><body><article><p>第一行&#10;第二行</p></article></body></html>', 'markdown')
+  assert.ok(r.text.includes('第一行\n第二行') || r.text.includes('第一行 第二行'), `md line structure: ${JSON.stringify(r.text)}`)
+})
+ok('json-ld datePublished/author harvested (object author)', () => {
+  const html = '<html><head><script type="application/ld+json">{"@context":"https://schema.org","@type":"NewsArticle","datePublished":"2026-08-24T10:30:00+08:00","author":{"@type":"Person","name":"张三"}}</script></head><body><article><p>正文内容段落。</p></article></body></html>'
+  const r = extract(html, 'text')
+  assert.ok(r.published.startsWith('2026-08-24'), `published: ${r.published}`)
+  assert.equal(r.author, '张三')
+})
+ok('json-ld @graph and string author handled', () => {
+  const html = '<html><head><script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"WebSite","name":"某站"},{"@type":"BlogPosting","datePublished":"2025-03-01","author":"李四"}]}</script></head><body><article><p>正文。</p></article></body></html>'
+  const r = extract(html, 'text')
+  assert.ok(r.published.startsWith('2025-03-01'), `published: ${r.published}`)
+  assert.equal(r.author, '李四')
+})
+ok('json-ld broken JSON tolerated, byline fallback still works', () => {
+  const html = '<html><head><script type="application/ld+json">{invalid json</script></head><body><article><p>作者：王五 日期：2026年1月2日 正文内容。</p></article></body></html>'
+  const r = extract(html, 'text')
+  assert.equal(r.author, '王五', `byline author: ${r.author}`)
+  assert.equal(r.published, '2026年1月2日')
+})
+ok('explicit article meta beats json-ld date', () => {
+  const html = '<html><head><meta property="article:published_time" content="2020-01-01T00:00:00Z"><script type="application/ld+json">{"@type":"NewsArticle","datePublished":"2026-08-24"}</script></head><body><article><p>正文。</p></article></body></html>'
+  const r = extract(html, 'text')
+  assert.ok(r.published.startsWith('2020-01-01'), `article meta wins: ${r.published}`)
+})
+ok('json-ld date beats generic meta date stamp', () => {
+  const html = '<html><head><meta name="date" content="2020-06-06"><script type="application/ld+json">{"@type":"Article","datePublished":"2026-08-24T09:00:00+08:00"}</script></head><body><article><p>正文。</p></article></body></html>'
+  const r = extract(html, 'text')
+  assert.ok(r.published.startsWith('2026-08-24'), `json-ld wins over generic date: ${r.published}`)
+})
+ok('metaRefreshTarget: standard 0;url=...', () => {
+  assert.equal(metaRefreshTarget('<meta http-equiv="refresh" content="0;url=https://a.com/x">', 'https://s.com/'), 'https://a.com/x')
+})
+ok('metaRefreshTarget: relative target resolved against document URL', () => {
+  assert.equal(metaRefreshTarget('<meta http-equiv="refresh" content="0; url=/real">', 'https://s.com/entry'), 'https://s.com/real')
+})
+ok('metaRefreshTarget: attribute order and case insensitive', () => {
+  assert.equal(metaRefreshTarget('<META CONTENT="0; url=https://a.com" HTTP-EQUIV="REFRESH">', 'https://s.com/'), 'https://a.com/')
+})
+ok('metaRefreshTarget: quoted url part', () => {
+  assert.equal(metaRefreshTarget(`<meta http-equiv="refresh" content="0;url='https://a.com/q'">`, 'https://s.com/'), 'https://a.com/q')
+})
+ok('metaRefreshTarget: bare timed refresh without url -> null', () => {
+  assert.equal(metaRefreshTarget('<meta http-equiv="refresh" content="5">', 'https://s.com/'), null)
+})
+ok('metaRefreshTarget: timed refresh with url -> null (keep the page)', () => {
+  assert.equal(metaRefreshTarget('<meta http-equiv="refresh" content="30; url=https://a.com">', 'https://s.com/'), null)
+})
+ok('metaRefreshTarget: javascript: refused', () => {
+  assert.equal(metaRefreshTarget('<meta http-equiv="refresh" content="0; url=javascript:alert(1)">', 'https://s.com/'), null)
+})
+ok('metaRefreshTarget: base href influences relative target', () => {
+  const html = '<head><base href="https://cdn.example.com/sub/"></head><meta http-equiv="refresh" content="0;url=go.html">'
+  assert.equal(metaRefreshTarget(html, 'https://s.com/entry'), 'https://cdn.example.com/sub/go.html')
+})
+ok('metaRefreshTarget: no refresh meta -> null', () => {
+  assert.equal(metaRefreshTarget('<html><body><p>plain</p></body></html>', 'https://s.com/'), null)
+})
+
+{
+  const http = await import('node:http')
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    if (req.url === '/base') res.end('<html><head><base href="http://127.0.0.1:18097/sub/"></head><body><article><p>框架页正文。</p></article><a href="page2.html">下一页</a></body></html>')
+    else if (req.url === '/nobase') res.end('<html><head></head><body><article><p>无 base 页正文。</p></article><a href="page2.html">下一页</a></body></html>')
+    else if (req.url === '/relbase') res.end('<html><head><base href="/sub/"></head><body><article><p>相对 base 正文。</p></article><a href="x.html">链接</a></body></html>')
+    else { res.statusCode = 404; res.end('<html><body>not found</body></html>') }
+  })
+  await new Promise((r) => server.listen(18097, r))
+  const base = 'http://127.0.0.1:18097'
+  {
+    const r = await m.readUrl({ url: `${base}/base`, includeLinks: true, maxChars: 2000 }, undefined, undefined, undefined)
+    assert.ok(!r.error, `base page read ok: ${JSON.stringify(r).slice(0, 80)}`)
+    const next = (r.links || []).find((l) => l.title.includes('下一页'))
+    assert.ok(next, `next link found: ${JSON.stringify(r.links)}`)
+    assert.equal(next.url, 'http://127.0.0.1:18097/sub/page2.html', `resolved against base href: ${next.url}`)
+    passed++
+    console.log('  ok - extractLinks resolves relative hrefs against base href')
+  }
+  {
+    const r = await m.readUrl({ url: `${base}/nobase`, includeLinks: true, maxChars: 2000 }, undefined, undefined, undefined)
+    const next = (r.links || []).find((l) => l.title.includes('下一页'))
+    assert.equal(next.url, `${base}/page2.html`, `no base -> document URL: ${next.url}`)
+    passed++
+    console.log('  ok - without base href links resolve against document URL')
+  }
+  {
+    const r = await m.readUrl({ url: `${base}/relbase`, includeLinks: true, maxChars: 2000 }, undefined, undefined, undefined)
+    const l = (r.links || []).find((x) => x.title.includes('链接'))
+    assert.equal(l.url, 'http://127.0.0.1:18097/sub/x.html', `relative base resolved against document host: ${l.url}`)
+    passed++
+    console.log('  ok - relative base href resolves against document host')
+  }
+  server.close()
+}
+
+{
+  const http = await import('node:http')
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    if (req.url === '/shell') res.end('<html><head><meta http-equiv="refresh" content="0;url=/real"></head><body>跳转中…</body></html>')
+    else if (req.url === '/real') res.end('<html><head><title>真实页</title></head><body><article><p>这是壳页后面的真实正文内容。</p></article></body></html>')
+    else if (req.url === '/hop1') res.end('<html><head><meta http-equiv="refresh" content="0; url=/hop2"></head><body>hop1</body></html>')
+    else if (req.url === '/hop2') res.end('<html><head><meta http-equiv="refresh" content="0;url=/real"></head><body>hop2</body></html>')
+    else if (req.url === '/loop') res.end('<html><head><meta http-equiv="refresh" content="0;url=/loop2"></head><body>loop1</body></html>')
+    else if (req.url === '/loop2') res.end('<html><head><meta http-equiv="refresh" content="0;url=/loop"></head><body>loop2</body></html>')
+    else if (req.url === '/deadend') res.end('<html><head><meta http-equiv="refresh" content="0;url=/missing404"></head><body>跳板页自身内容。</body></html>')
+    else { res.statusCode = 404; res.end('<html><body>not found</body></html>') }
+  })
+  await new Promise((r) => server.listen(18098, r))
+  const base = 'http://127.0.0.1:18098'
+  {
+    const r = await m.readUrl({ url: `${base}/shell`, maxChars: 2000 }, undefined, undefined, undefined)
+    assert.ok(!r.error, `no error: ${JSON.stringify(r).slice(0, 100)}`)
+    assert.equal(r.url, `${base}/real`, `finalUrl reflects target: ${r.url}`)
+    assert.ok(r.text.includes('真实正文'), `followed body: ${r.text.slice(0, 60)}`)
+    passed++
+    console.log('  ok - readUrl follows meta-refresh shell to real page')
+  }
+  {
+    const r = await m.readUrl({ url: `${base}/hop1`, maxChars: 2000 }, undefined, undefined, undefined)
+    assert.ok(!r.error)
+    assert.equal(r.url, `${base}/real`)
+    assert.ok(r.text.includes('真实正文'), '2-hop chain followed')
+    passed++
+    console.log('  ok - readUrl follows 2-hop meta-refresh chain')
+  }
+  {
+    const r = await m.readUrl({ url: `${base}/loop`, maxChars: 2000 }, undefined, undefined, undefined)
+    assert.ok(!r.error, `loop terminates without error: ${JSON.stringify(r).slice(0, 80)}`)
+    assert.ok(r.url === `${base}/loop` || r.url === `${base}/loop2`, `bounded url: ${r.url}`)
+    passed++
+    console.log('  ok - meta-refresh loop terminates (bounded)')
+  }
+  {
+    // fail-open: a 404 target keeps the shell's own HTML and does not error.
+    const r = await m.readUrl({ url: `${base}/deadend`, maxChars: 2000 }, undefined, undefined, undefined)
+    assert.ok(!r.error, `fail-open no error: ${JSON.stringify(r).slice(0, 100)}`)
+    assert.ok(r.text.includes('跳板页自身内容'), `shell text kept: ${r.text.slice(0, 60)}`)
+    passed++
+    console.log('  ok - meta-refresh follow fails open (shell text kept)')
+  }
+  server.close()
+}
 
 console.log(`\n${passed} assertions passed`)
 // All assertions are synchronous or top-level awaited; reaching here means every

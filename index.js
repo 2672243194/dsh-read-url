@@ -285,16 +285,29 @@ const ENTITIES = {
   permil: '‰', euro: '€', pound: '£', yen: '¥', cent: '¢',
   sup2: '²', sup3: '³', frac12: '½', frac14: '¼', frac34: '¾',
 }
+// &#0; / &#127; / &#x1F; decode to control characters that pollute the model
+// context (NUL, DEL, C1 controls). Map non-whitespace controls to a space;
+// keep \t\n\r — pages legitimately use &#10; for line breaks, and flattening
+// those to spaces would destroy paragraph structure in markdown mode. Lone
+// surrogates (U+D800–DFFF) decode to replacement chars instead of leaking a
+// broken code unit into the rendered text.
+function fromSafeCodePoint(c) {
+  if (c < 0x20) return (c === 9 || c === 10 || c === 13) ? String.fromCodePoint(c) : ' '
+  if (c >= 0x7f && c <= 0x9f) return ' '
+  if (c >= 0xd800 && c <= 0xdfff) return '\uFFFD'
+  return String.fromCodePoint(c)
+}
+
 export function decodeTextEntities(text) {
   if (!text.includes('&')) return text
   return text.replace(/&(?:#(\d+)|#x([0-9a-fA-F]+)|([a-z][a-z0-9]{1,7}));?/gi, (m, dec, hex, name) => {
     if (dec !== undefined) {
       const c = Number(dec)
-      return c > 0x10ffff ? m : String.fromCodePoint(c)
+      return c > 0x10ffff ? m : fromSafeCodePoint(c)
     }
     if (hex !== undefined) {
       const c = Number.parseInt(hex, 16)
-      return c > 0x10ffff ? m : String.fromCodePoint(c)
+      return c > 0x10ffff ? m : fromSafeCodePoint(c)
     }
     const n = (name || '').toLowerCase()
     return Object.prototype.hasOwnProperty.call(ENTITIES, n) ? ENTITIES[n] : m
@@ -667,20 +680,73 @@ export function blockMd(html, depth = 0) {
 }
 
 // Page-level metadata the model actually asks about (who wrote it, when) —
-// cheap to harvest from <meta>.
+// cheap to harvest from <meta>. publishedExplicit records whether the date
+// came from a semantic article/og key (authoritative) or a generic date/dc.date
+// stamp (often last-modified, weaker than a JSON-LD datePublished).
 function extractMeta(html) {
-  const get = (names) => {
+  const getKey = (names) => {
     for (const n of names) {
       const m = new RegExp(`<meta[^>]{1,1000}(?:property|name)=["']${n}["'][^>]{1,1000}content=["']([^"']+)["']`, 'i').exec(html)
-      if (m) return decodeTextEntities(m[1]).replace(/<[^>]{1,1000}>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80)
+      if (m) {
+        return {
+          v: decodeTextEntities(m[1]).replace(/<[^>]{1,1000}>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80),
+          key: n,
+        }
+      }
     }
+    return { v: '', key: '' }
+  }
+  const p = getKey(['article:published_time', 'og:published_time', 'pubdate', 'publishdate', 'date', 'dc.date'])
+  const a = getKey(['author', 'article:author', 'og:article:author'])
+  const d = getKey(['og:description', 'description'])
+  return {
+    published: p.v,
+    publishedExplicit: /^(article|og):/i.test(p.key),
+    author: a.v,
+    description: d.v,
+  }
+}
+
+// schema.org JSON-LD blocks carry publication metadata (datePublished/author)
+// many news sites put nowhere else — <meta> covers only a subset and the
+// byline regex cannot see ISO-8601 timestamps. Parse the first ld+json block
+// that yields either field; tolerate broken JSON and every structural shape
+// (plain object, @type arrays, @graph graphs, author as string/object/array).
+// Bounded block size keeps a hostile giant script tag from dragging the scan.
+const LDJSON_RE = /<script[^>]{0,1000}type=["']application\/ld\+json["'][^>]{0,1000}>([\s\S]{0,20000}?)<\/script\s*>/gi
+function jsonLdMeta(html) {
+  const collect = (node, out) => {
+    if (!node || typeof node !== 'object') return
+    if (Array.isArray(node)) {
+      for (const it of node) collect(it, out)
+      return
+    }
+    out.push(node)
+    if (Array.isArray(node['@graph'])) for (const it of node['@graph']) collect(it, out)
+  }
+  const authorOf = (a) => {
+    if (typeof a === 'string') return a
+    if (Array.isArray(a)) return authorOf(a[0])
+    if (a && typeof a === 'object') return typeof a.name === 'string' ? a.name : authorOf(a.name)
     return ''
   }
-  return {
-    published: get(['article:published_time', 'og:published_time', 'pubdate', 'publishdate', 'date', 'dc.date']),
-    author: get(['author', 'article:author', 'og:article:author']),
-    description: get(['og:description', 'description']),
+  const clean = (s) => (s ? decodeTextEntities(s).slice(0, 40) : '')
+  for (const m of html.matchAll(LDJSON_RE)) {
+    let json
+    try {
+      json = JSON.parse(m[1])
+    } catch {
+      continue
+    }
+    const nodes = []
+    collect(json, nodes)
+    for (const n of nodes) {
+      const published = clean(typeof n.datePublished === 'string' ? n.datePublished : '')
+      const author = clean(authorOf(n.author))
+      if (published || author) return { published, author }
+    }
   }
+  return { published: '', author: '' }
 }
 
 // Meta-less pages still print the byline inside the body head: "作者：阮一峰
@@ -717,6 +783,14 @@ export function extract(html, mode) {
     bodyText = textOnly(main).replace(/ +/g, ' ').trim()
   }
   const meta = extractMeta(html)
+  const ld = jsonLdMeta(html)
+  // Merge chain: <meta> → JSON-LD → byline. An explicit article:/og: meta date
+  // stays authoritative; otherwise a JSON-LD datePublished beats the generic
+  // date meta key (last-modified stamps are not publication times).
+  const published = ld.published
+    ? (meta.publishedExplicit ? meta.published : ld.published)
+    : meta.published
+  const author = ld.author || meta.author
   // Empty-body pages (login walls, JS-only shells) still carry og:description
   // — surface it as a fallback hint instead of nothing.
   let text = bodyText
@@ -725,7 +799,7 @@ export function extract(html, mode) {
     text = meta.description
     usedDescription = true
   }
-  const byline = bylineFallback(text, meta)
+  const byline = bylineFallback(text, { published, author })
   return {
     title: titleMatch ? textOnly(titleMatch[1]) || titleMatch[1].trim() : '',
     siteName: siteName ? siteName[1] : '',
@@ -807,11 +881,34 @@ export function smartTruncate(text, maxChars, offset = 0) {
   }
 }
 
+// <base href> overrides the document base for relative URL resolution (old
+// forums / frame sites). Per HTML spec only the FIRST <base> in <head> counts;
+// attribute order is arbitrary and the href may be protocol-relative. Empty
+// href (= document URL) is a no-op; non-http(s) targets are rejected. The
+// head scan is bounded — the tag cannot legally appear beyond it.
+function detectBaseHref(html, finalUrl) {
+  const headEnd = html.search(/<\/head\s*>/i)
+  const head = headEnd >= 0 ? html.slice(0, headEnd) : html.slice(0, 16384)
+  const base = /<base\b[^>]{0,1000}href=["']([^"']+)["'][^>]{0,1000}>/i.exec(head)
+  if (!base) return finalUrl
+  const href = base[1].trim()
+  if (!href) return finalUrl
+  try {
+    const u = new URL(href, finalUrl)
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : finalUrl
+  } catch {
+    return finalUrl
+  }
+}
+
 function extractLinks(html, limit, baseUrl) {
   const links = []
   const seen = new Set()
   // Accept relative hrefs too — most real pages link internally with relative
   // paths — and resolve them against the page URL so the model can follow them.
+  // A declared <base href> wins over the document URL (frame-site links would
+  // otherwise land on the wrong host).
+  const linkBase = detectBaseHref(html, baseUrl)
   const re = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi
   let m
   // Iteration cap: a page whose nav repeats the same links thousands of times
@@ -824,7 +921,7 @@ function extractLinks(html, limit, baseUrl) {
     if (!href || /^(javascript|mailto|tel|data):/i.test(href)) continue
     let url
     try {
-      url = baseUrl ? new URL(href, baseUrl).href : new URL(href).href
+      url = linkBase ? new URL(href, linkBase).href : new URL(href).href
     } catch {
       continue
     }
@@ -858,9 +955,12 @@ function hostOf(url) {
 const NEXT_TEXT_RE = /^(?:[›»>]+\s*)?(?:下一页|下页|下一篇|下一頁|下頁|后一页|後一頁|next page|next|older entries|[›»>]{1,3})(?:\s*[›»>]+)?$/i
 
 export function findNextLink(html, baseUrl) {
+  // Same <base href> rule as extractLinks: frame/forum sites pin their
+  // document base, and a "next page" link resolves against it.
+  const base = detectBaseHref(html || '', baseUrl)
   const resolve = (href) => {
     try {
-      const u = new URL(href, baseUrl)
+      const u = new URL(href, base)
       return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null
     } catch {
       return null
@@ -956,6 +1056,71 @@ export function compactJson(value) {
   }
 }
 
+// ---- meta-refresh shells: follow to the real page ----
+// <meta http-equiv="refresh" content="0; url=..."> stubs (link hops,
+// anti-hotlink relays, no-JS SPA entries) serve only a jump page — the body
+// lives at the target. Parse the FIRST matching <meta>; attribute order and
+// case are arbitrary, content quotes are stripped, a protocol-relative target
+// resolves against the document (or <base href>). Only IMMEDIATE redirects
+// are followed: a timed auto-refresh (content="30; url=…") is a normal page
+// with content, not a shell. A bare timed refresh with no url part reloads
+// the same page — null. Non-http(s) targets are refused.
+export function metaRefreshTarget(html, baseUrl) {
+  // Locate the refresh <meta> tag first (any attribute order / case), then
+  // read content from inside that tag — a forward regex would demand
+  // http-equiv before content and miss the reversed order.
+  const re = /<meta\b[^>]{0,1000}(?:http-equiv|name)=["']refresh["'][^>]{0,1000}>/gi
+  let m
+  while ((m = re.exec(html || ''))) {
+    const tag = m[0]
+    const contentM = /content=("([^"]*)"|'([^']*)')/i.exec(tag)
+    if (!contentM) continue // a refresh meta without content is inert
+    const content = (contentM[2] || contentM[3] || '').trim()
+    // content="5" | content="0; url=http://…" | content=";url='…'" — the url
+    // part may be single/double quoted or bare; "url=" must be a real token.
+    const urlM = /\burl\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s;]+))/i.exec(content)
+    if (!urlM) return null
+    const delayM = /^\s*(\d+(?:\.\d+)?)/.exec(content)
+    if (delayM && Number(delayM[1]) > 0) return null // timed refresh: keep the page
+    const target = (urlM[1] || urlM[2] || urlM[3] || '').trim()
+    if (!target) return null
+    try {
+      const u = new URL(target, detectBaseHref(html || '', baseUrl))
+      return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+// Bounded following: at most 3 hops, deduped by normalized URL. Any fetch
+// problem (network error, non-HTML body) FAILS OPEN — the shell's own HTML
+// is kept for static extraction instead of erroring the call. Followed pages
+// are never written to the session cache under their own URL: the caller's
+// cache key is the ORIGINAL url, and a shell re-request should re-follow
+// rather than serve a foreign page.
+const MAX_META_REFRESH_HOPS = 3
+async function followMetaRefresh(html, finalUrl, externalSignal, cfg) {
+  let cur = html
+  let curUrl = finalUrl
+  const seen = new Set([normalizeUrl(finalUrl)])
+  for (let i = 0; i < MAX_META_REFRESH_HOPS; i++) {
+    const target = metaRefreshTarget(cur, curUrl)
+    if (!target) break
+    const norm = normalizeUrl(target)
+    if (!norm || seen.has(norm)) break
+    seen.add(norm)
+    const page = await fetchPage(target, externalSignal, cfg)
+    if (page.error) break
+    const ct = (page.contentType || '').split(';')[0].toLowerCase().trim()
+    if (!/html|xhtml/.test(ct)) break
+    cur = decodeBuffer(page.buffer, page.contentType).text
+    curUrl = page.finalUrl || target
+  }
+  return { html: cur, finalUrl: curUrl }
+}
+
 export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   const url = String((args && args.url) || '').trim()
   if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
@@ -1049,6 +1214,14 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   let html = payload.html
   let finalUrl = payload.finalUrl || url
   const charset = payload.charset
+
+  // meta-refresh shells (link hops, anti-hotlink relays, no-JS SPA entries):
+  // follow immediately, BEFORE extraction and SPA rendering — a shell that
+  // redirects needs no headless round-trip, and extracting the stub is wasted
+  // work. Fails open on any fetch problem; the follow is hop-bounded.
+  const followed = await followMetaRefresh(html, finalUrl, externalSignal, cfg)
+  html = followed.html
+  finalUrl = followed.finalUrl
 
   let extracted = extract(html, mode)
   // Optional readability upgrade: cleaner article extraction when installed.
