@@ -20,7 +20,22 @@
 - 实网：24 扩展站 **18/24 OK**（失败均境外连接超时/403 环境边界）；152 站回归 **93 OK / 24 THIN+EMPTY / 35 ERR / 0 THREW**，0 崩溃、0 内容性回归（ERR 全为境外超时与 403/412 反爬，与 v1.2.0 基线一致）；
 - taptap.cn 当前已上阿里云 WAF JS 验证页（非 meta-refresh 壳页），壳页场景由本地集成测试覆盖（标准/相对/2 跳/循环/fail-open）。
 
-## [1.2.0] - 2026-08-22
+### 同日第二轮：健壮性审查（6 处修复 + JSON-LD 嵌套递归缺陷）
+
+静态通读 + 新测试驱动的健壮性审查：
+
+**修复**
+- **extractLinks / findNextLink 正则加界**：锚点属性 `[^>]+`/`[^>]*` 无界——超长属性（或无 `>`）的 `<a` 会让每个锚点位置扫描到串尾，与 v1.2.0「属性扫描统一加 {0,1000} 界」原则不一致。统一改为 `[^>]{0,1000}`，与全项目对抗性防御对齐；超长属性链接被安全跳过，正常链接不受影响（实测 300KB 属性 5–10ms）
+- **meta 属性提取顺序无关（metaContent 两段式）**：`extractMeta` / og:title / og:site_name 原为「property/name 必须在 content 之前」的单段正则——content 在前（`<meta content="..." property="...">`）的真实页面提取为空。改为先定位标签再读 content，与 metaRefreshTarget 同手法；content 值内嵌引号（`他说'你好'`）不再截断
+- **JSON-LD 嵌套结构（新测试抓出）**：原 collect 只展开数组与 @graph，`ItemList → mainEntity → Article`、`WebPage → mainEntityOfPage` 等嵌套结构的 datePublished/author 全部漏掉。改为递归展开全部对象属性（深度帽 20 防恶意嵌套）
+- **charset 嗅探补老式写法**：`<meta http-equiv="Content-Type" content="text/html; charset=gb2312">`（无 charset 属性、HTTP 头无 charset 的 legacy GBK 页）原先识别不到。sniffCharset 增加 http-equiv 分支
+- **JSON-LD 块上限 20k → 100k**：真实新闻站的 article-list JSON-LD 常超 20k，元数据随之丢失。上限放宽（防御性有界不变，元数据在块首节点，扫描成本可控）
+- **markdown 链接括号转义**：`[inner](url)` 的 URL 含 `)`（wiki/框架页常见）会提前终止 markdown 链接。href 中 `(` `)` 百分号编码为 `%28`/`%29`
+- **爬虫噪音扩展**：NOISE_EXT 增加 `m3u8|m3u|mpd|flv|ts`（流媒体 URL 不再进爬虫队列）
+
+**验证**
+- 单元断言 **114 → 123**（新增 9 条：meta 属性序颠倒 2、content 引号 1、og 顺序 1、http-equiv charset 1、JSON-LD 大块 1、嵌套 mainEntity 1、markdown 括号 1、爬虫 m3u8 噪音 + 超长属性限时 2）+ 12 SPA 断言全绿；
+- probe.mjs 全绿，无性能回归；## [1.2.0] - 2026-08-22
 
 ### 修复三处隐患 + 进一步省 token
 

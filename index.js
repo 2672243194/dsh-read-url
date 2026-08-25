@@ -74,8 +74,12 @@ function sniffCharset(buffer, contentType) {
   const m = /charset=["']?([\w-]+)/i.exec(contentType || '')
   if (m) return m[1]
   const head = buffer.subarray(0, 2048).toString('latin1').toLowerCase()
-  const meta = /<meta[^>]+charset=["']?([\w-]+)/i.exec(head)
+  const meta = /<meta[^>]{0,1000}charset=["']?([\w-]+)/i.exec(head)
   if (meta) return meta[1]
+  // Legacy form: <meta http-equiv="Content-Type" content="text/html; charset=gb2312">
+  // (no charset= attribute anywhere) — common on old GBK pages with no header charset.
+  const metaEquiv = /<meta[^>]{0,1000}(?:http-equiv)=["']content-type["'][^>]{0,1000}content=["'][^"']*charset=([\w-]+)/i.exec(head)
+  if (metaEquiv) return metaEquiv[1]
   return null
 }
 
@@ -575,7 +579,10 @@ export function inlineMd(html, depth = 0) {
     const inner = inlineMd(m[3], depth + 1)
     if (tag === 'a') {
       const href = /href=["']([^"']+)["']/i.exec(m[2])
-      out += href ? `[${inner}](${href[1]})` : inner
+      // A raw ')' in the target would terminate the markdown link early
+      // (common on wiki/framework URLs) — percent-encode parens to keep the
+      // link parseable by the model.
+      out += href ? `[${inner}](${href[1].replace(/\)/g, '%29').replace(/\(/g, '%28')})` : inner
     } else if (tag === 'strong' || tag === 'b') out += `**${inner}**`
     else if (tag === 'em' || tag === 'i') out += `*${inner}*`
     else if (tag === 'code') out += `\`${inner}\``
@@ -679,6 +686,17 @@ export function blockMd(html, depth = 0) {
   return img.restore(out)
 }
 
+// Read the content attribute of the FIRST <meta> whose property/name equals
+// `key`. Attribute order is arbitrary (content may precede property/name), and
+// the content value may itself contain quotes — locate the tag first, then
+// read content from inside it with a backreference pair.
+function metaContent(html, key) {
+  const tagM = new RegExp(`<meta\\b[^>]{0,1000}(?:property|name)=["']${key}["'][^>]{0,1000}>`, 'i').exec(html)
+  if (!tagM) return ''
+  const m = /content=("([^"]*)"|'([^']*)')/i.exec(tagM[0])
+  return m ? (m[2] || m[3] || '') : ''
+}
+
 // Page-level metadata the model actually asks about (who wrote it, when) —
 // cheap to harvest from <meta>. publishedExplicit records whether the date
 // came from a semantic article/og key (authoritative) or a generic date/dc.date
@@ -686,10 +704,10 @@ export function blockMd(html, depth = 0) {
 function extractMeta(html) {
   const getKey = (names) => {
     for (const n of names) {
-      const m = new RegExp(`<meta[^>]{1,1000}(?:property|name)=["']${n}["'][^>]{1,1000}content=["']([^"']+)["']`, 'i').exec(html)
-      if (m) {
+      const v = metaContent(html, n)
+      if (v) {
         return {
-          v: decodeTextEntities(m[1]).replace(/<[^>]{1,1000}>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80),
+          v: decodeTextEntities(v).replace(/<[^>]{1,1000}>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80),
           key: n,
         }
       }
@@ -713,16 +731,27 @@ function extractMeta(html) {
 // that yields either field; tolerate broken JSON and every structural shape
 // (plain object, @type arrays, @graph graphs, author as string/object/array).
 // Bounded block size keeps a hostile giant script tag from dragging the scan.
-const LDJSON_RE = /<script[^>]{0,1000}type=["']application\/ld\+json["'][^>]{0,1000}>([\s\S]{0,20000}?)<\/script\s*>/gi
+// 100k covers real article-list JSON-LD (news sites often embed dozens of
+// items); metadata sits in the first node anyway.
+const LDJSON_RE = /<script[^>]{0,1000}type=["']application\/ld\+json["'][^>]{0,1000}>([\s\S]{0,100000}?)<\/script\s*>/gi
 function jsonLdMeta(html) {
-  const collect = (node, out) => {
-    if (!node || typeof node !== 'object') return
+  // Recursively collect every node: nested structures are common (ItemList →
+  // mainEntity → Article, WebPage → mainEntityOfPage), so a flat top-level
+  // scan alone misses most real payloads. Depth-capped against hostile
+  // nesting; arrays, @graph and plain object properties are all expanded.
+  const collect = (node, out, depth = 0) => {
+    if (!node || typeof node !== 'object' || depth > 20) return
     if (Array.isArray(node)) {
-      for (const it of node) collect(it, out)
+      for (const it of node) collect(it, out, depth + 1)
       return
     }
     out.push(node)
-    if (Array.isArray(node['@graph'])) for (const it of node['@graph']) collect(it, out)
+    if (Array.isArray(node['@graph'])) for (const it of node['@graph']) collect(it, out, depth + 1)
+    for (const k of Object.keys(node)) {
+      if (k === '@graph') continue
+      const v = node[k]
+      if (v && typeof v === 'object') collect(v, out, depth + 1)
+    }
   }
   const authorOf = (a) => {
     if (typeof a === 'string') return a
@@ -771,8 +800,9 @@ function bylineFallback(text, meta) {
 
 export function extract(html, mode) {
   html = defuseLt(html) // kills the no-'>'-tail quadratic scans before any picker runs
-  const titleMatch = /<title[^>]{0,1000}>([\s\S]*?)<\/title>/i.exec(html) || /<meta[^>]{1,1000}property=["']og:title["'][^>]{1,1000}content=["']([^"']+)["']/i.exec(html)
-  const siteName = /<meta[^>]{1,1000}property=["']og:site_name["'][^>]{1,1000}content=["']([^"']+)["']/i.exec(html)
+  const titleTag = /<title[^>]{0,1000}>([\s\S]*?)<\/title>/i.exec(html)
+  const ogTitle = metaContent(html, 'og:title')
+  const siteName = metaContent(html, 'og:site_name')
   const langMatch = /<html[^>]{1,1000}lang=["']([\w-]+)["']/i.exec(html)
   let main = stripNoise(pickMain(html))
   main = stripNoise(revealEscapedTags(main))
@@ -801,8 +831,8 @@ export function extract(html, mode) {
   }
   const byline = bylineFallback(text, { published, author })
   return {
-    title: titleMatch ? textOnly(titleMatch[1]) || titleMatch[1].trim() : '',
-    siteName: siteName ? siteName[1] : '',
+    title: titleTag ? textOnly(titleTag[1]) || titleTag[1].trim() : ogTitle,
+    siteName,
     lang: langMatch ? langMatch[1] : '',
     published: byline.published,
     author: byline.author,
@@ -909,7 +939,10 @@ function extractLinks(html, limit, baseUrl) {
   // A declared <base href> wins over the document URL (frame-site links would
   // otherwise land on the wrong host).
   const linkBase = detectBaseHref(html, baseUrl)
-  const re = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi
+  // Attribute runs bounded: an unclosed <a whose '>' is far away (or missing)
+  // must not make the regex scan the rest of the string at every anchor
+  // position. Real attributes never approach 1000 chars.
+  const re = /<a\b[^>]{0,1000}href=["']([^"']+)["'][^>]{0,1000}>([\s\S]*?)<\/a\s*>/gi
   let m
   // Iteration cap: a page whose nav repeats the same links thousands of times
   // would otherwise scan the whole HTML to fill `limit` unique entries. Scan
@@ -966,13 +999,13 @@ export function findNextLink(html, baseUrl) {
       return null
     }
   }
-  const rel = /<(?:link|a)\b[^>]+rel=["']next["'][^>]*>/i.exec(html || '')
+  const rel = /<(?:link|a)\b[^>]{0,1000}rel=["']next["'][^>]{0,1000}>/i.exec(html || '')
   if (rel) {
     const href = /href=["']([^"']+)["']/i.exec(rel[0])
     const r = href && resolve(href[1])
     if (r) return r
   }
-  const re = /<a\b[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a\s*>/gi
+  const re = /<a\b[^>]{0,1000}href=["']([^"']+)["'][^>]{0,1000}>([\s\S]*?)<\/a\s*>/gi
   let m
   let scans = 0
   // Bounded like extractLinks: a nav bar with thousands of anchors must not
@@ -1585,7 +1618,7 @@ function sameHost(a, b) {
 }
 
 // URLs not worth crawling: static assets, login/auth paths, feeds, sitemaps.
-const NOISE_EXT = /\.(png|jpe?g|gif|svg|webp|ico|bmp|css|js|json|xml|pdf|zip|gz|tar|7z|mp3|mp4|avi|mov|webm|woff2?|ttf|eot|map)(\?|#|$)/i
+const NOISE_EXT = /\.(png|jpe?g|gif|svg|webp|ico|bmp|css|js|json|xml|pdf|zip|gz|tar|7z|mp3|m3u8?|mpd|flv|ts|mp4|avi|mov|webm|woff2?|ttf|eot|map)(\?|#|$)/i
 const NOISE_PATH = /(\/login|\/signin|\/register|\/logout|\/signup|\/api\/|\/admin|\/wp-admin|\/wp-login|\/feed|\/rss|\/sitemap|\/robots\.txt|\/cdn-cgi)/i
 function isNoiseUrl(url) {
   return NOISE_EXT.test(url) || NOISE_PATH.test(url)

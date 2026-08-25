@@ -258,7 +258,7 @@ const results = await Promise.all([
 | **批量 + 失败隔离** | 4 URL 混合 | ✅ 2/4 成功、失败隔离 |
 | **整站爬取** | 阮一峰博客 | ✅ 5/5 页树状站点地图 |
 
-- **114 个单元断言**（v1.3.0 新增：控制字符实体防护、JSON-LD 元数据、base href 链接、meta-refresh 跟随 11 条；v1.2.0 新增：长段落句级对齐、紧凑 JSON、分页变体、对抗输入限时、散文 &lt; 保留、深 JSON 降级）（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级、UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 Retry-After 重试、图片 alt、代码语言、元数据、og:description 回落、双转义 feed、无头二进制嗅探、嵌套 role=main、薄 article 回落、不平衡标签降级、byline 兜底、人机验证页识别、isConcurrencySafe 声明 + 并发缓存竞态烟雾）+ **12 个 SPA 测试断言**全绿；
+- **123 个单元断言**（v1.3.1 健壮性轮新增：meta 属性序颠倒、content 内嵌引号、http-equiv charset、JSON-LD 大块/嵌套 mainEntity、markdown 括号转义、m3u8 噪音、超长属性限时；v1.3.0 新增：控制字符实体防护、JSON-LD 元数据、base href 链接、meta-refresh 跟随 11 条；v1.2.0 新增：长段落句级对齐、紧凑 JSON、分页变体、对抗输入限时、散文 &lt; 保留、深 JSON 降级）（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级、UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 Retry-After 重试、图片 alt、代码语言、元数据、og:description 回落、双转义 feed、无头二进制嗅探、嵌套 role=main、薄 article 回落、不平衡标签降级、byline 兜底、人机验证页识别、isConcurrencySafe 声明 + 并发缓存竞态烟雾）+ **12 个 SPA 测试断言**全绿；
 - 一个真实案例：小黑盒帖子的评论点赞数（`up` 字段）无法从扁平文本确定归属——**精确字段应走页面背后的数据 API**（如 `/bbs/app/link/tree` JSON），这是同类文本提取器的共同边界，不是缺陷。
 
 ## Roadmap
@@ -277,6 +277,7 @@ const results = await Promise.all([
 - [x] 失败缓存独立（不再挤占成功缓存名额）、race 错误按 label 归因、长段落句级对齐截断、JSON 完全紧凑渲染 + 长值截断（约省 21%）、状态行合并、分页箭头变体（v1.2.0）
 - [x] 对抗页面线性化（无配对尖括号/无闭合标签/属性扫描加界 + 递归深度帽，修复 60KB→2.2s 的二次复杂度 DoS 向量）、散文 &lt; 不再被吞、代理重定向保留最终 URL、深 JSON 降级不崩溃（v1.2.0 第二轮）
 - [x] NUL/控制字符实体防护（`&#0;`/`&#127;` 输出空格、surrogate 输出 U+FFFD，不污染模型上下文）、JSON-LD 元数据三级提取（meta → JSON-LD → byline）、`<base href>` 链接解析（框架/老论坛页）、`<meta refresh>` 壳页自动跟随（最多 3 跳、防循环、fail-open，v1.3.0）
+- [x] 健壮性轮：meta 属性序无关提取（content 在前不再漏）、JSON-LD 嵌套结构递归（ItemList→mainEntity）、`<meta http-equiv="Content-Type">` 老式 charset、链接/分页正则统一加界、markdown 括号转义、爬虫流媒体噪音过滤（v1.3.1）
 
 > v1.0.0 起进入维护期：以修 bug 为主，减少更新频率。
 

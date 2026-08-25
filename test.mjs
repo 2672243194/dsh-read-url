@@ -1174,6 +1174,94 @@ ok('metaRefreshTarget: no refresh meta -> null', () => {
   server.close()
 }
 
+console.log('v1.3.1: robustness (meta attr order / charset equiv / json-ld size / markdown parens / crawl noise)')
+ok('extractMeta: content before property/name (attribute order insensitive)', () => {
+  const html = '<html><head><meta content="2025-05-05" property="article:published_time"><meta content="作者甲" name="author"></head><body><article><p>正文。</p></article></body></html>'
+  const r = extract(html, 'text')
+  assert.equal(r.published, '2025-05-05', `published: ${r.published}`)
+  assert.equal(r.author, '作者甲')
+})
+ok('extractMeta: content value containing single quotes (description fallback)', () => {
+  const html = `<html><head><meta property="og:description" content="他说'你好'，这是摘要。"></head><body><div id="app"></div></body></html>`
+  const r = extract(html, 'text')
+  assert.ok(r.text.includes("他说'你好'"), `quoted content kept: ${JSON.stringify(r.text)}`)
+})
+ok('og:title / site_name attribute order insensitive', () => {
+  const html = '<html><head><meta content="颠倒站" property="og:site_name"><meta content="颠倒标题" property="og:title"></head><body><article><p>正文。</p></article></body></html>'
+  const r = extract(html, 'text')
+  assert.equal(r.siteName, '颠倒站')
+  assert.equal(r.title, '颠倒标题')
+})
+ok('decodeBuffer: legacy meta http-equiv Content-Type charset', () => {
+  const gbkHello = Buffer.from([0xc4, 0xe3, 0xba, 0xc3]) // 你好 in GBK
+  const buf = Buffer.concat([
+    Buffer.from('<html><head><meta http-equiv="Content-Type" content="text/html; charset=gb2312"></head><body><p>', 'utf8'),
+    gbkHello,
+    Buffer.from('</p></body></html>', 'utf8'),
+  ])
+  const { text, charset } = decodeBuffer(buf, '')
+  assert.equal(charset, 'gbk', `charset: ${charset}`)
+  assert.ok(text.includes('你好'), `decoded: ${text.slice(0, 80)}`)
+})
+ok('json-ld block larger than 20k chars still harvested', () => {
+  const filler = JSON.stringify(Array.from({ length: 400 }, (_, i) => ({ '@type': 'ListItem', position: i + 1, name: `item ${i} with a longer descriptive payload` })))
+  const html = `<html><head><script type="application/ld+json">{"@context":"https://schema.org","@type":"ItemList","itemListElement":${filler},"mainEntity":{"@type":"Article","datePublished":"2026-08-25","author":{"@type":"Person","name":"大块作者"}}}</script></head><body><article><p>正文。</p></article></body></html>`
+  assert.ok(html.length > 20000, `block is large: ${html.length}`)
+  const r = extract(html, 'text')
+  assert.ok(r.published.startsWith('2026-08-25'), `published: ${r.published}`)
+  assert.equal(r.author, '大块作者')
+})
+ok('json-ld nested mainEntity (ItemList → mainEntity → Article)', () => {
+  const html = '<html><head><script type="application/ld+json">{"@context":"https://schema.org","@type":"ItemList","itemListElement":[{"@type":"ListItem","position":1,"name":"x"}],"mainEntity":{"@type":"Article","datePublished":"2026-07-01","author":{"@type":"Person","name":"嵌套作者"}}}</script></head><body><article><p>正文。</p></article></body></html>'
+  const r = extract(html, 'text')
+  assert.ok(r.published.startsWith('2026-07-01'), `published: ${r.published}`)
+  assert.equal(r.author, '嵌套作者')
+})
+ok('markdown link href parens percent-encoded', () => {
+  const md = blockMd('<p><a href="https://en.wikipedia.org/wiki/Foo_(bar)">Foo</a></p>')
+  assert.ok(md.includes('[Foo](https://en.wikipedia.org/wiki/Foo_%28bar%29)'), `md: ${md}`)
+})
+
+{
+  const http = await import('node:http')
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    if (req.url === '/stream') res.end('<html><head><title>流页</title></head><body><article><p>页面正文。</p></article><a href="/stream.m3u8">直播流</a> <a href="/page2.html">下一页</a></body></html>')
+    else if (req.url === '/page2.html') res.end('<html><head><title>第二页</title></head><body><article><p>第二页正文。</p></article></body></html>')
+    else if (req.url === '/bigattr') res.end('<html><head><title>超长属性页</title></head><body><article><p>正常正文段落。</p></article><a href="/ok">正常链接</a> <a ' + 'x'.repeat(300000) + ' href="/big">超长属性链接</a></body></html>')
+    else { res.statusCode = 404; res.end('<html><body>not found</body></html>') }
+  })
+  await new Promise((r) => server.listen(18099, r))
+  const base = 'http://127.0.0.1:18099'
+  {
+    const tools = []
+    m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }, {})
+    const site = tools.find((t) => t.name === 'read_url_site')
+    const r = await site.execute({ url: `${base}/stream` })
+    const urls = r.pages.map((p) => p.url)
+    assert.ok(!urls.some((u) => u.includes('.m3u8')), `m3u8 excluded: ${urls.join(',')}`)
+    assert.ok(urls.some((u) => u.includes('page2.html')), `page2 crawled: ${urls.join(',')}`)
+    passed++
+    console.log('  ok - crawl skips m3u8 stream URLs (noise)')
+  }
+  {
+    // Bounded-attribute extractLinks: a 300k-char attribute must not crash or
+    // hang link extraction; the well-formed link is still found, and the
+    // oversized one is skipped (never scanned beyond the 1000-char bound).
+    const t0 = Date.now()
+    const r = await m.readUrl({ url: `${base}/bigattr`, includeLinks: true, maxChars: 2000 }, undefined, undefined, undefined)
+    const elapsed = Date.now() - t0
+    assert.ok(!r.error, `no error: ${JSON.stringify(r).slice(0, 80)}`)
+    assert.ok(elapsed < 3000, `bounded time: ${elapsed}ms`)
+    const urls = (r.links || []).map((l) => l.url)
+    assert.ok(urls.includes(`${base}/ok`), `normal link kept: ${JSON.stringify(urls)}`)
+    assert.ok(!urls.some((u) => u.includes('/big')), `oversized-attr link skipped: ${JSON.stringify(urls)}`)
+    passed++
+    console.log(`  ok - oversized-attribute anchor bounded (${elapsed}ms), normal link intact`)
+  }
+  server.close()
+}
+
 console.log(`\n${passed} assertions passed`)
 // All assertions are synchronous or top-level awaited; reaching here means every
 // one passed, so force a clean exit (avoids environment-specific exit-code noise).
