@@ -258,7 +258,7 @@ const results = await Promise.all([
 | **批量 + 失败隔离** | 4 URL 混合 | ✅ 2/4 成功、失败隔离 |
 | **整站爬取** | 阮一峰博客 | ✅ 5/5 页树状站点地图 |
 
-- **123 个单元断言**（v1.3.1 健壮性轮新增：meta 属性序颠倒、content 内嵌引号、http-equiv charset、JSON-LD 大块/嵌套 mainEntity、markdown 括号转义、m3u8 噪音、超长属性限时；v1.3.0 新增：控制字符实体防护、JSON-LD 元数据、base href 链接、meta-refresh 跟随 11 条；v1.2.0 新增：长段落句级对齐、紧凑 JSON、分页变体、对抗输入限时、散文 &lt; 保留、深 JSON 降级）（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级、UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 Retry-After 重试、图片 alt、代码语言、元数据、og:description 回落、双转义 feed、无头二进制嗅探、嵌套 role=main、薄 article 回落、不平衡标签降级、byline 兜底、人机验证页识别、isConcurrencySafe 声明 + 并发缓存竞态烟雾）+ **12 个 SPA 测试断言**全绿；
+- **126 个单元断言**（v1.3.1 收尾轮新增：pre 代码块实体解码、meta-refresh 跟随 charset 更新、read_url_links 壳页跟随；v1.3.1 健壮性轮新增：meta 属性序颠倒、content 内嵌引号、http-equiv charset、JSON-LD 大块/嵌套 mainEntity、markdown 括号转义、m3u8 噪音、超长属性限时；v1.3.0 新增：控制字符实体防护、JSON-LD 元数据、base href 链接、meta-refresh 跟随 11 条；v1.2.0 新增：长段落句级对齐、紧凑 JSON、分页变体、对抗输入限时、散文 &lt; 保留、深 JSON 降级）（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级、UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 Retry-After 重试、图片 alt、代码语言、元数据、og:description 回落、双转义 feed、无头二进制嗅探、嵌套 role=main、薄 article 回落、不平衡标签降级、byline 兜底、人机验证页识别、isConcurrencySafe 声明 + 并发缓存竞态烟雾）+ **12 个 SPA 测试断言**全绿；
 - 一个真实案例：小黑盒帖子的评论点赞数（`up` 字段）无法从扁平文本确定归属——**精确字段应走页面背后的数据 API**（如 `/bbs/app/link/tree` JSON），这是同类文本提取器的共同边界，不是缺陷。
 
 ## Roadmap

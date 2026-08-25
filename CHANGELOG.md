@@ -35,7 +35,22 @@
 
 **验证**
 - 单元断言 **114 → 123**（新增 9 条：meta 属性序颠倒 2、content 引号 1、og 顺序 1、http-equiv charset 1、JSON-LD 大块 1、嵌套 mainEntity 1、markdown 括号 1、爬虫 m3u8 噪音 + 超长属性限时 2）+ 12 SPA 断言全绿；
-- probe.mjs 全绿，无性能回归；## [1.2.0] - 2026-08-22
+- probe.mjs 全绿，无性能回归；
+
+### 同日第二轮：全量审查收尾（4 处一致性修复）
+
+针对全量代码审查（index.js 全流程逐段核查 + 实测验证）发现的一致性/元数据缺陷：
+
+**修复**
+- **meta-refresh 跟随后 charset 未更新**：`charset` 在 follow 之前取自壳页，壳页 utf-8 → 目标 GBK 时返回的 charset 标记与正文实际编码不符。`followMetaRefresh` 现在返回跟随目标的 charset，`readUrl` 在跟随后更新
+- **readability base URL 用原始请求地址**：`upgrade()` 传 `url`（原始 URL）给 readability，meta-refresh 跟随/SPA 渲染后文档实际在另一主机，相对链接/图片会按错误 base 解析。改为传当前 `finalUrl`（SPA 路径显式传 `rr.finalUrl`）
+- **markdown 代码块实体未解码**：`<pre>` 内 `&lt;div&gt;` 输出字面量（与普通文本不一致，浪费 token）。改为「先剥标签、再解码实体」——代码中的实体还原为可读字符
+- **read_url_links 不跟随 meta-refresh 壳页**：read_url 会跟随、read_url_links 只返回跳板页链接——工具间行为不一致。复用 `followMetaRefresh`（fail-open、3 跳有界）
+
+**验证**
+- 单元断言 **123 → 126**（新增 3 条：pre 实体解码、跟随 charset 更新、read_url_links 壳页跟随）+ 12 SPA 断言全绿；probe.mjs 32 PASS 无回归
+
+## [1.2.0] - 2026-08-22
 
 ### 修复三处隐患 + 进一步省 token
 

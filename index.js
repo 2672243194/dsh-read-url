@@ -626,7 +626,10 @@ export function blockMd(html, depth = 0) {
       const t = blockMd(inner, depth + 1).trim()
       out += `\n\n> ${t.replace(/\n/g, '\n> ')}`
     } else if (tag === 'pre') {
-      const code = inner.replace(/<[^>]{1,1000}>/g, '').trim()
+      // Strip wrapper tags FIRST, then decode entities — a literal &lt;div&gt;
+      // in the code must become <div> in the fenced block, but a real nested
+      // tag must not survive the strip to be rendered as markdown.
+      const code = decodeTextEntities(inner.replace(/<[^>]{1,1000}>/g, '')).trim()
       // Language hint from common highlighter conventions: the model reads
       // ```js fenced blocks far more accurately than unlabelled ones.
       const lang =
@@ -1137,6 +1140,7 @@ const MAX_META_REFRESH_HOPS = 3
 async function followMetaRefresh(html, finalUrl, externalSignal, cfg) {
   let cur = html
   let curUrl = finalUrl
+  let curCharset = '' // set only when a hop actually happened
   const seen = new Set([normalizeUrl(finalUrl)])
   for (let i = 0; i < MAX_META_REFRESH_HOPS; i++) {
     const target = metaRefreshTarget(cur, curUrl)
@@ -1148,10 +1152,12 @@ async function followMetaRefresh(html, finalUrl, externalSignal, cfg) {
     if (page.error) break
     const ct = (page.contentType || '').split(';')[0].toLowerCase().trim()
     if (!/html|xhtml/.test(ct)) break
-    cur = decodeBuffer(page.buffer, page.contentType).text
+    const decoded = decodeBuffer(page.buffer, page.contentType)
+    cur = decoded.text
+    curCharset = decoded.charset
     curUrl = page.finalUrl || target
   }
-  return { html: cur, finalUrl: curUrl }
+  return { html: cur, finalUrl: curUrl, charset: curCharset }
 }
 
 export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
@@ -1246,7 +1252,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
 
   let html = payload.html
   let finalUrl = payload.finalUrl || url
-  const charset = payload.charset
+  let charset = payload.charset
 
   // meta-refresh shells (link hops, anti-hotlink relays, no-JS SPA entries):
   // follow immediately, BEFORE extraction and SPA rendering — a shell that
@@ -1255,14 +1261,19 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   const followed = await followMetaRefresh(html, finalUrl, externalSignal, cfg)
   html = followed.html
   finalUrl = followed.finalUrl
+  // The target may use a different encoding than the shell page — reflect it.
+  if (followed.charset) charset = followed.charset
 
   let extracted = extract(html, mode)
   // Optional readability upgrade: cleaner article extraction when installed.
   const ext = await getReadabilityExtractor()
-  const upgrade = (target, htmlText) => {
+  // The base passed to readability must be the CURRENT final URL — after a
+  // meta-refresh follow or SPA render the document may live on another host,
+  // and relative links/images would resolve against the original request URL.
+  const upgrade = (target, htmlText, base) => {
     if (!ext) return target
     try {
-      const clean = ext(htmlText, url)
+      const clean = ext(htmlText, base || finalUrl)
       if (clean && clean.length > 0) {
         target.text = mode === 'markdown'
           ? blockMd(clean).replace(/\n{3,}/g, '\n\n').trim()
@@ -1300,7 +1311,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
           ? '已渲染但被人机验证页拦截，保留静态提取结果'
           : '已渲染但被人机验证页拦截（无静态内容可用）'
       } else {
-        const r2 = upgrade(extract(rr.html, mode), rr.html)
+        const r2 = upgrade(extract(rr.html, mode), rr.html, rr.finalUrl || finalUrl)
         // Accept the rendered text when it meaningfully beats the static one.
         // From an EMPTY static extraction even a short body is a real gain
         // (JS shells can render just 30-60 chars of real content, below the
@@ -1471,6 +1482,11 @@ function readLinksTool(ctx, cfg) {
         html = decodeBuffer(page.buffer, page.contentType).text
         finalUrl = page.finalUrl || url
       }
+      // Same meta-refresh shell following as read_url: a link hop serves a
+      // stub whose real links live at the target. Fails open, hop-bounded.
+      const followed = await followMetaRefresh(html, finalUrl, exec && exec.signal, cfg)
+      html = followed.html
+      finalUrl = followed.finalUrl
       let links = extractLinks(html, limit, finalUrl)
       // SPA fallback: a JS-only page yields no links from its static HTML;
       // render it and re-extract when the static result looks empty. Any

@@ -1262,6 +1262,66 @@ ok('markdown link href parens percent-encoded', () => {
   server.close()
 }
 
+console.log('v1.3.1 round 2: follow charset / pre entities / read_url_links follow')
+ok('markdown pre block decodes HTML entities (strip then decode)', () => {
+  const md = blockMd('<pre><code>&lt;div&gt;x &amp; y&lt;/div&gt;</code></pre>')
+  assert.ok(md.includes('```\n<div>x & y</div>\n```'), `pre: ${JSON.stringify(md)}`)
+})
+{
+  // meta-refresh follow must update charset to the TARGET's encoding: shell
+  // page is utf-8, target body is GBK bytes with charset=gbk.
+  const http = await import('node:http')
+  const gbkHello = Buffer.from([0xc4, 0xe3, 0xba, 0xc3]) // 你好 in GBK
+  const server = http.createServer((req, res) => {
+    if (req.url === '/shell-utf8') {
+      res.setHeader('content-type', 'text/html; charset=utf-8')
+      res.end('<html><head><meta http-equiv="refresh" content="0;url=/gbk"></head><body>跳转</body></html>')
+    } else if (req.url === '/gbk') {
+      res.setHeader('content-type', 'text/html; charset=gbk')
+      res.end(Buffer.concat([
+        Buffer.from('<html><head><title>GBK页</title></head><body><article><p>', 'utf8'),
+        gbkHello,
+        Buffer.from('，这是GBK正文。</p></article></body></html>', 'utf8'),
+      ]))
+    } else { res.statusCode = 404; res.end('nf') }
+  })
+  await new Promise((r) => server.listen(18100, r))
+  const base = 'http://127.0.0.1:18100'
+  {
+    const r = await m.readUrl({ url: `${base}/shell-utf8`, maxChars: 1000 }, undefined, undefined, undefined)
+    assert.ok(!r.error, `no error: ${JSON.stringify(r).slice(0, 80)}`)
+    assert.equal(r.url, `${base}/gbk`)
+    assert.equal(r.charset, 'gbk', `charset follows the target: ${r.charset}`)
+    assert.ok(r.text.includes('你好'), `gbk body decoded: ${r.text.slice(0, 40)}`)
+    passed++
+    console.log('  ok - meta-refresh follow updates charset to target encoding')
+  }
+  server.close()
+}
+{
+  const http = await import('node:http')
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    if (req.url === '/linkshell') res.end('<html><head><meta http-equiv="refresh" content="0;url=/linkstarget"></head><body>跳转</body></html>')
+    else if (req.url === '/linkstarget') res.end('<html><head><title>目标</title></head><body><article><p>正文。</p></article><a href="/a">去A</a> <a href="/b">去B</a></body></html>')
+    else { res.statusCode = 404; res.end('nf') }
+  })
+  await new Promise((r) => server.listen(18101, r))
+  const tools = []
+  m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }, {})
+  const linksTool = tools.find((t) => t.name === 'read_url_links')
+  const base = 'http://127.0.0.1:18101'
+  {
+    const r = await linksTool.execute({ url: `${base}/linkshell` })
+    assert.ok(!r.error, `no error: ${JSON.stringify(r).slice(0, 80)}`)
+    assert.equal(r.url, `${base}/linkstarget`, `final url: ${r.url}`)
+    assert.ok(r.links.some((l) => l.url.includes('/a')), `target links: ${JSON.stringify(r.links)}`)
+    passed++
+    console.log('  ok - read_url_links follows meta-refresh shell')
+  }
+  server.close()
+}
+
 console.log(`\n${passed} assertions passed`)
 // All assertions are synchronous or top-level awaited; reaching here means every
 // one passed, so force a clean exit (avoids environment-specific exit-code noise).
