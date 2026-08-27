@@ -1,5 +1,48 @@
 # Changelog
 
+## [1.4.0] - 2026-08-28
+
+> 省token主打轮。经实测复核，原方案中的「nav 导航块剔除」与「RSS/Atom 条目摘要」在 1.3.1 已就位（python-docs 实测 235K 全文 → 20K 内干净正文，导航零泄漏；feed 输出已含每条 ≤200 字符摘要），本轮聚焦真实缺口：隐藏元素剥离、URL 片段定位阅读、段落化正文。
+
+### URL 片段定位阅读（url#section-anchor）——token 大头
+
+超长参考页（MDN / Python docs 一页 20 万+ 字符）此前只能从文档头翻起。现在 `#fragment` 直接定位目标小节：
+
+- **容器锚点**（`<section id>` / `<dl id>` 等）→ 深度计数平衡块提取（复用 tagBlockAt，正确处理嵌套），**精确切出该小节**
+- **标题/内联锚点**（`<h2 id>`、`<dt id>`、`<a name>`）→ 从锚点起读到文末（标题引出其后正文），smartTruncate 兜底
+- percent-encoded 中文锚点自动尝试解码形态；未命中锚点降级为全文（不报错）
+- **cache key 保留 fragment**：`#a` 与 `#b` 各自独立缓存条目，绝不互串；offset 续读相对小节起点
+- 命中锚点时跳过 readability 升级（其会以全文覆盖小节语义）与自动分页（拼接后续整页违背定位意图）；输出 meta 行加 `#anchor` 标记说明正文起点
+- 实测：python-docs stdtypes.html `#str.startswith` **235,393 → 111,587 字符（-52.6%）**，且默认 6000 字符窗口直接落在目标方法而非文档头
+
+### 隐藏元素与同意弹窗剥离
+
+SPA 装饰树（`style="display:none"`）、`hidden` 属性、`aria-hidden="true"`、OneTrust/Cookiebot/GDPR 等 id 挂载的同意横幅此前全部漏网进正文。新增两条有界正则过滤器：
+
+- 覆盖 `hidden`（裸属性与带值）、`aria-hidden="true"`（false 保留）、`style` 含 `display:none` / `visibility:hidden`
+- consent id 匹配：`onetrust|cookiebot|cybot|gdpr|consent|cookie-law|cookie_banner|cmp-`（大小写不敏感）
+- **`[\s"']` 属性界卫兵**：`data-hidden` / `data-id` 等复合属性名不误伤
+- 未闭合的隐藏元素安全降级为保留内容（lazy 扫描 50K 有界，探针实测 4.9ms）
+
+### 正文段落化（textLines）
+
+text 模式原先把全文压成单行平文本，offset 续读从句子中间切开。现在块级边界成为段落分隔：
+
+- 标题独立成行、`<br>` 保单换行，段落以 `\n\n` 分隔——smartTruncate 的段落对齐真正生效，续读切口落在真实段落边界
+- 标题行尾的永久链接装饰符（`¶` / `§`）剥离（text 与 markdown 双模式）
+- readability 升级路径的 text 输出同步走段落化（可选增强安装时行为一致）
+
+### 其他
+
+- 正文 <60 字符且无渲染提示的页面补一条恒定成本的提示行（「正文极短（可能登录墙或反爬拦截）」），模型不再对 40 字符页面盲目 offset 续读
+- `renderResult` 导出（供测试断言输出文案）
+
+### 验证
+
+- 单元断言 **126 → 150**（+24：隐藏/consent 剥离 11、锚点切片 8 含 e2e 缓存隔离与 offset 语义、段落接缝 2、装饰符 1、短正文提示 1、既有回归 1）+ 12 SPA 断言全绿
+- probe.mjs 对抗探针 +7（3000 隐藏 div、未闭合隐藏、2000 consent 横幅、超长 style 前缀、正则特殊字符锚点、4000 层嵌套平衡块、畸形百分号解码）全绿，最慢 4.9ms
+- 实网：python-docs 锚点定位实测（上文数据）；152 站回归基线不变
+
 ## [1.3.1] - 2026-08-25
 
 > 注：v1.3.0（2026-08-24 开发完成）未独立发布——三项工作（v1.3.0 四项改进 + 08-25 健壮性轮 + 审查收尾轮）合并发布为 1.3.1。以下内容即该合并版本的完整变更。

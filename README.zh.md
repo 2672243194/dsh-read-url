@@ -210,19 +210,22 @@ const results = await Promise.all([
 ## 省 token 设计（核心）
 
 1. **默认只给正文**——不返回 headings/keywords/images/字数统计等冗余字段，需要时按参数取；
-2. **段落级智能截断 + offset 续读**——默认 6000 字符（约 3000 token），在段落边界截断保证语义完整，输出行仅一行 `(chars 6000/12990 — 截断，offset 续读)` 引导；续读从指定偏移开始、命中缓存切片，**不重复返回已读前文**（实测 0+500 → 500+500，无重复）；offset 越界返回空而非重复开头；
-3. **text 模式优先**——Markdown 结构按需开启；
-4. **紧凑文本 render**——模型直接看到 `title:` 头部 + 正文，无需解析 JSON；`siteName` 与域名相同时省略；状态提示全部一行内（截断/续读/缓存/渲染标记），无长段落废话；
-5. **双层缓存**——成功结果按 URL 缓存 5 分钟（重复读取直接命中，省网络也省模型重试）；**失败结果缓存 30 秒**（坏 URL 不会触发重复 fetch 循环）；
-6. **KV Cache 友好（DeepSeek 成本特调）**——工具 schema/description 保持**静态文本**（不嵌入配置值），配置变更不会使可复用的 prompt 前缀失效，KV 缓存持续命中。DeepSeek 缓存命中 token 价格约为未命中的 1/10，前缀越稳定越省钱（官方 `tool-web` 文档同款分析）；
-7. **批量共用缓存**——`read_url_batch` 内部复用同一套缓存，重复批量读直接命中，且每页默认 3000 字符（低于单页 6000）控制总量；
-8. **固定开销压缩**——4 个工具 description 合计约 900 字符（有断言守卫，保持静态利于 KV 缓存）；HTML 实体解码扩展至 45 个命名实体，`&mdash;`/`&hellip;` 等残留不再浪费 token 或显示为乱码。
+2. **段落级智能截断 + offset 续读**——默认 6000 字符（约 3000 token），在段落边界截断保证语义完整（text 模式段落以 `\n\n` 分隔，切口落在真实段落边界而非句中），输出行仅一行 `(chars 6000/12990 — 截断，offset 续读)` 引导；续读从指定偏移开始、命中缓存切片，**不重复返回已读前文**（实测 0+500 → 500+500，无重复）；offset 越界返回空而非重复开头；
+3. **URL 片段定位阅读（v1.4.0）**——`url#section-anchor` 直接定位长文档目标小节：容器锚点精确切块（深度计数平衡提取）、标题锚点从该处起读；cache key 保留 fragment 保证 `#a`/`#b` 互不串页，offset 相对小节起点。实测 python-docs `#str.startswith`：**235,393 → 111,587 字符（-52.6%）**，默认 6000 字符窗口直接落在目标方法而非文档头；
+4. **隐藏元素与同意弹窗剥离（v1.4.0）**——`display:none`/`visibility:hidden` 装饰树、`hidden` 属性、`aria-hidden="true"`、OneTrust/Cookiebot/GDPR id 挂载的横幅不再混入正文；复合属性名（`data-hidden`/`data-id`）有界卫兵不误伤；
+5. **text 模式优先**——Markdown 结构按需开启；
+6. **紧凑文本 render**——模型直接看到 `title:` 头部 + 正文，无需解析 JSON；`siteName` 与域名相同时省略；状态提示全部一行内（截断/续读/缓存/渲染标记），无长段落废话；
+7. **双层缓存**——成功结果按 URL 缓存 5 分钟（重复读取直接命中，省网络也省模型重试）；**失败结果缓存 30 秒**（坏 URL 不会触发重复 fetch 循环）；
+8. **KV Cache 友好（DeepSeek 成本特调）**——工具 schema/description 保持**静态文本**（不嵌入配置值），配置变更不会使可复用的 prompt 前缀失效，KV 缓存持续命中。DeepSeek 缓存命中 token 价格约为未命中的 1/10，前缀越稳定越省钱（官方 `tool-web` 文档同款分析）；
+9. **批量共用缓存**——`read_url_batch` 内部复用同一套缓存，重复批量读直接命中，且每页默认 3000 字符（低于单页 6000）控制总量；
+10. **固定开销压缩**——4 个工具 description 合计约 900 字符（有断言守卫，保持静态利于 KV 缓存）；HTML 实体解码扩展至 45 个命名实体，`&mdash;`/`&hellip;` 等残留不再浪费 token 或显示为乱码。
 
 ## 技术说明
 
 - **编码**：BOM 优先探测（UTF-8 / UTF-16LE / UTF-16BE——字节级证据优先于任何声明），其次 HTTP `Content-Type` charset → HTML meta；内置 `TextDecoder` 转码（Node 20+ full-icu，页面声明的 Shift-JIS/EUC-JP/GBK/Big5 均可正确解码），GB2312 归一为 GBK，检测到乱码自动回退 UTF-8；
 - **内容类型分发**：URL 不一定是 HTML——JSON 接口紧凑重排渲染（无缩进，超长字符串值 >1500 字符截断并标注，v1.2.0 起缩进 1 格改为完全紧凑），RSS 2.0 / Atom 订阅源解析为条目列表（`标题 — 链接` + 摘要，`feedCount` 字段，`includeLinks` 时附完整 items；条目摘要迭代「剥标签+解实体」直到稳定，双重转义的 `&lt;a&gt;` 不会漏成字面标签）；XML sitemap 明确拒绝（对模型无阅读价值）；其余全部走 HTML 管线；
-- **正文提取**：优先 `<article>`（聚合页多篇合并；无关小卡片 article——如订阅挂件——文本不足 200 字符且页面有 `<main>` 时自动回落 main）/ `<main>` / `role="main"`，`role="main"` 容器用**深度计数找平衡闭合标签**（嵌套 div 不会在第一个 `</div>` 被截断——实测 gnu.org 曾因此只取到 1/8 正文）；剥离 `nav/footer/header/aside/form/iframe` 及广告类容器，启发式回归到 `<body>`；body 路径上追加**文本密度过滤**——丢弃链接主导的短块（相关推荐/分类侧栏/热门文章挂件），标准容器页面完全不走此路径；
+- **正文提取**：优先 `<article>`（聚合页多篇合并；无关小卡片 article——如订阅挂件——文本不足 200 字符且页面有 `<main>` 时自动回落 main）/ `<main>` / `role="main"`，`role="main"` 容器用**深度计数找平衡闭合标签**（嵌套 div 不会在第一个 `</div>` 被截断——实测 gnu.org 曾因此只取到 1/8 正文）；剥离 `nav/footer/header/aside/form/iframe` 及广告类容器、**隐藏元素与同意弹窗**（`hidden` 属性、`aria-hidden="true"`、`style` 含 `display:none`/`visibility:hidden`、`onetrust/cookiebot/cybot/gdpr/consent/cookie-law` 等 id 挂载的 GDPR 横幅；`[\s"']` 属性界卫兵保证 `data-hidden`/`data-id` 复合属性名不误伤；未闭合元素安全降级为保留内容），启发式回归到 `<body>`；body 路径上追加**文本密度过滤**——丢弃链接主导的短块（相关推荐/分类侧栏/热门文章挂件），标准容器页面完全不走此路径；
+- **URL 片段定位（v1.4.0）**：`url#section-anchor` 定位长文档小节——容器标签（section/div/dl/table 等）取**深度计数平衡块**（嵌套正确、精确切出该节），标题/内联锚点（`<h2 id>`/`<dt id>`/`<a name>`）从该处读到文末（标题引出其后正文）；percent-encoded 中文锚点自动尝试解码形态；未命中降级全文。cache key 保留 fragment（`#a`/`#b` 独立缓存）；命中锚点时跳过 readability 升级与自动分页（二者都以全文语义覆盖定位语义）；text 模式**段落化输出**（块级边界 → `\n\n` 段落分隔，标题独立成行，smartTruncate 段落对齐真正生效，offset 续读切口落在真实段落边界；标题行尾永久链接装饰符 `¶`/`§` 剥离）；
 - **分页拼接**：识别 `rel=next`（标准）或纯「下一页 / next / › / »」短锚文本（刻意保守，不做模糊猜测）；同域限定 + 防环；跨页重复段落自动去重；续页走静态快路径（分页 SPA 链每页一次完整渲染不划算）；
 - **元数据**：`published` / `author` 从 meta 标签提取进输出字段与状态行；页面无相关 meta 时（如阮一峰博客零 meta 标签）从**正文头部 600 字符的署名行兜底**（「作者：X / 日期：2026年8月21日」，meta 优先、正文深部提及不误采、markdown 链接语法不泄漏）；空正文页（登录墙/JS 壳）回落到 `og:description` 作为提示，不再返回空；
 - **Markdown**：自研轻量标签状态机（标题/段落/列表/引用/代码块/表格/行内加粗斜体链接），零依赖；带 alt 的图片渲染为 `![alt](src)`（空 alt 装饰图丢弃），代码块围栏带 `language-*` class 里的语言标注；
@@ -233,11 +236,13 @@ const results = await Promise.all([
 - **可选增强二（SPA 页面渲染）**：在 DSH profile 目录执行 `npm i playwright && npx playwright install chromium` 后自动启用。检测到正文为空且（页面脚本密集 疑似 Vue/React 客户端渲染，或 body 为空的 JS 跳转壳——script 数不多但正文全靠跳转）时，自动用无头 Chromium 渲染后再提取（`rendered` 标记告知模型）；渲染结果仅在**显著优于**静态提取时采用（静态为空时 ≥20 字符即接受，防短正文被拒）；**人机验证页防御**——Cloudflare「Just a moment...」等指纹页识别后额外轮询 8s 供其自动跳转，仍未通过则拒绝渲染结果、保留静态正文（指纹页文字量可能超过真实正文，实测 259 vs 135 字符，绝不当作提升），指纹页 DOM 也不污染分页/链接提取；渲染采用 `domcontentloaded` + **DOM 稳定轮询**（内容停止增长即收，上限 10s）而非 `networkidle`——心跳轮询站永不空闲，避免 30s 超时；未安装时优雅提示安装方法、不报错——核心保持零依赖；
 - **边界**：登录墙页面无法读取；SPA 页面需安装 Playwright 增强后渲染读取（未安装时返回明确提示）；**结构化数据（如评论的点赞数归属、榜单数值）不在文本提取范围**——本插件把 HTML 扁平化为可读文本，字段与数值的精确对应关系会丢失；需要精确字段时，用 Playwright 拦截页面实际调用的数据 API 获取（见下方「真实世界验证」）。
 
-## 真实世界验证（2026-08-21，v1.0.0；2026-08-22 适配 DSH 0.1.1-rc.2 复验；2026-08-24 v1.3.0 复验）
+## 真实世界验证（2026-08-21，v1.0.0；2026-08-22 适配 DSH 0.1.1-rc.2 复验；2026-08-24 v1.3.0 复验；2026-08-28 v1.4.0 复验）
 
 152 站全量实测（`multi-site.mjs` 已提交可复跑，8 并发）：**115 OK / 17 预期边界（登录墙·验证页·静态小页） / 20 网络·反爬归因错误 / 0 崩溃**（含全部发布前修复的终态轮；网络类错误逐轮有 ±5 波动，均为环境归因）。覆盖国内门户 / 媒体 / 电商（京东·淘宝·拼多多·苏宁·当当）/ 视频（B 站·爱奇艺·优酷·芒果）/ 音乐 / 游戏 / 小说（起点·纵横·晋江 legacy GBK）/ 问答 / 论坛 / 政府 / 高校（清北复交等 8 所）/ 港台繁体（PTT·自由时报·联合报）/ 日韩（Yahoo JP·Hatena·goo·naver·daum）/ 海外技术站（GitHub·dev.to·react.dev·nodejs·rust·go·python docs）/ 订阅源 / JSON API / 编码压力（GBK·GB2312·Big5·gb18030）/ 反爬与网络边界。错误全部环境归因（维基/Reddit/UDN 连接超时；W3C/贴吧/NGA/StackOverflow 403；北邮 412；DNS 失败等）——每一个都返回结构化、准确归因的错误，无一崩溃。v1.3.0 复验轮（本机直连，无代理）：**93 OK / 24 THIN+EMPTY / 35 ERR / 0 THREW**，ERR 全部为境外连接超时与 403/412 反爬（与基线一致），无内容性回归。
 
 扫描驱动的发布前修复（全部带单测锁定）：RSS 双重转义、无头二进制嗅探、JS 跳转壳渲染、**`role="main"` 嵌套 div 截断**（gnu.org 165→800 字符）、**小 article 劫持主内容**（gitlab 71→800 字符）、渲染接受门槛放宽。
+
+v1.4.0 复验（2026-08-28，代理环境）：python-docs stdtypes.html 锚点定位实测——`#str.startswith` 全文 235,393 → 定位切片 111,587 字符（-52.6%），text/markdown 双模式内容均精确起始于目标方法定义；152 站回归基线不变。
 
 另有 **DSH 15 项全功能验收轮**（真实 Agent 调用 read_url 系工具逐项核对）：12 项完全符合，3 项问题全部修复闭环——① Cloudflare「Just a moment...」验证页文字量超过真实正文（259 vs 135 字符）被误当作渲染提升 → 挑战页特征识别 + 渲染后额外等待 8s 自动跳转 + 拒绝接受指纹页；② 阮一峰页面零 author/date meta 标签，作者/日期只在正文里 → byline 兜底从正文头部 600 字符提取署名行（实测 `author=阮一峰 published=2026年8月21日`）；③ PDF 类型拒绝归因 → 明确报 `Unsupported content-type: application/pdf`。
 
@@ -258,7 +263,7 @@ const results = await Promise.all([
 | **批量 + 失败隔离** | 4 URL 混合 | ✅ 2/4 成功、失败隔离 |
 | **整站爬取** | 阮一峰博客 | ✅ 5/5 页树状站点地图 |
 
-- **126 个单元断言**（v1.3.1 收尾轮新增：pre 代码块实体解码、meta-refresh 跟随 charset 更新、read_url_links 壳页跟随；v1.3.1 健壮性轮新增：meta 属性序颠倒、content 内嵌引号、http-equiv charset、JSON-LD 大块/嵌套 mainEntity、markdown 括号转义、m3u8 噪音、超长属性限时；v1.3.0 新增：控制字符实体防护、JSON-LD 元数据、base href 链接、meta-refresh 跟随 11 条；v1.2.0 新增：长段落句级对齐、紧凑 JSON、分页变体、对抗输入限时、散文 &lt; 保留、深 JSON 降级）（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级、UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 Retry-After 重试、图片 alt、代码语言、元数据、og:description 回落、双转义 feed、无头二进制嗅探、嵌套 role=main、薄 article 回落、不平衡标签降级、byline 兜底、人机验证页识别、isConcurrencySafe 声明 + 并发缓存竞态烟雾）+ **12 个 SPA 测试断言**全绿；
+- **150 个单元断言**（v1.4.0 新增 24：隐藏/consent 剥离 11（hidden 属性/aria-hidden/style 隐藏/onetrust/cybot/gdpr/复合属性卫兵/aria-hidden=false 保留）、锚点切片 8（容器平衡块/标题到文末/markdown 定位/未命中降级/百分号解码/data-id 卫兵/e2e 缓存隔离与 offset 语义/裸 URL 不受影响）、段落接缝与装饰符 3、短正文提示 1、回归 1；v1.3.1 收尾轮新增：pre 代码块实体解码、meta-refresh 跟随 charset 更新、read_url_links 壳页跟随；v1.3.1 健壮性轮新增：meta 属性序颠倒、content 内嵌引号、http-equiv charset、JSON-LD 大块/嵌套 mainEntity、markdown 括号转义、m3u8 噪音、超长属性限时；v1.3.0 新增：控制字符实体防护、JSON-LD 元数据、base href 链接、meta-refresh 跟随 11 条；v1.2.0 新增：长段落句级对齐、紧凑 JSON、分页变体、对抗输入限时、散文 &lt; 保留、深 JSON 降级）（含实体解码、description/schema 预算守卫、链接去重、表格分隔行转义、代理回退函数、空参容错、竞速逻辑、空竞速守卫、裸 main 提取、最坏链路超时预算、yml 字符串强转+钳制、严格宿主 seam 降级、UTF-16 BOM、Shift-JIS、密度过滤、分页拼接/封顶/关闭、JSON 渲染、RSS 解析、sitemap 拒绝、429 Retry-After 重试、图片 alt、代码语言、元数据、og:description 回落、双转义 feed、无头二进制嗅探、嵌套 role=main、薄 article 回落、不平衡标签降级、byline 兜底、人机验证页识别、isConcurrencySafe 声明 + 并发缓存竞态烟雾）+ **12 个 SPA 测试断言**全绿；probe.mjs 对抗探针 +7（v1.4.0 新正则全部限时通过，最慢 4.9ms）；
 - 一个真实案例：小黑盒帖子的评论点赞数（`up` 字段）无法从扁平文本确定归属——**精确字段应走页面背后的数据 API**（如 `/bbs/app/link/tree` JSON），这是同类文本提取器的共同边界，不是缺陷。
 
 ## Roadmap
@@ -278,6 +283,9 @@ const results = await Promise.all([
 - [x] 对抗页面线性化（无配对尖括号/无闭合标签/属性扫描加界 + 递归深度帽，修复 60KB→2.2s 的二次复杂度 DoS 向量）、散文 &lt; 不再被吞、代理重定向保留最终 URL、深 JSON 降级不崩溃（v1.2.0 第二轮）
 - [x] NUL/控制字符实体防护（`&#0;`/`&#127;` 输出空格、surrogate 输出 U+FFFD，不污染模型上下文）、JSON-LD 元数据三级提取（meta → JSON-LD → byline）、`<base href>` 链接解析（框架/老论坛页）、`<meta refresh>` 壳页自动跟随（最多 3 跳、防循环、fail-open，v1.3.0）
 - [x] 健壮性轮：meta 属性序无关提取（content 在前不再漏）、JSON-LD 嵌套结构递归（ItemList→mainEntity）、`<meta http-equiv="Content-Type">` 老式 charset、链接/分页正则统一加界、markdown 括号转义、爬虫流媒体噪音过滤（v1.3.1）
+- [x] URL 片段定位阅读（`url#section-anchor` 容器平衡块/标题到文末、缓存隔离、offset 相对小节，python-docs 实测 -52.6%，v1.4.0）
+- [x] 隐藏元素与同意弹窗剥离（hidden/aria-hidden/style 隐藏 + onetrust/cookiebot/gdpr id 匹配，v1.4.0）
+- [x] text 模式段落化输出（块级边界 → 段落分隔，offset 续读切口落在真实段落边界，v1.4.0）
 
 > v1.0.0 起进入维护期：以修 bug 为主，减少更新频率。
 

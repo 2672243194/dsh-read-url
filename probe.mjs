@@ -105,4 +105,25 @@ t('race: throwing promise recorded', async () => {
   return `success:${out.success} f0:${out.failures[0] && out.failures[0].error}`
 })
 
+console.log('\n=== H. v1.4.0 hidden/consent/anchor regexes ===')
+// hidden-filter: thousands of hidden divs with deep nesting (lazy 50k bound)
+const HIDDEN_MANY = Array.from({ length: 3000 }, (_, i) => `<div hidden class="c${i}">${'x'.repeat(50)}</div>`).join('')
+t('stripNoise 3000 hidden divs', () => textOnly(`<main>${HIDDEN_MANY}<p>keep</p></main>`).length)
+// hidden-filter: unclosed hidden div (lazy scan must not run to infinity)
+t('unclosed hidden div', () => textOnly('<main><div hidden>' + 'y'.repeat(300000) + '<p>keep</p></main>').length)
+// consent-filter: 2000 consent banners, unclosed
+const CONSENT_MANY = Array.from({ length: 2000 }, (_, i) => `<div id="onetrust-${i}">${'z'.repeat(40)}</div>`).join('')
+t('stripNoise 2000 consent banners', () => textOnly(`<main>${CONSENT_MANY}<p>keep</p></main>`).length)
+// style-hidden with huge inline style before display:none
+t('200-char style prefix before display:none', () =>
+  textOnly(`<main><div style="color:${'a'.repeat(180)};display:none">hid</div><p>keep</p></main>`).length)
+// anchor: regex-special fragment, no matching id (must not throw / hang)
+t('anchor with regex specials, unmatched', () =>
+  extract('<main><p>body</p></main>', 'text', 'a.*b+c[d](e){2}|f^g$h').text.length)
+// anchor: id value with specials, balanced-block scan over deep nesting
+const DEEP = `<main><section id="deep">${'<div>'.repeat(4000)}inner${'</div>'.repeat(4000)}</section><p>tail</p></main>`
+t('anchor balanced-block on 4000-deep nesting', () => extract(DEEP, 'text', 'deep').text.length)
+// anchor: percent-decoding failure (malformed) must not throw
+t('malformed percent-encoding anchor', () => extract('<main><p>body</p></main>', 'text', '%E4%B8%').text.length)
+
 console.log('\nprobe done')

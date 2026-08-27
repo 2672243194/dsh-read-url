@@ -1322,6 +1322,184 @@ ok('markdown pre block decodes HTML entities (strip then decode)', () => {
   server.close()
 }
 
+console.log('v1.4.0: hidden-element / consent stripping')
+{
+  const page = (noise) => `<html><body><main><article><p>正文段落保持原样。</p>${noise}</article></main></body></html>`
+  const cases = [
+    ['hidden attr', '<div hidden>隐藏内容</div>'],
+    ['hidden attr with value', '<div hidden="">带值隐藏</div>'],
+    ['aria-hidden true', '<span aria-hidden="true">装饰文本</span>'],
+    ['style display:none', '<ul style="display:none">静默列表</ul>'],
+    ['style visibility:hidden', '<p style="visibility:hidden">不可见段</p>'],
+    ['style display:none late in list', '<section style="color:red;display:none">后置隐藏</section>'],
+    ['onetrust banner id', '<div id="onetrust-consent-sdk">Cookie 同意横幅</div>'],
+    ['Cybot case-insensitive', '<div id="CybotCookiebotDialog">Cookiebot 弹窗</div>'],
+    ['gdpr substring id', '<div id="user-gdpr-modal">GDPR 提示</div>'],
+  ]
+  for (const [name, noise] of cases) {
+    const r = m.extract(page(noise), 'text')
+    assert.ok(r.text.includes('正文段落保持原样'), `body kept (${name})`)
+    assert.ok(!r.text.includes(noise.match(/>([^<]+)</)[1]), `noise stripped (${name}): ${r.text}`)
+    passed++
+    console.log(`  ok - strips ${name}`)
+  }
+  // Compound attr names must NOT trip the hidden/consent filters.
+  {
+    const r = m.extract(page('<div data-hidden="x">合法内容A</div><a data-id="onetrust-x">合法内容B</a>'), 'text')
+    assert.ok(r.text.includes('合法内容A') && r.text.includes('合法内容B'), `no false positive: ${r.text}`)
+    passed++
+    console.log('  ok - data-hidden / data-id are NOT stripped (attr boundary guard)')
+  }
+  // aria-hidden="false" is a visible element — must stay.
+  {
+    const r = m.extract(page('<span aria-hidden="false">显式可见</span>'), 'text')
+    assert.ok(r.text.includes('显式可见'), `false stays visible: ${r.text}`)
+    passed++
+    console.log('  ok - aria-hidden="false" content kept')
+  }
+}
+
+console.log('v1.4.0: URL fragment anchors')
+{
+  const DOC = `<html><head><title>长文档</title></head><body><main>
+  <h2>开头章节</h2><p>开头章节的内容，锚点读取时不应出现。</p>
+  <section id="str.startswith"><h2>str.startswith</h2><p>判断前缀的方法正文。${'细节段落。'.repeat(40)}</p></section>
+  <section id="later"><h2>later</h2><p>后续章节正文。</p></section>
+  </main></body></html>`
+  {
+    const r = m.extract(DOC, 'text', 'str.startswith')
+    assert.ok(r.anchored === true, 'anchored flag set')
+    assert.ok(r.text.startsWith('str.startswith'), `text starts at anchor: ${r.text.slice(0, 40)}`)
+    assert.ok(!r.text.includes('开头章节的内容'), `pre-anchor text absent: ${r.text.slice(0, 60)}`)
+    assert.ok(r.text.includes('判断前缀的方法正文'), `anchor body present`)
+    assert.ok(!r.text.includes('后续章节正文'), `post-anchor section absent (exact block): ${r.text.slice(-40)}`)
+    passed++
+    console.log('  ok - container anchor yields the exact balanced section block')
+  }
+  {
+    // Heading anchors introduce the content AFTER them — keep to-end slicing.
+    const DOC_H = `<html><body><main><h2 id="start">起始标题</h2><p>标题之后的正文。</p><p>更多内容。</p></main></body></html>`
+    const r = m.extract(DOC_H, 'text', 'start')
+    assert.ok(r.anchored === true && r.text.startsWith('起始标题') && r.text.includes('标题之后的正文'), `heading anchor keeps following text: ${r.text}`)
+    passed++
+    console.log('  ok - heading anchor reads from it to the end (section intro)')
+  }
+  {
+    const r = m.extract(DOC, 'markdown', 'str.startswith')
+    assert.ok(r.anchored === true && r.text.includes('# str.startswith'), `md scoped: ${r.text.slice(0, 60)}`)
+    assert.ok(!r.text.includes('开头章节'), `md pre-anchor absent`)
+    passed++
+    console.log('  ok - markdown mode slices from the anchor')
+  }
+  {
+    const r = m.extract(DOC, 'text', 'no-such-anchor')
+    assert.equal(r.anchored, false, 'unmatched anchor -> not anchored')
+    assert.ok(r.text.includes('开头章节'), 'fallback keeps full text from the top')
+    passed++
+    console.log('  ok - unmatched anchor degrades to full text')
+  }
+  {
+    // Percent-encoded CJK fragment; document carries the decoded id.
+    const enc = encodeURIComponent('字符串方法')
+    const DOC2 = `<html><body><main><p>前置内容。</p><section id="字符串方法"><p>解码后的锚点正文。</p></section></main></body></html>`
+    const r = m.extract(DOC2, 'text', enc)
+    assert.ok(r.anchored === true && r.text.includes('解码后的锚点正文') && !r.text.includes('前置内容'), `decoded candidate matched: ${r.text}`)
+    passed++
+    console.log('  ok - percent-encoded fragment matches decoded id')
+  }
+  {
+    // Compound attr names must not satisfy the anchor lookup.
+    const DOC3 = `<html><body><main><a data-id="target">假锚点</a><section id="target"><p>真锚点正文。</p></section></main></body></html>`
+    const r = m.extract(DOC3, 'text', 'target')
+    assert.ok(r.text.startsWith('真锚点正文') && !r.text.includes('假锚点'), `data-id not matched: ${r.text.slice(0, 40)}`)
+    passed++
+    console.log('  ok - data-id never satisfies the anchor lookup')
+  }
+}
+
+{
+  // e2e: fragment scoping + cache isolation + offset relative to section start
+  const http = await import('node:http')
+  const A = `第一节的全部正文内容，${'细节。'.repeat(120)}`
+  const B = `第二节的全部正文内容，${'补充。'.repeat(120)}`
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    res.end(`<html><head><title>分节页</title></head><body><main>
+    <section id="sec1"><h2>第一节</h2><p>${A}</p></section>
+    <section id="sec2"><h2>第二节</h2><p>${B}</p></section>
+    </main></body></html>`)
+  })
+  await new Promise((r) => server.listen(18102, r))
+  const base = 'http://127.0.0.1:18102'
+  try {
+    const r1 = await m.readUrl({ url: `${base}#sec1`, maxChars: 400 }, undefined, undefined, undefined)
+    assert.ok(!r1.error, `read ok: ${JSON.stringify(r1).slice(0, 80)}`)
+    assert.equal(r1.anchored, true, `anchored flag: ${JSON.stringify(r1).slice(0, 120)}`)
+    assert.ok(r1.text.startsWith('第一节'), `starts at section 1: ${r1.text.slice(0, 30)}`)
+    assert.ok(!r1.text.includes('第二节'), `section 2 absent: ${r1.text.slice(0, 50)}`)
+    passed++
+    console.log('  ok - read_url #sec1 scopes to section 1')
+
+    // Same page, different fragment: must NOT be served the #sec1 cache entry.
+    const r2 = await m.readUrl({ url: `${base}#sec2`, maxChars: 400 }, undefined, undefined, undefined)
+    assert.ok(!r2.error && r2.anchored === true, `sec2 anchored: ${JSON.stringify(r2).slice(0, 120)}`)
+    assert.ok(r2.text.startsWith('第二节'), `starts at section 2: ${r2.text.slice(0, 30)}`)
+    assert.ok(!r2.text.includes('第一节'), `section 1 absent: ${r2.text.slice(0, 50)}`)
+    passed++
+    console.log('  ok - fragment stays in cache key (#sec1 vs #sec2 isolated)')
+
+    // offset continues from the SECTION start, not the document start.
+    const r3 = await m.readUrl({ url: `${base}#sec1`, maxChars: 400, offset: 400 }, undefined, undefined, undefined)
+    assert.ok(!r3.error, `offset read ok: ${JSON.stringify(r3).slice(0, 80)}`)
+    assert.equal(r3.charsStart, 400, `charsStart relative to section: ${r3.charsStart}`)
+    assert.ok(!r3.text.includes('第二节'), `continuation still scoped: ${r3.text.slice(0, 40)}`)
+    passed++
+    console.log('  ok - offset continues within the anchored section')
+
+    // Bare url (no fragment) reads the full document — unaffected by scoped entries.
+    const r4 = await m.readUrl({ url: base, maxChars: 500 }, undefined, undefined, undefined)
+    assert.ok(!r4.error && r4.anchored !== true, `bare read unanchored: ${JSON.stringify(r4).slice(0, 120)}`)
+    assert.ok(r4.text.includes('第一节') && r4.text.includes('第二节'), `full doc: ${r4.text.slice(0, 40)}`)
+    passed++
+    console.log('  ok - bare url still reads the full document')
+  } finally {
+    server.close()
+  }
+}
+
+console.log('v1.4.0: text mode paragraph seams + thin-page hint')
+{
+  const r = m.extract(`<html><body><main><article><h1>标题</h1><p>第一段落内容。</p><p>第二段落内容。</p></article></main></body></html>`, 'text')
+  assert.ok(/\n\n/.test(r.text), `paragraph breaks present: ${JSON.stringify(r.text.slice(0, 60))}`)
+  assert.ok(r.text.startsWith('标题\n\n'), `heading on its own line: ${JSON.stringify(r.text.slice(0, 12))}`)
+  passed++
+  console.log('  ok - text mode keeps paragraph seams (offset cuts at real boundaries)')
+}
+{
+  const r = m.extract(`<html><head><title>装饰页</title></head><body><main><article><h2>标题 ¶</h2><p>正文。</p></article></main></body></html>`, 'text')
+  assert.ok(!r.text.includes('¶'), `trailing pilcrow stripped: ${JSON.stringify(r.text.slice(0, 20))}`)
+  passed++
+  console.log('  ok - trailing permalink glyph stripped from headings')
+}
+{
+  // Login-wall shape: tiny static body, no scripts -> thin-page hint.
+  const http = await import('node:http')
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    res.end('<html><head><title>登录墙</title></head><body><main>请先登录后查看内容。</main></body></html>')
+  })
+  await new Promise((r) => server.listen(18103, r))
+  const tools = []
+  m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }, {})
+  const readTool = tools.find((t) => t.name === 'read_url')
+  const r = await readTool.execute({ url: `http://127.0.0.1:18103/` })
+  server.close()
+  const rendered = m.renderResult(r)
+  assert.ok(rendered.includes('正文极短'), `thin hint emitted: ${rendered.slice(0, 160)}`)
+  passed++
+  console.log('  ok - near-empty body gets the constant thin-page hint')
+}
+
 console.log(`\n${passed} assertions passed`)
 // All assertions are synchronous or top-level awaited; reaching here means every
 // one passed, so force a clean exit (avoids environment-specific exit-code noise).

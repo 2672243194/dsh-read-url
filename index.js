@@ -341,6 +341,32 @@ function textOnly(html) {
     .trim())
 }
 
+// Paragraph-aware variant of textOnly for the body extraction path: block
+// boundaries become paragraph breaks so offset continuation slices at real
+// paragraph seams (smartTruncate aligns on /\n\n+/) instead of mid-sentence,
+// and long reference pages stay readable instead of one flattened line.
+// <br> keeps single newlines; every other tag runs are stripped as spaces.
+function textLines(html) {
+  const cleaned = decodeTextEntities(defuseLt(html)
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<script[\s>][\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s>][\s\S]*?<\/style>/gi, ' ')
+    .replace(/<textarea[\s>][\s\S]*?<\/textarea\s*>/gi, ' ')
+    .replace(/<noscript[\s>][\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<br\b[^>]{0,1000}\/?>/gi, '\n')
+    .replace(/<\/?(?:p|div|section|article|main|h[1-6]|li|ul|ol|table|tbody|thead|tfoot|tr|blockquote|pre|figcaption|dt|dd|dl|figure|fieldset|option)\b[^>]{0,1000}>/gi, '\n')
+    .replace(/<[^>]{1,1000}>/g, ' '))
+  const lines = []
+  for (const rawLine of cleaned.split('\n')) {
+    let line = rawLine.replace(/[ \t\r\f\v]+/g, ' ').trim()
+    // A heading becomes its own short paragraph in this layout; a trailing
+    // permalink glyph on one is anchor decoration, not content.
+    if (line.length <= 120) line = line.replace(/\s*[¶§]$/, '')
+    if (line) lines.push(line)
+  }
+  return lines.join('\n\n')
+}
+
 // ---- JSON / RSS / Atom content dispatch ----
 // A URL is not always an HTML page: data APIs answer JSON and content sources
 // answer feeds. Both are model-readable when compacted, so read_url handles
@@ -509,6 +535,16 @@ function stripNoise(mainHtml) {
   if (box.length) {
     out = out.replace(new RegExp(`<(${box.join('|')})[\\s>][\\s\\S]*?<\\/\\1>`, 'gi'), ' ')
   }
+  // Elements explicitly hidden from users are invisible decoration or stateful
+  // UI (collapsed panels, modal templates) — their text must not leak into the
+  // body. The [\s"'] guard keeps `hidden`/`style` from matching inside
+  // compound attr names (data-hidden, aria-hidden). Consent/GDPR banners mount
+  // by id (onetrust, cookiebot, cybot, gdpr) rather than class, so a second
+  // pass keys on the id attribute. Every scan run is bounded.
+  const hidden = /<(div|span|section|p|ul|table)\b[^>]{0,1000}[\s"'](?:hidden\b|aria-hidden\s*=\s*["']?true|style\s*=\s*["'][^"']{0,200}(?:display:\s*none|visibility:\s*hidden))[^>]{0,1000}>[\s\S]{0,50000}?<\/\1\s*>/gi
+  out = out.replace(hidden, ' ')
+  const consent = /<([a-z][a-z0-9]*)\s+id=["'][^"']{0,120}(?:onetrust|cookiebot|cybot|gdpr|consent|cookie-law|cookie_banner|cmp-)[^"']{0,120}["'][^>]{0,1000}>[\s\S]{0,50000}?<\/\1\s*>/gi
+  out = out.replace(consent, ' ')
   return out.replace(
     /<([a-z][a-z0-9]*)[^>]{1,1000}class=["'][^"']{0,300}(ad-|ads|advert|banner|sidebar|social|share|comment|popup|modal|cookie)[^"']{0,300}["'][^>]{0,1000}>[\s\S]*?<\/\1>/gi,
     ' ',
@@ -615,7 +651,8 @@ export function blockMd(html, depth = 0) {
     }
     if (tag === 'h1' || tag === 'h2' || tag === 'h3' || tag === 'h4' || tag === 'h5' || tag === 'h6') {
       const level = '#'.repeat(Number(tag[1]))
-      out += `\n\n${level} ${inlineMd(inner, depth + 1)}`
+      // Trailing permalink glyphs are anchor decorations, not heading text.
+      out += `\n\n${level} ${inlineMd(inner, depth + 1).replace(/\s*[¶§]\s*$/, '')}`
     } else if (tag === 'p') {
       const t = inlineMd(inner, depth + 1)
       if (t) out += `\n\n${t}`
@@ -801,7 +838,42 @@ function bylineFallback(text, meta) {
   return out
 }
 
-export function extract(html, mode) {
+// Locate the element whose id/name equals `anchor` and return the html of its
+// section: for container tags (section/div/dl/…) the element's own balanced
+// block IS the section; for heading/inline anchors (<h2 id>, <a name>, <dt
+// id>) the anchor only marks where the section starts, so everything FROM it
+// onward is kept (the heading introduces the content that follows). Returns
+// null when no element matches — callers fall back to full text.
+// The [\s"'] guard rejects compound attr names (data-id, data-name), and the
+// exact-quoted value means id="prefix-anchor" never matches anchor "prefix".
+const ANCHOR_CONTAINER = /^(?:section|div|article|aside|main|dl|table|ul|ol|details|figure|blockquote|fieldset|form)$/
+function sliceAtAnchor(mainHtml, anchor) {
+  if (!anchor) return null
+  const esc = anchor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const m = new RegExp(`<([a-z][a-z0-9]*)\\b[^>]{0,1000}[\\s"'](?:id|name)\\s*=\\s*["']${esc}["'][^>]{0,1000}>`, 'i').exec(mainHtml)
+  if (!m) return null
+  const tag = m[1].toLowerCase()
+  if (ANCHOR_CONTAINER.test(tag)) {
+    const block = tagBlockAt(mainHtml, m.index, tag)
+    if (block) return block
+  }
+  return mainHtml.slice(m.index)
+}
+
+// Anchors may arrive percent-encoded (CJK section names); the document can
+// carry either form. Try the raw fragment first, then its decoded variant.
+function anchorCandidates(anchor) {
+  const list = [anchor]
+  try {
+    const dec = decodeURIComponent(anchor)
+    if (dec !== anchor) list.push(dec)
+  } catch {
+    /* malformed percent-encoding — raw form only */
+  }
+  return list
+}
+
+export function extract(html, mode, anchor = '') {
   html = defuseLt(html) // kills the no-'>'-tail quadratic scans before any picker runs
   const titleTag = /<title[^>]{0,1000}>([\s\S]*?)<\/title>/i.exec(html)
   const ogTitle = metaContent(html, 'og:title')
@@ -809,11 +881,19 @@ export function extract(html, mode) {
   const langMatch = /<html[^>]{1,1000}lang=["']([\w-]+)["']/i.exec(html)
   let main = stripNoise(pickMain(html))
   main = stripNoise(revealEscapedTags(main))
+  // A URL fragment scopes the read to one section of a long reference page —
+  // slice at the anchor so only that section is extracted. Unmatched anchors
+  // degrade to the full document instead of failing.
+  let scoped = null
+  for (const cand of anchorCandidates(anchor)) {
+    scoped = sliceAtAnchor(main, cand)
+    if (scoped) break
+  }
   let bodyText
   if (mode === 'markdown') {
-    bodyText = blockMd(main).replace(/\n{3,}/g, '\n\n').trim()
+    bodyText = blockMd(scoped || main).replace(/\n{3,}/g, '\n\n').trim()
   } else {
-    bodyText = textOnly(main).replace(/ +/g, ' ').trim()
+    bodyText = textLines(scoped || main).replace(/ +/g, ' ').trim()
   }
   const meta = extractMeta(html)
   const ld = jsonLdMeta(html)
@@ -841,6 +921,7 @@ export function extract(html, mode) {
     author: byline.author,
     text,
     usedDescription,
+    anchored: !!scoped,
   }
 }
 
@@ -1053,6 +1134,10 @@ function sliceFrom(full, offset, maxChars) {
   }
   if (full.rendered) out.rendered = true
   if (full.spaHint) out.spaHint = full.spaHint
+  if (full.anchored) {
+    out.anchored = true
+    out.anchor = full.anchor || ''
+  }
   if (full.paginated > 1) out.paginated = full.paginated
   if (full.feedCount) out.feedCount = full.feedCount
   if (full.published) out.published = full.published
@@ -1170,14 +1255,23 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   // Cache stores the FULL extracted text keyed by url+mode+includeLinks, so
   // continuation reads (offset) and different maxChars hit the same entry —
   // but a links-request must not be served from a links-less cached copy.
-  // The key drops the URL fragment: #sections would otherwise split the cache.
+  // The fragment STAYS in the key: a #section read scopes the extraction to
+  // that anchor, so two fragments must never share one cache entry.
   let cacheUrl = url
   try {
-    const u = new URL(url)
-    u.hash = ''
-    cacheUrl = u.href
+    cacheUrl = new URL(url).href
   } catch {
     /* keep raw url on parse failure */
+  }
+  // A #fragment scopes the read to one section of a long page. The browser
+  // never sends it to the server, so it must be taken from the REQUEST url —
+  // finalUrl (after redirects/renders) has no fragment.
+  let anchor = ''
+  try {
+    const h = new URL(url).hash
+    if (h.length > 1) anchor = h.slice(1)
+  } catch {
+    /* keep bare url */
   }
   const cacheKey = `${cacheUrl}|${mode}|${args.includeLinks === true ? 'links' : 'no-links'}`
   // Failed fetches are cached briefly so the model doesn't re-request a
@@ -1264,7 +1358,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   // The target may use a different encoding than the shell page — reflect it.
   if (followed.charset) charset = followed.charset
 
-  let extracted = extract(html, mode)
+  let extracted = extract(html, mode, anchor)
   // Optional readability upgrade: cleaner article extraction when installed.
   const ext = await getReadabilityExtractor()
   // The base passed to readability must be the CURRENT final URL — after a
@@ -1277,14 +1371,16 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
       if (clean && clean.length > 0) {
         target.text = mode === 'markdown'
           ? blockMd(clean).replace(/\n{3,}/g, '\n\n').trim()
-          : textOnly(clean).replace(/ +/g, ' ').trim()
+          : textLines(clean).replace(/ +/g, ' ').trim()
       }
     } catch {
       // keep heuristic result
     }
     return target
   }
-  extracted = upgrade(extracted, html)
+  // Readability would replace the scoped section with the FULL article text;
+  // when an anchor matched, the scoped extraction IS the answer.
+  extracted = extracted.anchored ? extracted : upgrade(extracted, html)
 
   // Optional SPA enhancement: if the page looks client-rendered and static
   // extraction found almost nothing, try headless rendering (playwright).
@@ -1311,7 +1407,8 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
           ? '已渲染但被人机验证页拦截，保留静态提取结果'
           : '已渲染但被人机验证页拦截（无静态内容可用）'
       } else {
-        const r2 = upgrade(extract(rr.html, mode), rr.html, rr.finalUrl || finalUrl)
+        const r2raw = extract(rr.html, mode, anchor)
+        const r2 = r2raw.anchored ? r2raw : upgrade(r2raw, rr.html, rr.finalUrl || finalUrl)
         // Accept the rendered text when it meaningfully beats the static one.
         // From an EMPTY static extraction even a short body is a real gain
         // (JS shells can render just 30-60 chars of real content, below the
@@ -1338,7 +1435,9 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   const paginateMax = cfg.paginate === false ? 1 : Math.max(1, Math.min(10, Number(cfg.paginateMax) || 3))
   const startHost = hostOf(finalUrl || url)
   const seen = new Set([normalizeUrl(finalUrl || url)])
-  let nextUrl = paginateMax > 1 ? findNextLink(renderedHtml || html, finalUrl || url) : null
+  // An anchored read is scoped to one section — joining the "next page" chain
+  // would append whole pages the fragment never asked for.
+  let nextUrl = paginateMax > 1 && !extracted.anchored ? findNextLink(renderedHtml || html, finalUrl || url) : null
   while (
     nextUrl && paginated < paginateMax &&
     sameHost(nextUrl, startHost) &&
@@ -1359,6 +1458,13 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     nextUrl = findNextLink(nextHtml, page.finalUrl || nextUrl)
   }
 
+  // A near-empty body (login wall, anti-bot shell) with no render hint yet
+  // still looks like "the page content" to the model — one constant-cost line
+  // tells it not to keep offset-reading a 40-char page.
+  if (!spaHint && extracted.text && extracted.text.length < 60) {
+    spaHint = '正文极短（可能登录墙或反爬拦截）'
+  }
+
   const full = {
     url: finalUrl,
     title: extracted.title || '',
@@ -1369,6 +1475,8 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     fullText: extracted.text,
     rendered,
     spaHint,
+    anchored: extracted.anchored || false,
+    anchor: extracted.anchored ? anchor : '',
     paginated,
     published: extracted.published || '',
     author: extracted.author || '',
@@ -1381,7 +1489,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   return sliceFrom(full, offset, maxChars)
 }
 
-function renderResult(value) {
+export function renderResult(value) {
   if (typeof value === 'string') return value
   const r = value || {}
   if (r.error) return `Error: ${r.error}`
@@ -1396,6 +1504,9 @@ function renderResult(value) {
   }
   if (r.published) meta.push(r.published)
   if (r.author) meta.push(`by ${r.author}`)
+  // Tells the model why the text starts mid-document: the read was scoped to
+  // this fragment, and offset continues from the section start.
+  if (r.anchored) meta.push(`#${r.anchor || ''}`)
   if (r.feedCount) meta.push(`feed · ${r.feedCount} 条`)
   if (r.mode === 'json') meta.push('json')
   if (meta.length) lines.push(meta.join(' · '))
@@ -1408,6 +1519,9 @@ function renderResult(value) {
   if (r.cached) flags.push('cached')
   if (r.paginated > 1) flags.push(`已拼接${r.paginated}页`)
   if (r.rendered) flags.push('rendered')
+  // With text present the hint rides the flags line; with empty text the
+  // dedicated "无可读内容" line below already carries it.
+  if (r.text && r.spaHint) flags.push(r.spaHint)
   if (flags.length) lines.push(`(${flags.join(' · ')})`)
   if (!r.text) {
     if (r.charsStart > 0 && !r.truncated) {
