@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.5.0] - 2026-08-29
+
+> 元数据补全与 token 边角打磨轮。152 站回归确认 1.4.0 无内容性回归后，聚焦三处已核实的缺口（响应大小上限 3MB、RSS 摘要、nav 剔除等此前已就位的项不再重复）。
+
+### JSON-LD `articleBody` 正文兜底
+
+不少新闻/门户站把**全文**放在 `<script type="application/ld+json">` 的 `articleBody` 字段，可见 HTML 却是反爬壳或薄片段——DOM 提取器够不到。现在正文提取不足 200 字符时自动尝试 ld+json 正文兜底（strip 标签 → 段落化，块扫描沿用有界 LDJSON_RE，上限 200K 字符；DOM 正文充分时不触发，绝不用兜底覆盖真实正文）。
+
+### `<time datetime>` 元数据源 + 日期归一化
+
+- 发布时间合并链扩展为：显式 `article:`/`og:` meta → JSON-LD datePublished → **`<time datetime>`** → 通用 date meta → byline 文本。语义化 `<time>` 标记通常标示发布时间，优先于常为 last-modified 的通用 date meta。
+- 可识别格式的日期统一归一为 ISO（`2026年8月24日` → `2026-08-24`），覆盖 meta/JSON-LD/time/byline 全部来源；不匹配的格式原样透传。
+
+### markdown 表格行数帽
+
+兼容性对照表（40+ 行 × 多列）是 markdown 模式最大的单点 token 开销。表格超过 25 行时只保留前 25 行并追加一行 `…+N rows` 提示；text 模式不受影响。
+
+### 零宽字符剥离
+
+零宽空格/连接符（U+200B–200D、U+2060、BOM）对读者不可见却计 token，且 152 站实测中确有泄漏（如 vuejs-doc 输出）。textOnly / textLines / blockMd 三条渲染路径统一剥离。
+
+### 评估后保持不变：batch 默认 maxChars = 3000
+
+实测对比：ruanyifeng 全文不足 2000（两窗口无差异）；solidot 的 2000–3000 段是第二篇文章的真实正文——下调到 2000 会在聚合页切掉实际内容。且 batch schema 描述含字面 `default 3000`，改动必须动 schema 文本，违背静态 schema 承诺。**结论：维持 3000。**
+
+### 验证
+
+- 单元断言 **150 → 158**（+8：articleBody 兜底 2、无日期源不编造 1、time datetime 1、CJK 归一 1、表格帽 1、零宽 2；既有 byline 日期断言同步归一化行为更新）+ 12 SPA 断言全绿；
+- probe.mjs 39 PASS 无回归；
+- 实网：MDN markdown 模式表格静态 HTML 未超帽（兼容表为 JS 渲染），帽由单测覆盖；ruanyifeng/solidot 窗口评估见上。
+
 ## [1.4.0] - 2026-08-28
 
 > 省token主打轮。经实测复核，原方案中的「nav 导航块剔除」与「RSS/Atom 条目摘要」在 1.3.1 已就位（python-docs 实测 235K 全文 → 20K 内干净正文，导航零泄漏；feed 输出已含每条 ≤200 字符摘要），本轮聚焦真实缺口：隐藏元素剥离、URL 片段定位阅读、段落化正文。

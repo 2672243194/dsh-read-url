@@ -213,12 +213,13 @@ const results = await Promise.all([
 2. **段落级智能截断 + offset 续读**——默认 6000 字符（约 3000 token），在段落边界截断保证语义完整（text 模式段落以 `\n\n` 分隔，切口落在真实段落边界而非句中），输出行仅一行 `(chars 6000/12990 — 截断，offset 续读)` 引导；续读从指定偏移开始、命中缓存切片，**不重复返回已读前文**（实测 0+500 → 500+500，无重复）；offset 越界返回空而非重复开头；
 3. **URL 片段定位阅读（v1.4.0）**——`url#section-anchor` 直接定位长文档目标小节：容器锚点精确切块（深度计数平衡提取）、标题锚点从该处起读；cache key 保留 fragment 保证 `#a`/`#b` 互不串页，offset 相对小节起点。实测 python-docs `#str.startswith`：**235,393 → 111,587 字符（-52.6%）**，默认 6000 字符窗口直接落在目标方法而非文档头；
 4. **隐藏元素与同意弹窗剥离（v1.4.0）**——`display:none`/`visibility:hidden` 装饰树、`hidden` 属性、`aria-hidden="true"`、OneTrust/Cookiebot/GDPR id 挂载的横幅不再混入正文；复合属性名（`data-hidden`/`data-id`）有界卫兵不误伤；
-5. **text 模式优先**——Markdown 结构按需开启；
-6. **紧凑文本 render**——模型直接看到 `title:` 头部 + 正文，无需解析 JSON；`siteName` 与域名相同时省略；状态提示全部一行内（截断/续读/缓存/渲染标记），无长段落废话；
-7. **双层缓存**——成功结果按 URL 缓存 5 分钟（重复读取直接命中，省网络也省模型重试）；**失败结果缓存 30 秒**（坏 URL 不会触发重复 fetch 循环）；
-8. **KV Cache 友好（DeepSeek 成本特调）**——工具 schema/description 保持**静态文本**（不嵌入配置值），配置变更不会使可复用的 prompt 前缀失效，KV 缓存持续命中。DeepSeek 缓存命中 token 价格约为未命中的 1/10，前缀越稳定越省钱（官方 `tool-web` 文档同款分析）；
-9. **批量共用缓存**——`read_url_batch` 内部复用同一套缓存，重复批量读直接命中，且每页默认 3000 字符（低于单页 6000）控制总量；
-10. **固定开销压缩**——4 个工具 description 合计约 900 字符（有断言守卫，保持静态利于 KV 缓存）；HTML 实体解码扩展至 45 个命名实体，`&mdash;`/`&hellip;` 等残留不再浪费 token 或显示为乱码。
+5. **元数据三路兜底（v1.5.0）**——发布时间合并链 `article:`/`og:` meta → JSON-LD → `<time datetime>` → 通用 date meta → byline，可识别格式归一为 ISO；反爬壳页正文过薄时自动用 ld+json `articleBody` 全文兜底；markdown 表格超 25 行截断并附 `…+N rows` 提示；零宽字符（U+200B 等）统一剥离；
+6. **text 模式优先**——Markdown 结构按需开启；
+7. **紧凑文本 render**——模型直接看到 `title:` 头部 + 正文，无需解析 JSON；`siteName` 与域名相同时省略；状态提示全部一行内（截断/续读/缓存/渲染标记），无长段落废话；
+8. **双层缓存**——成功结果按 URL 缓存 5 分钟（重复读取直接命中，省网络也省模型重试）；**失败结果缓存 30 秒**（坏 URL 不会触发重复 fetch 循环）；
+9. **KV Cache 友好（DeepSeek 成本特调）**——工具 schema/description 保持**静态文本**（不嵌入配置值），配置变更不会使可复用的 prompt 前缀失效，KV 缓存持续命中。DeepSeek 缓存命中 token 价格约为未命中的 1/10，前缀越稳定越省钱（官方 `tool-web` 文档同款分析）；
+10. **批量共用缓存**——`read_url_batch` 内部复用同一套缓存，重复批量读直接命中，且每页默认 3000 字符（低于单页 6000）控制总量；
+11. **固定开销压缩**——4 个工具 description 合计约 900 字符（有断言守卫，保持静态利于 KV 缓存）；HTML 实体解码扩展至 45 个命名实体，`&mdash;`/`&hellip;` 等残留不再浪费 token 或显示为乱码。
 
 ## 技术说明
 

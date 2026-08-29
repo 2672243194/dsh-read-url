@@ -160,7 +160,7 @@ ok('byline fallback harvests author/date from meta-less body head', () => {
 </main></body></html>`
   const r = extract(page, 'text')
   assert.equal(r.author, '阮一峰', `author: ${JSON.stringify(r.author)}`)
-  assert.equal(r.published, '2026年8月21日', `published: ${JSON.stringify(r.published)}`)
+  assert.equal(r.published, '2026-08-21', `published normalized to ISO: ${JSON.stringify(r.published)}`)
 })
 
 ok('meta tags still win over byline fallback', () => {
@@ -1047,7 +1047,7 @@ ok('json-ld broken JSON tolerated, byline fallback still works', () => {
   const html = '<html><head><script type="application/ld+json">{invalid json</script></head><body><article><p>作者：王五 日期：2026年1月2日 正文内容。</p></article></body></html>'
   const r = extract(html, 'text')
   assert.equal(r.author, '王五', `byline author: ${r.author}`)
-  assert.equal(r.published, '2026年1月2日')
+  assert.equal(r.published, '2026-01-02')
 })
 ok('explicit article meta beats json-ld date', () => {
   const html = '<html><head><meta property="article:published_time" content="2020-01-01T00:00:00Z"><script type="application/ld+json">{"@type":"NewsArticle","datePublished":"2026-08-24"}</script></head><body><article><p>正文。</p></article></body></html>'
@@ -1498,6 +1498,65 @@ console.log('v1.4.0: text mode paragraph seams + thin-page hint')
   assert.ok(rendered.includes('正文极短'), `thin hint emitted: ${rendered.slice(0, 160)}`)
   passed++
   console.log('  ok - near-empty body gets the constant thin-page hint')
+}
+
+console.log('v1.5.0: ld+json articleBody / time datetime / table cap / zero-width')
+{
+  const r = m.extract(`<html><head><title>壳页</title></head><body><div id="app">请升级浏览器</div></body>` +
+    `<script type="application/ld+json">{"@type":"NewsArticle","articleBody":"<p>第一段全文内容。</p><p>第二段全文内容。</p><p>第三段全文内容。</p>","datePublished":"2026-08-24"}</script></html>`, 'text')
+  assert.ok(r.text.includes('第二段全文内容'), `ld body used: ${JSON.stringify(r.text.slice(0, 60))}`)
+  assert.ok(!r.text.includes('请升级浏览器'), `shell text dropped`)
+  assert.ok(r.published.startsWith('2026-08-24'), `ld date still works: ${r.published}`)
+  passed++
+  console.log('  ok - thin body falls back to ld+json articleBody')
+}
+{
+  const r = m.extract(`<html><body><main><article>正文足够长。<p>${'内容内容内容。'.repeat(40)}</p></article></main>` +
+    `<script type="application/ld+json">{"articleBody":"兜底正文不应覆盖充分正文"}</script></body></html>`, 'text')
+  assert.ok(r.text.includes('内容内容内容'), `real body kept: ${r.text.slice(0, 40)}`)
+  assert.ok(!r.text.includes('兜底正文'), `ld body skipped when DOM body is rich`)
+  passed++
+  console.log('  ok - articleBody fallback only when DOM body is thin')
+}
+{
+  const r = m.extract(`<html><body><main><article><p>无元数据正文内容。</p></article></main></body></html>`, 'text')
+  assert.equal(r.published, '', 'no fabricated date without any source')
+  passed++
+  console.log('  ok - no date fabricated when no source exists')
+}
+{
+  const r = m.extract(`<html><body><main><article><p>正文。<time datetime="2026-03-05T10:00:00+08:00">3月5日</time></p></article></main></body></html>`, 'text')
+  assert.ok(r.published.startsWith('2026-03-05'), `time datetime harvested: ${r.published}`)
+  passed++
+  console.log('  ok - <time datetime> supplies published')
+}
+{
+  const r = m.extract(`<html><body><main><article><p>发布于 2026年8月24日 的报道正文内容。</p></article></main></body></html>`, 'text')
+  assert.ok(r.published === '2026-08-24', `CJK date normalized: ${r.published}`)
+  passed++
+  console.log('  ok - CJK date normalized to ISO')
+}
+{
+  const html = '<table>' + '<tr><th>列A</th><th>列B</th></tr>' +
+    Array.from({ length: 40 }, (_, i) => `<tr><td>行${i}</td><td>值</td></tr>`).join('') + '</table>'
+  const r = m.extract(`<html><body><main>${html}</main></body></html>`, 'markdown')
+  assert.ok(r.text.includes('…+16 rows'), `cap hint present: ${JSON.stringify(r.text.slice(-30))}`)
+  assert.ok(!r.text.includes('行39'), `rows beyond cap dropped`)
+  passed++
+  console.log('  ok - markdown table capped at 25 rows with +N hint')
+}
+{
+  const r = m.extract(`<html><body><main><article><p>正​文零⁠宽字符</p><h2>标题​</h2></article></main></body></html>`, 'text')
+  assert.ok(!/[\u200b-\u200d\u2060\ufeff]/.test(r.text), `zero-width stripped: ${JSON.stringify(r.text.slice(0, 30))}`)
+  assert.ok(r.text.includes('正文零宽字符'), `text intact: ${r.text.slice(0, 20)}`)
+  passed++
+  console.log('  ok - zero-width characters stripped from output')
+}
+{
+  const md = m.blockMd('<p>a\u200bb</p>')
+  assert.ok(!md.includes('\u200b'), `markdown path stripped: ${JSON.stringify(md)}`)
+  passed++
+  console.log('  ok - zero-width stripped in markdown mode')
 }
 
 console.log(`\n${passed} assertions passed`)

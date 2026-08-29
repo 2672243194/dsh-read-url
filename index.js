@@ -329,6 +329,10 @@ function defuseLt(html) {
   return html.slice(0, from) + html.slice(from).replace(/</g, ' ')
 }
 
+// Invisible-to-readers joiner characters (zero-width space/joiners, word
+// joiner, BOM) cost tokens and leak into copy/paste text — strip at render.
+const ZW_RE = /[\u200b-\u200d\u2060\ufeff]/g
+
 function textOnly(html) {
   return decodeTextEntities(defuseLt(html)
     .replace(/<!--[\s\S]*?-->/g, ' ')
@@ -338,6 +342,7 @@ function textOnly(html) {
     .replace(/<noscript[\s>][\s\S]*?<\/noscript>/gi, ' ')
     .replace(/<[^>]{1,1000}>/g, ' ')
     .replace(/[ \t\r\n]+/g, ' ')
+    .replace(ZW_RE, '')
     .trim())
 }
 
@@ -357,7 +362,7 @@ function textLines(html) {
     .replace(/<\/?(?:p|div|section|article|main|h[1-6]|li|ul|ol|table|tbody|thead|tfoot|tr|blockquote|pre|figcaption|dt|dd|dl|figure|fieldset|option)\b[^>]{0,1000}>/gi, '\n')
     .replace(/<[^>]{1,1000}>/g, ' '))
   const lines = []
-  for (const rawLine of cleaned.split('\n')) {
+  for (const rawLine of cleaned.replace(ZW_RE, '').split('\n')) {
     let line = rawLine.replace(/[ \t\r\f\v]+/g, ' ').trim()
     // A heading becomes its own short paragraph in this layout; a trailing
     // permalink glyph on one is anchor decoration, not content.
@@ -588,6 +593,7 @@ function imgsToMarkdown(html) {
 // the walker degrades to plain text.
 const OPEN_TAG_RE = /<([a-zA-Z0-9]+)((?:"[^"]*"|'[^']*'|[^'">]){0,1000})>/g
 const MD_MAX_DEPTH = 100
+const MD_TABLE_MAX_ROWS = 25
 function stripUnmatchedOpeners(html) {
   const closers = new Set()
   for (const m of html.matchAll(/<\/([a-zA-Z0-9]+)/g)) closers.add(m[1].toLowerCase())
@@ -713,7 +719,12 @@ export function blockMd(html, depth = 0) {
         // unescape cells' escaped pipes before deriving the separator row,
         // otherwise the --- line is one char wider per escaped pipe
         const sep = header.replace(/\\\|/g, '|').replace(/[^|]/g, '-')
-        out += `\n\n${rows.join('\n')}\n${sep}`
+        // Compatibility tables (40+ rows × many columns) are the single
+        // largest token sink in markdown mode; the hint keeps the model
+        // aware the table continues without repeating the cell noise.
+        const kept = rows.length > MD_TABLE_MAX_ROWS ? rows.slice(0, MD_TABLE_MAX_ROWS) : rows
+        const more = rows.length - kept.length
+        out += `\n\n${kept.join('\n')}\n${sep}${more > 0 ? `\n…+${more} rows` : ''}`
       }
     } else if (tag === 'a' || tag === 'strong' || tag === 'b' || tag === 'em' || tag === 'i') {
       const t = inlineMd(inner, depth + 1)
@@ -723,7 +734,7 @@ export function blockMd(html, depth = 0) {
       if (t) out += t
     }
   }
-  return img.restore(out)
+  return img.restore(out).replace(ZW_RE, '')
 }
 
 // Read the content attribute of the FIRST <meta> whose property/name equals
@@ -818,6 +829,57 @@ function jsonLdMeta(html) {
   return { published: '', author: '' }
 }
 
+// News portals frequently ship the FULL article text inside ld+json
+// (articleBody) while the visible HTML is an anti-bot shell or a thin
+// fragment — a fallback body source the DOM extractors cannot reach. Returns
+// the first string articleBody found (array values joined), stripped to
+// paragraphs via textLines. Block scan is the same bounded LDJSON_RE.
+function jsonLdArticleBody(html) {
+  for (const m of html.matchAll(LDJSON_RE)) {
+    let json
+    try {
+      json = JSON.parse(m[1])
+    } catch {
+      continue
+    }
+    const nodes = []
+    const collect = (node, depth = 0) => {
+      if (!node || typeof node !== 'object' || depth > 20) return
+      if (Array.isArray(node)) {
+        for (const it of node) collect(it, depth + 1)
+        return
+      }
+      nodes.push(node)
+      for (const k of Object.keys(node)) {
+        const v = node[k]
+        if (v && typeof v === 'object') collect(v, depth + 1)
+      }
+    }
+    collect(json)
+    for (const n of nodes) {
+      const raw = Array.isArray(n.articleBody) ? n.articleBody.join('\n\n') : n.articleBody
+      if (typeof raw === 'string' && raw.trim()) return textLines(raw).slice(0, 200000)
+    }
+  }
+  return ''
+}
+
+// Semantic <time datetime="..."> — common on blogs/docs that ship no meta or
+// ld+json date. First occurrence wins; empty attribute is a no-op.
+function timeTagMeta(html) {
+  const m = /<time\b[^>]{0,1000}datetime=["']([^"']{1,60})["']/i.exec(html || '')
+  return m ? m[1].trim().slice(0, 40) : ''
+}
+
+// CJK / loose-variant dates normalize to ISO so the metadata line stays
+// comparable across sources ("2026年8月24日" → "2026-08-24"). Anything that
+// does not match a recognized shape passes through untouched.
+function normalizeDate(s) {
+  const m = /^(\d{4})\s*[年/\-.]\s*(\d{1,2})\s*[月/\-.]\s*(\d{1,2})\s*日?$/.exec((s || '').trim())
+  if (!m) return s
+  return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`
+}
+
 // Meta-less pages still print the byline inside the body head: "作者：阮一峰
 // 日期：2026年8月21日". Fill ONLY the missing fields, and only from the first
 // 600 chars of body text — deeper matches are content, not bylines.
@@ -833,7 +895,7 @@ function bylineFallback(text, meta) {
   }
   if (!out.published) {
     const m = BYLINE_DATE_RE.exec(head)
-    if (m) out.published = m[1].replace(/\s+/g, ' ').trim().slice(0, 40)
+    if (m) out.published = normalizeDate(m[1].replace(/\s+/g, ' ').trim().slice(0, 40))
   }
   return out
 }
@@ -897,13 +959,17 @@ export function extract(html, mode, anchor = '') {
   }
   const meta = extractMeta(html)
   const ld = jsonLdMeta(html)
-  // Merge chain: <meta> → JSON-LD → byline. An explicit article:/og: meta date
-  // stays authoritative; otherwise a JSON-LD datePublished beats the generic
-  // date meta key (last-modified stamps are not publication times).
-  const published = ld.published
-    ? (meta.publishedExplicit ? meta.published : ld.published)
-    : meta.published
+  // Merge chain: explicit article:/og: meta date → JSON-LD datePublished →
+  // <time datetime> (semantic markup usually marks publication, unlike the
+  // generic date meta key which is often last-modified) → generic date meta →
+  // byline text. jsonLdArticleBody doubles as a thin-body fallback below.
+  const published = meta.publishedExplicit
+    ? meta.published
+    : normalizeDate(ld.published || timeTagMeta(html) || meta.published)
   const author = ld.author || meta.author
+  // Thin-body fallback: anti-bot shells and JS-only pages still carry the
+  // full article in ld+json — prefer it over the short og:description hint.
+  const ldBody = bodyText.length < 200 ? jsonLdArticleBody(html) : ''
   // Empty-body pages (login walls, JS-only shells) still carry og:description
   // — surface it as a fallback hint instead of nothing.
   let text = bodyText
@@ -911,6 +977,10 @@ export function extract(html, mode, anchor = '') {
   if (!text && meta.description) {
     text = meta.description
     usedDescription = true
+  }
+  if (ldBody && ldBody.length > text.length) {
+    text = ldBody
+    usedDescription = false
   }
   const byline = bylineFallback(text, { published, author })
   return {
