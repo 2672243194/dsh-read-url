@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.6.0] - 2026-08-30
+
+> 迭代 2（站点类型扩展轮）：AMP/响应式图片、纯文本家族原生路径、非标准 JSON 消毒。零 schema 变更。
+
+### 新增
+
+- **AMP 页面图片**：AMP HTML 用 `<amp-img>` 代替 `<img>`，markdown 模式图片此前全丢——图片预处理同等对待 amp-img（alt/src/data-src 同一套规则）。
+- **`<picture>/<source srcset>` 回退**：响应式布局把真实图片 URL 放在 `<source srcset>`、`<img>` 只留 data: 占位时，首个 source URL 注入 img 兜底；img 自带可用 src 的 picture 不动。
+- **纯文本家族原生路径**：`text/plain` / `text/markdown` / `text/csv` 且前 5000 字符无 HTML 标签形状时不再走 HTML 管线（那会把每行压平成一段）——行结构原样保留（CRLF 归一、行尾空白清理、3+ 空行折叠）。.txt 日志、.md 文档、robots.txt、CSV 数据集逐行可读。被错误标成 text/plain 的真 HTML 页仍走 HTML 管线。
+- **JSON NaN/Infinity 消毒**：JS 手写序列化产物含 `NaN`/`Infinity`（非法 JSON）时 `JSON.parse` 整页失败、退化成 HTML 管线输出原始转储。解析失败后以字面量置 null 重试一次（仅在已非法的 JSON 上应用）。
+
+### 验证
+
+- 单元断言 **170 → 175**（+5：amp-img、picture 注入、picture 不动、text/plain 行结构 + 误标 HTML 回归、NaN JSON）+ 12 SPA + probe 47 全绿；
+- site-types.mjs **12 类 10/12 语义通过**（2 例境外连接超时）：text/markdown（155 行结构保留）、robots.txt（164 行）实网验证；WordPress feed / `<time>` 博客 / 懒加载图片复验通过。
+
 ## [1.5.2] - 2026-08-30
 
 > 迭代 1（底层管线审查轮）：fetchPage/重试/竞速/解码/spa/爬虫链路的例行审查，2 个真 bug + 2 处健壮性，零 schema 变更。

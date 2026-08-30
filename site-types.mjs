@@ -43,6 +43,12 @@ const CASES = [
   // Markdown 表格帽: 兼容性表页面不应产出无限表格（< 20000 字符窗口内应见到帽或小表）。
   ['table-mdn-armed', 'https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array', { mode: 'markdown' },
     (r) => r.error ? [false, r.error] : [!/\| -{3,}\|/.test(r.text.slice(0)) || r.charsTotal < 20000 || true, `chars=${r.charsTotal}`]],
+  // text/markdown 原生路径: 行结构保留（HTML 管线会压平换行）。npm 已发布版本。
+  ['text-md-jsdelivr', 'https://cdn.jsdelivr.net/npm/dsh-read-url@1.4.0/README.zh.md', {},
+    (r) => r.error ? [false, r.error] : [/\n/.test(r.text) && r.text.includes('#'), `newlines=${(r.text.match(/\n/g) || []).length}`]],
+  // text/plain 原生路径: robots.txt 逐行可读。
+  ['text-txt-robots', 'https://www.baidu.com/robots.txt', {},
+    (r) => r.error ? [false, r.error] : [/\n/.test(r.text) && /User-agent|Disallow|Sitemap/i.test(r.text), `lines=${(r.text.match(/\n/g) || []).length}`]],
 ]
 
 const results = await Promise.all(CASES.map(async ([name, url, args, check]) => {

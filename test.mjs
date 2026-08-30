@@ -1694,6 +1694,74 @@ console.log('v1.5.1: anchor-vs-ldbody guard / content:encoded / balanced strip /
   console.log('  ok - publication-marked <time> wins; footer time out of scope')
 }
 
+console.log('v1.6.0: amp-img / picture source / text-plain native / NaN json')
+{
+  // AMP pages: <amp-img> carries the same alt/src contract as <img>.
+  const md = m.blockMd('<amp-img alt="AMP 描述图" src="https://cdn.example/amp.jpg" layout="responsive"></amp-img>')
+  assert.ok(md.includes('![AMP 描述图](https://cdn.example/amp.jpg)'), `amp-img emitted: ${md}`)
+  passed++
+  console.log('  ok - amp-img rendered as markdown image')
+}
+{
+  // <picture>: img fallback without usable src → first source srcset injected.
+  const md = m.blockMd('<picture>' +
+    '<source srcset="https://cdn.example/hero.webp 1x, https://cdn.example/hero2x.webp 2x" media="(min-width:800px)">' +
+    '<img alt="响应式图" src="data:image/gif;base64,R0lGOD">' +
+    '</picture>')
+  assert.ok(md.includes('https://cdn.example/hero.webp'), `source srcset used: ${md}`)
+  assert.ok(md.includes('![响应式图]'), `alt kept: ${md}`)
+  passed++
+  console.log('  ok - picture/source fallback feeds the img pass')
+}
+{
+  // <picture> with a working img src: untouched (source is just a hint).
+  const md = m.blockMd('<picture><source srcset="https://a.example/x.avif"><img alt="普通" src="https://b.example/y.jpg"></picture>')
+  assert.ok(md.includes('https://b.example/y.jpg') && !md.includes('x.avif'), `img fallback preserved: ${md}`)
+  passed++
+  console.log('  ok - picture with usable img src untouched')
+}
+{
+  // text/plain native path: newlines preserved (local server).
+  const http = await import('node:http')
+  const server = http.createServer((req, res) => {
+    if (req.url === '/log.txt') {
+      res.setHeader('content-type', 'text/plain; charset=utf-8')
+      res.end('INFO 2026-08-30 service started\r\nERROR 2026-08-30 disk full\r\n\n\n\n\nINFO  recovery done\n')
+    } else if (req.url === '/html-as-text') {
+      res.setHeader('content-type', 'text/plain')
+      res.end('<html><body><p>错误标成纯文本的网页</p></body></html>')
+    }
+  })
+  await new Promise((r) => server.listen(18100, r))
+  const cfg = { timeoutMs: 5000, maxBytes: 3 * 1024 * 1024, maxChars: 6000, maxLinks: 20, cacheTtlMs: 1, cacheMax: 2, spaRender: false, paginate: false, paginateMax: 1, userAgent: 'x' }
+  const r = await m.readUrl({ url: 'http://127.0.0.1:18100/log.txt', maxChars: 2000 }, undefined, undefined, cfg)
+  assert.ok(!r.error, `text/plain ok: ${JSON.stringify(r).slice(0, 80)}`)
+  assert.ok(r.text.includes('ERROR 2026-08-30 disk full\n'), `newlines preserved: ${JSON.stringify(r.text.slice(0, 80))}`)
+  assert.ok(!/\n{4,}/.test(r.text), `blank runs collapsed`)
+  const r2 = await m.readUrl({ url: 'http://127.0.0.1:18100/html-as-text', maxChars: 500 }, undefined, undefined, cfg)
+  assert.ok(!r2.error && r2.text.includes('错误标成纯文本的网页'), `html-as-text keeps html pipeline`)
+  server.close()
+  passed++
+  console.log('  ok - text/plain served natively with line structure; mislabelled html stays html')
+}
+{
+  // NaN/Infinity JSON: invalid for JSON.parse — loose retry salvages the page.
+  const http = await import('node:http')
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json')
+    res.end('{"name":"sensor","temp":NaN,"range":[1,Infinity],"low":-Infinity}')
+  })
+  await new Promise((r) => server.listen(18101, r))
+  const cfg = { timeoutMs: 5000, maxBytes: 3 * 1024 * 1024, maxChars: 6000, maxLinks: 20, cacheTtlMs: 1, cacheMax: 2, spaRender: false, paginate: false, paginateMax: 1, userAgent: 'x' }
+  const r = await m.readUrl({ url: 'http://127.0.0.1:18101/sensor', maxChars: 1000 }, undefined, undefined, cfg)
+  server.close()
+  assert.ok(!r.error, `nan-json ok: ${JSON.stringify(r).slice(0, 80)}`)
+  assert.equal(r.mode, 'json', `json mode kept: ${r.mode}`)
+  assert.ok(r.text.includes('"name":"sensor"') && r.text.includes('"temp":null'), `NaN nulled: ${r.text.slice(0, 90)}`)
+  passed++
+  console.log('  ok - NaN/Infinity JSON nulled and served as json')
+}
+
 console.log(`\n${passed} assertions passed`)
 // All assertions are synchronous or top-level awaited; reaching here means every
 // one passed, so force a clean exit (avoids environment-specific exit-code noise).

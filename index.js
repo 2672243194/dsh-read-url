@@ -100,10 +100,11 @@ export function decodeBuffer(buffer, contentType) {
   return { text, charset: enc }
 }
 
-// Content types this plugin can consume. Beyond HTML: JSON (data APIs) and
-// XML (RSS/Atom feeds) are read natively — see readUrl's type dispatch.
+// Content types this plugin can consume. Beyond HTML: JSON (data APIs),
+// XML (RSS/Atom feeds) and plain-text families (txt/md/csv — logs, docs,
+// datasets) are read natively — see readUrl's type dispatch.
 // Note "application/rss+xml": the separator before xml is '+', not '/'.
-const FETCHABLE_CT = /text\/html|application\/xhtml|text\/plain|\/json|[+/]xml/i
+const FETCHABLE_CT = /text\/html|application\/xhtml|text\/(?:plain|markdown|csv)|\/json|[+/]xml/i
 
 // Retry-After header (seconds form) → ms, capped; undefined when absent/invalid.
 function retryAfterMs(res) {
@@ -607,7 +608,19 @@ function escInline(s) {
 const IMG_SENTINEL = '\u0001'
 function imgsToMarkdown(html) {
   const store = []
-  const out = html.replace(/<img\b[^>]{0,1000}>/gi, (tag) => {
+  // AMP pages use <amp-img> instead of <img>; responsive layouts wrap images
+  // in <picture><source srcset>. When the <img> fallback carries no usable
+  // src (lazy placeholder), the first source URL is injected into it so the
+  // normal img pass below still emits the image.
+  html = html.replace(/<picture\b[^>]*>([\s\S]{0,50000}?)<\/picture\s*>/gi, (block) => {
+    const imgTag = /<img\b[^>]{0,1000}>/i.exec(block)
+    const imgSrc = imgTag && /(?:^|\s)src=["']([^"']+)["']/i.exec(imgTag[0])
+    if (imgTag && imgSrc && !/^data:/i.test(imgSrc[1])) return block
+    const source = /<source\b[^>]{0,1000}\bsrcset=["']([^"'\s>]+)/i.exec(block)
+    if (!source || !imgTag) return block
+    return block.replace(/<img\b[^>]{0,1000}>/i, (img0) => img0.replace(/<img/i, `<img src="${source[1]}"`))
+  })
+  const out = html.replace(/<(?:amp-)?img\b[^>]{0,1000}>/gi, (tag) => {
     const alt = /alt=["']([^"']*)["']/i.exec(tag)
     let src = /src=["']([^"']+)["']/i.exec(tag)
     let srcVal = src && src[1]
@@ -1437,16 +1450,26 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     return { error }
   }
 
-  // Non-HTML payloads (JSON APIs, RSS/Atom feeds) are read natively: fetch,
-  // dispatch by content-type / payload shape, render compact. Falls back to
-  // the HTML pipeline for everything else.
+  // Non-HTML payloads (JSON APIs, RSS/Atom feeds, plain text files) are read
+  // natively: fetch, dispatch by content-type / payload shape, render compact.
+  // Falls back to the HTML pipeline for everything else.
+  // JSON with JS-only literals (NaN/Infinity — hand-rolled serializers) is
+  // not valid JSON: retry once with the literals nulled rather than dropping
+  // the whole page into the HTML pipeline as a raw-text dump.
+  const parseJsonLoose = (t) => {
+    try {
+      return JSON.parse(t)
+    } catch {
+      return JSON.parse(t.replace(/-?(?:NaN|Infinity)\b/g, 'null'))
+    }
+  }
   const dispatch = async () => {
     const viaSeam = await fetchViaWebSeam(ctx, url, externalSignal, cfg)
     if (viaSeam) {
       const t = viaSeam.html.trim()
       if (t.startsWith('{') || t.startsWith('[')) {
         try {
-          return { kind: 'json', text: compactJson(JSON.parse(t)) }
+          return { kind: 'json', text: compactJson(parseJsonLoose(t)) }
         } catch { /* not JSON — keep HTML pipeline */ }
       }
       return { kind: 'html', html: viaSeam.html, finalUrl: viaSeam.finalUrl, charset: 'provider-decoded' }
@@ -1457,7 +1480,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     const decoded = decodeBuffer(page.buffer, page.contentType)
     if (/json$/.test(ct)) {
       try {
-        return { kind: 'json', text: compactJson(JSON.parse(decoded.text)) }
+        return { kind: 'json', text: compactJson(parseJsonLoose(decoded.text)) }
       } catch { /* invalid JSON — serve through the HTML pipeline as text */ }
     }
     if (/[+/]xml$/.test(ct)) {
@@ -1468,11 +1491,30 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
         return { kind: 'feed', feed: parseFeed(decoded.text, cfg.maxLinks) }
       }
     }
+    // Plain-text families (txt/md/csv): line structure IS the content — the
+    // HTML pipeline would flatten every newline into spaces. Pages that are
+    // actually HTML but mislabelled text/plain keep the HTML pipeline.
+    if (/^text\/(?:plain|markdown|csv)$/.test(ct)) {
+      const head = decoded.text.slice(0, 5000)
+      if (!/<(?:html|body|div|p|table)\b[\s>]/i.test(head)) {
+        const text = decoded.text
+          .replace(/\r\n?/g, '\n')
+          .replace(/[ \t]+\n/g, '\n')
+          .replace(/\n{4,}/g, '\n\n\n')
+          .trim()
+        return { kind: 'text', text, charset: decoded.charset }
+      }
+    }
     return { kind: 'html', html: decoded.text, finalUrl: page.finalUrl || url, charset: decoded.charset }
   }
   const payload = await dispatch()
   if (payload.error) return failWith(payload.error)
 
+  if (payload.kind === 'text') {
+    const full = { url, title: '', siteName: hostOf(url), lang: '', charset: payload.charset, mode: 'text', fullText: payload.text, paginated: 1 }
+    cacheStore(cacheKey, full, cfg.cacheMax)
+    return sliceFrom(full, offset, maxChars)
+  }
   if (payload.kind === 'json') {
     const full = { url, title: '', siteName: hostOf(url), lang: '', charset: 'json', mode: 'json', fullText: payload.text, paginated: 1 }
     cacheStore(cacheKey, full, cfg.cacheMax)
