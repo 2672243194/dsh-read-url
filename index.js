@@ -1385,9 +1385,13 @@ async function followMetaRefresh(html, finalUrl, externalSignal, cfg) {
   let curUrl = finalUrl
   let curCharset = '' // set only when a hop actually happened
   const seen = new Set([normalizeUrl(finalUrl)])
+  // Chain budget: each hop carries its own fetch timeout, so 3 hops could
+  // triple the call's cost — the whole follow chain shares ONE timeout.
+  const t0 = Date.now()
   for (let i = 0; i < MAX_META_REFRESH_HOPS; i++) {
     const target = metaRefreshTarget(cur, curUrl)
     if (!target) break
+    if (Date.now() - t0 > cfg.timeoutMs) break
     const norm = normalizeUrl(target)
     if (!norm || seen.has(norm)) break
     seen.add(norm)
@@ -1409,6 +1413,10 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   const maxChars = Math.max(500, Math.min(20000, Number(args.maxChars) || cfg.maxChars))
   const mode = args.mode === 'markdown' ? 'markdown' : 'text'
   const offset = Math.max(0, Number(args.offset) || 0)
+  // Wall-clock anchor for the pagination budget below (the tool timeout
+  // formula reserves paginateMax+1 fetches + render slack; the in-code guard
+  // keeps a slow page from consuming the budget meant for the rest).
+  const startedAt = Date.now()
 
   // Cache stores the FULL extracted text keyed by url+mode+includeLinks, so
   // continuation reads (offset) and different maxChars hit the same entry —
@@ -1436,11 +1444,21 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   // broken URL in a loop (token + latency saver).
   const fh = failCache.get(cacheKey)
   if (fh) {
-    if (Date.now() - fh.time < 30000) return { error: fh.error, cached: true }
+    if (Date.now() - fh.time < 30000) {
+      // LRU touch: re-insert as the newest slot so repeated failures on a
+      // busy session don't evict (and re-fetch) this URL before its TTL ends.
+      failCache.delete(cacheKey)
+      failCache.set(cacheKey, fh)
+      return { error: fh.error, cached: true }
+    }
     failCache.delete(cacheKey)
   }
   const hit = cache.get(cacheKey)
   if (hit && Date.now() - hit.time < cfg.cacheTtlMs) {
+    // LRU touch: hot pages survive eviction even when cached long ago — the
+    // Map re-insertion moves the entry to the newest slot.
+    cache.delete(cacheKey)
+    cache.set(cacheKey, hit)
     const sliced = sliceFrom(hit.full, offset, maxChars)
     return { ...sliced, cached: true }
   }
@@ -1628,6 +1646,10 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   while (
     nextUrl && paginated < paginateMax &&
     sameHost(nextUrl, startHost) &&
+    // Budget guard: the whole read (initial fetch + renders + chain) must fit
+    // the tool timeout formula (paginateMax+1 fetches). A slow first page or
+    // SPA render eats into the chain's share here instead of overshooting.
+    Date.now() - startedAt < cfg.timeoutMs * (paginateMax + 1) &&
     !(externalSignal && externalSignal.aborted)
   ) {
     const nu = normalizeUrl(nextUrl)

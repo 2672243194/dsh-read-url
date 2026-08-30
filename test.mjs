@@ -1762,6 +1762,40 @@ console.log('v1.6.0: amp-img / picture source / text-plain native / NaN json')
   console.log('  ok - NaN/Infinity JSON nulled and served as json')
 }
 
+console.log('v1.6.1: LRU cache promotion')
+{
+  // LRU: a cache hit must re-insert as the newest slot. Fill the cache to
+  // max, read the OLDEST entry (promoting it), then overflow by one — the
+  // promoted entry must survive while the second-oldest is evicted instead.
+  // The cache is module-level and shared across this whole test file, so the
+  // plugin's own dispose (ctx.effect) clears it first for deterministic keys.
+  const http = await import('node:http')
+  let dispose = null
+  m.apply({ tools: { register: () => {} }, effect: (fn) => { try { dispose = fn() } catch { /* no cleanup */ } }, get: () => undefined }, {})
+  if (dispose) dispose()
+  const hitCount = { n: 0 }
+  const server = http.createServer((req, res) => {
+    hitCount.n++
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    res.end(`<html><body><article><p>页面内容 ${req.url} ${'文'.repeat(50)}</p></article></body></html>`)
+  })
+  await new Promise((r) => server.listen(18102, r))
+  const cfg = { timeoutMs: 5000, maxBytes: 3 * 1024 * 1024, maxChars: 6000, maxLinks: 20, cacheTtlMs: 300000, cacheMax: 3, spaRender: false, paginate: false, paginateMax: 1, userAgent: 'x' }
+  const read = (u) => m.readUrl({ url: `http://127.0.0.1:18102/${u}`, maxChars: 300 }, undefined, undefined, cfg)
+  await read('a') // cache order (oldest→newest): a
+  await read('b') // a, b
+  await read('c') // a, b, c  (full)
+  await read('a') // hit → promoted: b, c, a
+  await read('d') // overflow → evicts b: c, a, d
+  const fetchesBefore = hitCount.n // 4 fetches (a b c miss, d miss)
+  await read('a') // must still be cached
+  assert.equal(hitCount.n, fetchesBefore, `promoted 'a' survived eviction (fetches=${hitCount.n})`)
+  assert.ok((await read('b')).cached !== true, `evicted 'b' re-fetched`)
+  server.close()
+  passed++
+  console.log('  ok - cache hit promotes the entry (LRU, hot pages survive)')
+}
+
 console.log(`\n${passed} assertions passed`)
 // All assertions are synchronous or top-level awaited; reaching here means every
 // one passed, so force a clean exit (avoids environment-specific exit-code noise).
