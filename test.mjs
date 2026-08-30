@@ -1180,7 +1180,39 @@ ok('metaRefreshTarget: no refresh meta -> null', () => {
     passed++
     console.log('  ok - meta-refresh follow fails open (shell text kept)')
   }
+  {
+    // Crawler must follow the shell too: read_url_site lands on /real, not
+    // on the title-less hop stub.
+    const tools = []
+    m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }, { spaRender: false, cacheTtlMs: 1 })
+    const site = tools.find((t) => t.name === 'read_url_site')
+    const r = await site.execute({ url: `${base}/shell`, maxPages: 3, maxDepth: 1 })
+    assert.ok(!r.error, `crawl ok: ${JSON.stringify(r).slice(0, 80)}`)
+    const shellPage = (r.pages || []).find((p) => p.url === `${base}/shell`)
+    const realPage = (r.pages || []).find((p) => p.url === `${base}/real`)
+    assert.ok(realPage, `real page crawled: ${JSON.stringify((r.pages || []).map((p) => p.url))}`)
+    assert.ok(!shellPage || shellPage.title !== '跳转中', `shell not the final page`)
+    passed++
+    console.log('  ok - crawler follows meta-refresh shell to the real page')
+  }
   server.close()
+}
+
+{
+  // directFetch double-429: the second Retry-After shape must convert to a
+  // proper error (a shapeless { retryAfterMs } would reach decodeBuffer as a
+  // bufferless success and crash on a no-proxy host).
+  const http = await import('node:http')
+  let hits = 0
+  const server = http.createServer((req, res) => { hits++; res.writeHead(429, { 'retry-after': '0' }); res.end('throttled') })
+  await new Promise((r) => server.listen(18099, r))
+  const cfg = { timeoutMs: 5000, maxBytes: 3 * 1024 * 1024, maxChars: 6000, maxLinks: 20, cacheTtlMs: 1, cacheMax: 2, spaRender: false, paginate: false, paginateMax: 1, userAgent: 'x' }
+  const r = await m.directFetch('http://127.0.0.1:18099/x', undefined, cfg)
+  server.close()
+  assert.equal(hits, 2, `retried once: ${hits}`)
+  assert.ok(r.error && /rate limited/.test(r.error) && r.retryAfterMs === undefined, `proper error shape: ${JSON.stringify(r)}`)
+  passed++
+  console.log('  ok - double 429 Retry-After returns an error shape, not a bufferless success')
 }
 
 console.log('v1.3.1: robustness (meta attr order / charset equiv / json-ld size / markdown parens / crawl noise)')

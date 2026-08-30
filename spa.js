@@ -58,13 +58,13 @@ export async function renderPage(url, externalSignal) {
     // 'domcontentloaded' instead of 'networkidle': heartbeat-polling sites
     // (qq-news, juejin) never go idle and would time out at 30s. Instead wait
     // for the DOM to stabilize (content stops growing) up to 10s — SPA paint
-    // usually lands within a couple of seconds of DOM-ready.
-    // The cooperative signal aborts both the navigation and the poll loop, so
-    // a cancelled/timed-out call releases the browser immediately instead of
-    // burning the full poll window.
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000, signal: externalSignal || undefined })
+    // usually lands within a couple of seconds of DOM-ready. Two consecutive
+    // evaluate failures mean the page crashed — stop waiting for growth that
+    // can never come.
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
     const t0 = Date.now()
     let prevLen = -1
+    let evalFails = 0
     for (;;) {
       if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
       await page.waitForTimeout(500)
@@ -72,6 +72,7 @@ export async function renderPage(url, externalSignal) {
         .evaluate(() => (document.body ? document.body.innerHTML.length : 0))
         .catch(() => -1)
       if (Date.now() - t0 > 10000) break
+      if (len === -1 && ++evalFails >= 2) break
       // stop once two consecutive reads agree — including empty bodies (a
       // blank page should not burn the full 10s poll)
       if (len === prevLen && prevLen >= 0) break

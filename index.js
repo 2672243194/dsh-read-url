@@ -168,14 +168,24 @@ async function directFetchOnce(url, signal, cfg) {
 }
 
 // Direct-connect fetch with a single Retry-After-aware retry on 429/503.
-async function directFetch(url, signal, cfg) {
+// Exported for tests: the double-throttle path must always produce an { error }
+// shape — a second `{ retryAfterMs }` would otherwise leak past the race
+// filter into decodeBuffer as a bufferless "success" (bare TypeError there).
+export async function directFetch(url, signal, cfg) {
   const first = await directFetchOnce(url, signal, cfg)
   if (first && first.retryAfterMs !== undefined && !(signal && signal.aborted)) {
     await new Promise((resolve) => {
       const t = setTimeout(resolve, first.retryAfterMs)
       if (signal) signal.addEventListener('abort', () => { clearTimeout(t); resolve() }, { once: true })
     })
-    return directFetchOnce(url, signal, cfg)
+    if (signal && signal.aborted) return { error: 'cancelled' }
+    const second = await directFetchOnce(url, signal, cfg)
+    // The retry budget is spent — report the rate limit instead of returning
+    // a shapeless { retryAfterMs } (no buffer, no error) to the caller.
+    if (second && second.retryAfterMs !== undefined) {
+      return { error: 'HTTP 429/503 rate limited (retried once after Retry-After, still throttled)' }
+    }
+    return second
   }
   return first
 }
@@ -1931,11 +1941,19 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal) {
         visited.add(norm)
         const page = await fetchPage(url, externalSignal, cfg)
         if (page.error) return { url, depth, error: page.error }
-        const html = decodeBuffer(page.buffer, page.contentType).text
+        let html = decodeBuffer(page.buffer, page.contentType).text
+        let pageUrl = page.finalUrl || url
+        // Same shell-following as read_url: a meta-refresh stub would otherwise
+        // be crawled AS the page (title-less hop text pollutes results and the
+        // real content is never reached). Fails open — fetch problems keep the
+        // stub's own HTML.
+        const followed = await followMetaRefresh(html, pageUrl, externalSignal, cfg)
+        html = followed.html
+        pageUrl = followed.finalUrl
         const ex = extract(html, 'text')
-        const links = extractLinks(html, 100, page.finalUrl || url)
+        const links = extractLinks(html, 100, pageUrl)
         return {
-          url: page.finalUrl || url,
+          url: pageUrl,
           depth,
           title: ex.title || '',
           chars: ex.text.length,

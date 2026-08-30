@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.5.2] - 2026-08-30
+
+> 迭代 1（底层管线审查轮）：fetchPage/重试/竞速/解码/spa/爬虫链路的例行审查，2 个真 bug + 2 处健壮性，零 schema 变更。
+
+### 修复
+
+- **双次 429 形状崩溃（P0）**：`directFetchOnce` 在任意一次 429/503+Retry-After 都返回 `{ retryAfterMs }` 形状；`directFetch` 对第二次结果不检查原样返回——无代理路径绕过 raceFirstSuccess 的形状过滤，`decodeBuffer(undefined)` 在 `buffer[0]` 处裸抛 TypeError。现在重试预算耗尽时返回明确的 rate-limited error；等待 Retry-After 期间被 abort 则返回 cancelled（原先仍会补打一次请求）。`directFetch` 导出供测试直测（本机 Windows 系统代理无法通过环境变量屏蔽，无代理路径无法端到端复现）。
+- **爬虫不跟随 meta-refresh 壳页（P0）**：`crawlSite` 直连 fetchPage——read_url 已跟随跳板壳，read_url_site 却把壳页当正文爬（无标题跳板文本 + 永远到不了真实内容）。爬虫页处理接入 `followMetaRefresh`（fail-open），提取与出站链接均基于跟随后的文档。
+
+### 加固
+
+- **spa.js 渲染轮询**：`evaluate` 连续失败两次（页面已崩）即放弃 DOM 稳定等待，不再对崩溃页烧满 10s；移除 playwright `page.goto` 不支持的 `signal` 选项（静默忽略、误导读者），abort 语义由循环内检查与 catch 承担。
+
+### 验证
+
+- 单元断言 **168 → 170**（+2：directFetch 双 429 error 形状（本地 429 服务器直测，确认重试恰一次）；read_url_site 跟随壳页落在真实页）+ 12 SPA 断言 + probe 47 PASS 零 THROW 全绿。
+
 ## [1.5.1] - 2026-08-30
 
 > 例行审查轮：3 个实测坐实的 bug 修复 + 3 项健壮性加固 + 2 项站点适配，零 schema 变更。
