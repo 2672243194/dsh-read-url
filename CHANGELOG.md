@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.5.1] - 2026-08-30
+
+> 例行审查轮：3 个实测坐实的 bug 修复 + 3 项健壮性加固 + 2 项站点适配，零 schema 变更。
+
+### 修复（P0，均有复现用例）
+
+- **锚点读 × ld+json 兜底越权**：`extract()` 的 articleBody 兜底不感知锚点语义——定位到 <200 字符的小节时整篇 LD 全文覆盖小节内容（`anchored: true` 却返回全文）。现在锚点命中时跳过该兜底（与 readability 升级的既有守卫对齐）；无锚点的薄页仍正常兜底。
+- **feed `content:encoded` 全文丢失**：闭标签正则要求字面 `</content>`，`</content:encoded>` 永不匹配——WordPress 等博客 feed 的全文字段整段丢失只剩标题。改为捕获字段名 + 反向引用配对（`<content:encoded>` 必须配 `</content:encoded>`），顺带杜绝与 `</description>` 跨配对吞错内容。实测 WPJAM/WP学院 feed 每条恢复 200 字符实质摘要。
+- **隐藏/consent 嵌套泄漏**：容器内有先闭合的嵌套 `<div>` 时，非贪婪正则止步于第一个内层闭标签，其余横幅文本泄漏进正文（真实 consent 横幅普遍深嵌套）。改为深度计数平衡扫描（复用 tagBlockAt 思路）；扫描窗口 100KB 上限防「大量未闭合开标签」退化；未闭合 fail-open 保留内容。
+
+### 加固（P1）
+
+- **batch 单页异常隔离**：`mapLimit` 的 `Promise.all` 无守卫，单页意外 throw 会炸整批。每页 try/catch 转 `{error}`。
+- **batch 列表去重**：同一 URL 多次出现会并发双 fetch。按精确字符串去重（带 `#fragment` 的锚点读语义不同，不与裸 URL 合并）。
+- **`<time datetime>` 作用域收窄**：优先 `itemprop="datePublished"`/`pubdate` 标记的标签；扫描范围从全文档改为剥离噪声后的正文区——页脚/评论区的 time 标签不再劫持发布时间。
+
+### 站点适配（P2）
+
+- **noscript SEO 兜底**：SPA 壳把正文放 `<noscript>` 时（stripNoise 剥离的块），正文过薄则取最长的 noscript 块兜底（≥150 字符阈值；"请启用 JS" 类短横幅不触发）。
+- **懒加载图片**：markdown 模式 `<img src>` 缺失或为 data: 占位图时回退 `data-src`/`data-original`/`data-lazy-src`，描述性图片不再丢失。
+
+### 验证
+
+- 单元断言 **158 → 168**（+10：锚点守卫正反例 2、content:encoded + 跨配对 1、嵌套隐藏/consent 平衡移除 1、未闭合 fail-open 1、noscript 兜底正反例 2、懒加载回退 1、time 标记优先级 1；batch 上限断言改用 15 个不同 URL 并新增去重断言）
+- probe.mjs **39 → 47**（+8 对抗项：3000 个分散未闭合隐藏 div（窗口有界 408ms）、3000 层 consent 深嵌套完整移除 0.9ms、2000 未闭合 consent、隐藏 table、50k articleBody、畸形 LDJSON、3000 noscript 块、未闭合 noscript——全部无 THROW）
+- 新增 `site-types.mjs` 站点类型语义探针（10 类，按类型断言而非字符数）：**8/10 语义通过**，2 例境外连接超时（环境边界）。关键实锤——WordPress feed（content:encoded）摘要恢复、`<time datetime>` 博客 published 提取（2026-08-28）、懒加载站点 markdown 图片 15 张、MediaWiki 变体百科正文干净
+- 152 站全量回归：**103 OK / 25 THIN+EMPTY / 24 ERR / 0 THREW**，OK 站零噪声；5 个首窗字符下降站点经 v1.3.1/v1.4.0 模块 A/B 比对确认均为段落化重排效应，内容完整（总字符量普遍增加）
+
 ## [1.5.0] - 2026-08-29
 
 > 元数据补全与 token 边角打磨轮。152 站回归确认 1.4.0 无内容性回归后，聚焦三处已核实的缺口（响应大小上限 3MB、RSS 摘要、nav 剔除等此前已就位的项不再重复）。

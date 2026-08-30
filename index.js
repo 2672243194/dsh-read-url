@@ -405,7 +405,10 @@ function parseFeed(xml, limit) {
     const linkTag = /<link[^>]*>([\s\S]*?)<\/link>/i.exec(it)
     const linkHref = /<link[^>]+href=["']([^"']+)["']/i.exec(it)
     const link = (linkTag && xmlText(linkTag[1])) || (linkHref && linkHref[1]) || ''
-    const desc = xmlText(/<(?:description|summary|content)[^>]*>([\s\S]*?)<\/(?:description|summary|content)>/i.exec(it)?.[1] || '')
+    // Namespaced fields (WordPress <content:encoded>) pair via a captured
+    // name + backreference: the closer must match the SAME name, so a
+    // <content:encoded> opener can never pair with a distant </description>.
+    const desc = xmlText(/<((?:description|summary|content)(?::[a-zA-Z0-9]+)?)(?:\s[^>]*)?>([\s\S]*?)<\/\1\s*>/i.exec(it)?.[2] || '')
     if (!title && !link && !desc) continue
     items.push({ title: title.slice(0, 120), url: link, summary: desc.slice(0, 200) })
   }
@@ -458,13 +461,16 @@ export function densityFilter(html) {
 
 // Depth-counted block extraction: returns html from the opening tag at
 // openIdx through its BALANCED closing tag. A non-greedy regex would stop at
-// the first nested </div>, truncating heavily nested container divs.
-function tagBlockAt(html, openIdx, tagName) {
+// the first nested </div>, truncating heavily nested container divs. maxScan
+// bounds the search window — a closer further out than that is treated as
+// absent (keeps hostile many-unclosed-opens inputs linear).
+function tagBlockAt(html, openIdx, tagName, maxScan = Infinity) {
   const re = new RegExp(`</?${tagName}(?=[\\s>])`, 'gi')
   re.lastIndex = openIdx
   let depth = 0
   let m
   while ((m = re.exec(html))) {
+    if (m.index - openIdx > maxScan) return null
     depth += m[0][1] === '/' ? -1 : 1
     if (depth === 0) {
       const close = html.indexOf('>', m.index)
@@ -472,6 +478,29 @@ function tagBlockAt(html, openIdx, tagName) {
     }
   }
   return null
+}
+
+// Remove every element matched by an OPEN-TAG-ONLY pattern together with its
+// balanced content. The pattern must capture the tag name (group 1) so the
+// scanner counts only same-name open/close pairs. Unclosed matches (no closer
+// within the 100k scan window) are left in place — fail-open. Each match
+// continues from the removed block's end, so removed interiors are never
+// rescanned and total cost stays near-linear in the surviving input.
+const BALANCED_SCAN_WINDOW = 100000
+function stripBalanced(html, openTagRe) {
+  openTagRe.lastIndex = 0
+  let out = ''
+  let last = 0
+  let m
+  while ((m = openTagRe.exec(html))) {
+    const tag = m[1].toLowerCase()
+    const block = tagBlockAt(html, m.index, tag, BALANCED_SCAN_WINDOW)
+    if (!block) continue // unclosed container — keep the content
+    out += html.slice(last, m.index) + ' '
+    last = m.index + block.length
+    openTagRe.lastIndex = last
+  }
+  return out + html.slice(last)
 }
 
 export function pickMain(html) {
@@ -545,11 +574,11 @@ function stripNoise(mainHtml) {
   // body. The [\s"'] guard keeps `hidden`/`style` from matching inside
   // compound attr names (data-hidden, aria-hidden). Consent/GDPR banners mount
   // by id (onetrust, cookiebot, cybot, gdpr) rather than class, so a second
-  // pass keys on the id attribute. Every scan run is bounded.
-  const hidden = /<(div|span|section|p|ul|table)\b[^>]{0,1000}[\s"'](?:hidden\b|aria-hidden\s*=\s*["']?true|style\s*=\s*["'][^"']{0,200}(?:display:\s*none|visibility:\s*hidden))[^>]{0,1000}>[\s\S]{0,50000}?<\/\1\s*>/gi
-  out = out.replace(hidden, ' ')
-  const consent = /<([a-z][a-z0-9]*)\s+id=["'][^"']{0,120}(?:onetrust|cookiebot|cybot|gdpr|consent|cookie-law|cookie_banner|cmp-)[^"']{0,120}["'][^>]{0,1000}>[\s\S]{0,50000}?<\/\1\s*>/gi
-  out = out.replace(consent, ' ')
+  // pass keys on the id attribute. Removal is a depth-counted balanced scan —
+  // banners are deeply nested and a lazy `[\s\S]*?` would stop at the first
+  // inner closer, leaking the rest of the banner text.
+  out = stripBalanced(out, /<(div|span|section|p|ul|table)\b[^>]{0,1000}[\s"'](?:hidden\b|aria-hidden\s*=\s*["']?true|style\s*=\s*["'][^"']{0,200}(?:display:\s*none|visibility:\s*hidden))[^>]{0,1000}>/gi)
+  out = stripBalanced(out, /<([a-z][a-z0-9]*)\s+id=["'][^"']{0,120}(?:onetrust|cookiebot|cybot|gdpr|consent|cookie-law|cookie_banner|cmp-)[^"']{0,120}["'][^>]{0,1000}>/gi)
   return out.replace(
     /<([a-z][a-z0-9]*)[^>]{1,1000}class=["'][^"']{0,300}(ad-|ads|advert|banner|sidebar|social|share|comment|popup|modal|cookie)[^"']{0,300}["'][^>]{0,1000}>[\s\S]*?<\/\1>/gi,
     ' ',
@@ -570,8 +599,15 @@ function imgsToMarkdown(html) {
   const store = []
   const out = html.replace(/<img\b[^>]{0,1000}>/gi, (tag) => {
     const alt = /alt=["']([^"']*)["']/i.exec(tag)
-    const src = /src=["']([^"']+)["']/i.exec(tag)
-    store.push(src && alt && alt[1].trim() ? `![${alt[1].trim()}](${src[1]})` : '')
+    let src = /src=["']([^"']+)["']/i.exec(tag)
+    let srcVal = src && src[1]
+    // Lazy-load wrappers keep the real URL in data-* attributes; a data: URI
+    // src is an inline placeholder spacer, not a usable image reference.
+    if (!srcVal || /^data:/i.test(srcVal)) {
+      const lazy = /data-(?:src|original|lazy-src)=["']([^"']+)["']/i.exec(tag)
+      if (lazy) srcVal = lazy[1]
+    }
+    store.push(srcVal && alt && alt[1].trim() ? `![${alt[1].trim()}](${srcVal})` : '')
     return `${IMG_SENTINEL}${store.length - 1}${IMG_SENTINEL}`
   })
   return {
@@ -864,10 +900,29 @@ function jsonLdArticleBody(html) {
   return ''
 }
 
+// SPA shells ship their SEO copy inside <noscript> (the block the stripNoise
+// pass removes from main content). A thin body falls back to the LONGEST
+// noscript block when it carries substantive text; short ones are UI noise
+// ("please enable JavaScript"). Unclosed blocks simply never match — fail-open.
+function noscriptBody(html) {
+  let best = ''
+  for (const m of html.matchAll(/<noscript[^>]{0,500}>([\s\S]{0,50000}?)<\/noscript\s*>/gi)) {
+    const t = textLines(m[1])
+    if (t.length > best.length) best = t
+  }
+  return best.length >= 150 ? best : ''
+}
+
 // Semantic <time datetime="..."> — common on blogs/docs that ship no meta or
-// ld+json date. First occurrence wins; empty attribute is a no-op.
+// ld+json date. Tags explicitly marked as publication time (itemprop/pubdate)
+// win; otherwise the FIRST time tag in the scoped html is used. Callers pass
+// the noise-stripped main content so footer/comment timestamps (which carry
+// their own <time> tags) are out of scope. Empty attribute is a no-op.
 function timeTagMeta(html) {
-  const m = /<time\b[^>]{0,1000}datetime=["']([^"']{1,60})["']/i.exec(html || '')
+  if (!html) return ''
+  const marked = /<time\b[^>]{0,1000}(?:itemprop=["']datePublished["']|pubdate\b)[^>]{0,1000}datetime=["']([^"']{1,60})["']/i.exec(html)
+  if (marked) return marked[1].trim().slice(0, 40)
+  const m = /<time\b[^>]{0,1000}datetime=["']([^"']{1,60})["']/i.exec(html)
   return m ? m[1].trim().slice(0, 40) : ''
 }
 
@@ -965,11 +1020,14 @@ export function extract(html, mode, anchor = '') {
   // byline text. jsonLdArticleBody doubles as a thin-body fallback below.
   const published = meta.publishedExplicit
     ? meta.published
-    : normalizeDate(ld.published || timeTagMeta(html) || meta.published)
+    : normalizeDate(ld.published || timeTagMeta(main) || meta.published)
   const author = ld.author || meta.author
   // Thin-body fallback: anti-bot shells and JS-only pages still carry the
   // full article in ld+json — prefer it over the short og:description hint.
-  const ldBody = bodyText.length < 200 ? jsonLdArticleBody(html) : ''
+  // An anchored read scopes the answer to one section: the ld+json body is
+  // the WHOLE article and would override the located section, so it applies
+  // only to full-document reads.
+  const ldBody = !scoped && bodyText.length < 200 ? jsonLdArticleBody(html) : ''
   // Empty-body pages (login walls, JS-only shells) still carry og:description
   // — surface it as a fallback hint instead of nothing.
   let text = bodyText
@@ -980,6 +1038,13 @@ export function extract(html, mode, anchor = '') {
   }
   if (ldBody && ldBody.length > text.length) {
     text = ldBody
+    usedDescription = false
+  }
+  // Same thin-body shape, next fallback layer: SPA shells put their SEO copy
+  // in <noscript> (stripped from main) — surface it when substantive.
+  const nosBody = !scoped && text.length < 200 ? noscriptBody(html) : ''
+  if (nosBody && nosBody.length > text.length) {
+    text = nosBody
     usedDescription = false
   }
   const byline = bylineFallback(text, { published, author })
@@ -1766,15 +1831,34 @@ function readUrlBatchTool(ctx, cfg) {
     },
     async execute(args, exec) {
       const a = args || {}
-      const urls = (Array.isArray(a.urls) ? a.urls : []).map((u) => String(u).trim()).filter(Boolean)
+      // Duplicate URLs collapse to one fetch (parallel copies would race the
+      // cache and fetch the same page twice); order is preserved. Exact-string
+      // identity: a #fragment read is an ANCHORED read with different
+      // semantics, so it must not merge with its bare URL.
+      const seenUrl = new Set()
+      const urls = (Array.isArray(a.urls) ? a.urls : [])
+        .map((u) => String(u).trim())
+        .filter(Boolean)
+        .filter((u) => {
+          if (seenUrl.has(u)) return false
+          seenUrl.add(u)
+          return true
+        })
       if (!urls.length) return { error: 'urls array is required (1-10 http(s) URLs)' }
       const list = urls.slice(0, 10)
       const perMax = Math.max(500, Math.min(20000, Number(a.maxChars) || 3000))
       const mode = a.mode === 'markdown' ? 'markdown' : 'text'
       const signal = exec && exec.signal
-      const pages = await mapLimit(list, 4, (u) =>
-        readUrl({ url: u, maxChars: perMax, mode, includeLinks: a.includeLinks === true }, ctx, signal, cfg),
-      )
+      // One page throwing must not reject the whole batch — readUrl returns
+      // error objects for expected failures, but any unexpected exception is
+      // converted to one here too.
+      const pages = await mapLimit(list, 4, async (u) => {
+        try {
+          return await readUrl({ url: u, maxChars: perMax, mode, includeLinks: a.includeLinks === true }, ctx, signal, cfg)
+        } catch (e) {
+          return { error: `Unexpected error: ${e && e.message ? e.message : e}` }
+        }
+      })
       const ok = pages.filter((p) => !p.error)
       return {
         total: list.length,

@@ -568,11 +568,20 @@ console.log('read_url_batch (local server, real fetch)')
   }
 
   {
-    const many = Array.from({ length: 15 }, (_, i) => `${base}/a`)
+    const many = Array.from({ length: 15 }, (_, i) => `${base}/a?i=${i}`)
     const r = await batch.execute({ urls: many, maxChars: 300 })
     assert.equal(r.total, 10, 'only first 10 URLs are read')
     passed++
     console.log('  ok - caps url list at 10')
+  }
+
+  {
+    // Duplicate URLs collapse to one fetch — the batch must not read the
+    // same page twice (parallel copies would race the cache).
+    const r = await batch.execute({ urls: [`${base}/a`, `${base}/a#frag`, `${base}/b`, `${base}/a`], maxChars: 300 })
+    assert.equal(r.total, 3, `duplicates deduped: ${r.total}`)
+    passed++
+    console.log('  ok - duplicate urls collapse to one read')
   }
 
   {
@@ -1557,6 +1566,100 @@ console.log('v1.5.0: ld+json articleBody / time datetime / table cap / zero-widt
   assert.ok(!md.includes('\u200b'), `markdown path stripped: ${JSON.stringify(md)}`)
   passed++
   console.log('  ok - zero-width stripped in markdown mode')
+}
+
+console.log('v1.5.1: anchor-vs-ldbody guard / content:encoded / balanced strip / noscript / lazy img')
+{
+  // An anchored read scopes the answer to one section; the ld+json articleBody
+  // is the WHOLE article and must not override the located section.
+  const html = '<html><body><main><section id="intro"><p>本节只有一小段简介内容。</p></section></main></body>' +
+    `<script type="application/ld+json">{"articleBody":"LD全文兜底内容 ${'X'.repeat(300)}"}</script></html>`
+  const r = m.extract(html, 'text', 'intro')
+  assert.ok(r.anchored && r.text.includes('本节只有一小段'), `section kept: ${r.text.slice(0, 30)}`)
+  assert.ok(!r.text.includes('LD全文兜底'), `ld body skipped when anchored`)
+  passed++
+  console.log('  ok - anchored thin section is not overridden by ld+json body')
+}
+{
+  // A full-document thin page still gets the ld+json body (guard only for anchor scope).
+  const html = '<html><body><div id="app">壳页</div></body>' +
+    `<script type="application/ld+json">{"articleBody":"<p>LD 兜底正文第一段。</p><p>第二段。</p>"}</script></html>`
+  const r = m.extract(html, 'text')
+  assert.ok(r.text.includes('LD 兜底正文第一段'), `unanchored still uses ld body: ${r.text.slice(0, 30)}`)
+  passed++
+  console.log('  ok - unanchored thin page still uses articleBody fallback')
+}
+{
+  // WordPress-style feed: <content:encoded> must pair with its own closer.
+  const item = '<item><title>T</title><link>https://x/1</link>' +
+    '<content:encoded><![CDATA[<p>content-encoded 全文正文在这里。</p>]]></content:encoded></item>'
+  const m2 = /<((?:description|summary|content)(?::[a-zA-Z0-9]+)?)(?:\s[^>]*)?>([\s\S]*?)<\/\1\s*>/i
+  assert.ok(m2.exec(item)[2].includes('全文正文'), `content:encoded captured`)
+  // Cross-pairing guard: an opener can never swallow a later different closer.
+  const cross = '<item><content:encoded>全文</content:encoded><description>摘要</description></item>'
+  assert.equal(m2.exec(cross)[2], '全文', 'same-name closer required')
+  passed++
+  console.log('  ok - content:encoded parsed, cross-pairing blocked')
+}
+{
+  // Balanced hidden/consent removal: a nested closer before the noise text
+  // must not leak the remainder (non-greedy regex did).
+  const html = '<html><body><main><article><p>真实正文段落。</p>' +
+    '<div style="display:none"><div>头部小组件</div>被隐藏的噪声正文应该删掉</div>' +
+    '<div id="onetrust-banner"><div class="x"><div>深嵌套</div>Cookie 同意文案很长</div></div>' +
+    '<p>正文第二段。</p></article></main></body></html>'
+  const r = m.extract(html, 'text')
+  assert.ok(!r.text.includes('被隐藏的噪声正文'), `hidden remainder stripped: ${r.text}`)
+  assert.ok(!r.text.includes('Cookie 同意') && !r.text.includes('深嵌套'), `nested consent stripped`)
+  assert.ok(r.text.includes('真实正文段落') && r.text.includes('正文第二段'), `body intact`)
+  passed++
+  console.log('  ok - nested hidden/consent containers removed in full')
+}
+{
+  // Unclosed hidden container: fail-open (content stays, nothing crashes).
+  const html = '<html><body><main><article><p>正文A。</p><div hidden>未闭合内容一直到底</article></main></body></html>'
+  const r = m.extract(html, 'text')
+  assert.ok(r.text.includes('正文A'), `fail-open body kept: ${r.text.slice(0, 30)}`)
+  passed++
+  console.log('  ok - unclosed hidden container degrades to keep-content')
+}
+{
+  // SPA shell with SEO copy in <noscript>: thin body falls back to it.
+  const html = '<html><body><div id="app">请启用 JavaScript</div>' +
+    `<noscript><div class="seo"><p>这是给无 JS 客户端的 SEO 全文，内容相当长足以满足阈值。${'noscript正文'.repeat(20)}</p></div></noscript></body></html>`
+  const r = m.extract(html, 'text')
+  assert.ok(r.text.includes('SEO 全文'), `noscript body used: ${r.text.slice(0, 40)}`)
+  assert.ok(!r.text.includes('请启用 JavaScript'), `shell text dropped`)
+  passed++
+  console.log('  ok - substantive noscript block serves as thin-body fallback')
+}
+{
+  // Short noscript ("enable JS" banners) must NOT surface as body.
+  const html = '<html><body><main><p>正常正文内容足够长。' + '正文'.repeat(150) + '</p></main>' +
+    '<noscript>请启用 JavaScript 以获得最佳体验</noscript></body></html>'
+  const r = m.extract(html, 'text')
+  assert.ok(!r.text.includes('请启用'), `short noscript ignored: ${r.text.slice(0, 40)}`)
+  passed++
+  console.log('  ok - short noscript banner ignored')
+}
+{
+  // Lazy-load images: data: placeholder src falls back to data-src.
+  const md = m.blockMd('<img alt="描述图" src="data:image/gif;base64,R0lGOD" data-src="https://cdn.example/real.jpg">' +
+    '<img alt="原始写法" data-original="https://cdn.example/orig.png" src="">')
+  assert.ok(md.includes('https://cdn.example/real.jpg'), `data-src fallback: ${md}`)
+  assert.ok(md.includes('https://cdn.example/orig.png'), `data-original fallback`)
+  passed++
+  console.log('  ok - lazy-load data-* attributes feed markdown images')
+}
+{
+  // timeTagMeta priority: itemprop/pubdate marked tag beats a bare one; and a
+  // <time> outside main (footer) does not hijack the article date.
+  const html = '<html><body><footer><time datetime="2020-01-01">页脚时间</time></footer>' +
+    '<main><article><p>正文内容。</p><time itemprop="datePublished" datetime="2026-05-05">5月5日</time></article></main></body></html>'
+  const r = m.extract(html, 'text')
+  assert.ok(r.published === '2026-05-05', `marked time wins over footer time: ${r.published}`)
+  passed++
+  console.log('  ok - publication-marked <time> wins; footer time out of scope')
 }
 
 console.log(`\n${passed} assertions passed`)

@@ -126,4 +126,35 @@ t('anchor balanced-block on 4000-deep nesting', () => extract(DEEP, 'text', 'dee
 // anchor: percent-decoding failure (malformed) must not throw
 t('malformed percent-encoding anchor', () => extract('<main><p>body</p></main>', 'text', '%E4%B8%').text.length)
 
+console.log('\n=== I. v1.5.1 balanced strip / ld+json / noscript adversarials ===')
+// Unclosed hidden divs SPREAD across the input: each match would scan to EOF
+// without the bounded window — must stay fast (fail-open keeps content).
+const HIDDEN_SPREAD = Array.from({ length: 3000 }, (_, i) => `<div hidden>u${i}${'y'.repeat(30)}`).join('')
+t('3000 UNCLOSED hidden divs spread (window-bounded, fail-open)', () =>
+  textOnly(`<main>${HIDDEN_SPREAD}<p>keep</p></main>`).length)
+// Deeply nested consent banner: depth-counted removal must reach the real closer.
+const CONSENT_DEEP = `<div id="onetrust-deep">${'<div>'.repeat(3000)}banner text${'</div>'.repeat(3000)}</div>`
+t('consent banner 3000 deep, fully removed', () =>
+  textOnly(`<main>${CONSENT_DEEP}<p>keep</p></main>`))
+// Many unclosed consent divs (id pattern, no closer anywhere).
+const CONSENT_OPEN = Array.from({ length: 2000 }, (_, i) => `<div id="gdpr-${i}">text${'z'.repeat(40)}`).join('')
+t('2000 unclosed consent divs (fail-open, window-bounded)', () =>
+  textOnly(`<main>${CONSENT_OPEN}<p>keep</p></main>`).length)
+// Hidden removal on non-div names (table/span) with specials in attrs.
+t('hidden table removed balanced', () =>
+  textOnly('<main><table hidden><tr><td>hid</td></tr></table><p>keep</p></main>').length)
+// Huge articleBody: clipping keeps the scan bounded.
+t('50k articleBody through textLines', () =>
+  extract('<html><body><div>壳</div><script type="application/ld+json">{"articleBody":"' + 'b'.repeat(50000) + '"}</script></body></html>', 'text').text.length)
+// Malformed ld+json with a giant unterminated string must not hang the scan.
+t('articleBody scan over broken ld+json', () =>
+  extract('<html><body><div>壳</div><script type="application/ld+json">{"articleBody":"<p>' + 'x'.repeat(300000), 'text').text.length)
+// Many noscript blocks: longest wins; bounded per-block scan.
+const NOS_BOMB = Array.from({ length: 3000 }, (_, i) => `<noscript>block${i} ${'n'.repeat(200)}</noscript>`).join('')
+t('3000 noscript blocks (longest wins)', () =>
+  extract(`<html><body><div>壳</div>${NOS_BOMB}</body></html>`, 'text').text.length)
+// Unclosed noscript must not hang the fallback.
+t('unclosed noscript (fail-open)', () =>
+  extract('<html><body><div>壳</div><noscript>' + 'n'.repeat(300000) + '</body></html>', 'text').text.length)
+
 console.log('\nprobe done')
