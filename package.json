@@ -1,6 +1,6 @@
 {
   "name": "dsh-read-url",
-  "version": "1.6.1",
+  "version": "1.7.0",
   "description": "DeepSeek Harness URL reader: fetch any webpage (HTML/JSON/RSS/Atom), auto-detect encoding (UTF-16 BOM/GBK/Big5/Shift-JIS), extract clean main content with auto-pagination, output compact text/Markdown to save tokens. Zero runtime dependencies, no API key, drop-in. Follows meta-refresh shells, reads JSON-LD metadata, honors base href.",
   "type": "module",
   "main": "index.js",

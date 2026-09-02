@@ -415,7 +415,9 @@ ok('tool descriptions stay compact & static (KV-cache friendly)', () => {
     assert.ok(!t.description.includes('${'), `${t.name} description must be static (no dynamic values)`)
     total += t.description.length
   }
-  assert.ok(total < 1150, `4 descriptions total ${total} chars (budget 1150)`)
+  // Budget covers the per-tool untrusted-content warning (official web tools
+  // carry the same sentence); still tight enough to block bloat.
+  assert.ok(total < 1250, `4 descriptions total ${total} chars (budget 1250)`)
 })
 
 ok('parameter schemas stay compact (fixed per-call cost)', () => {
@@ -1398,6 +1400,61 @@ console.log('v1.4.0: hidden-element / consent stripping')
     passed++
     console.log('  ok - aria-hidden="false" content kept')
   }
+}
+
+console.log('v1.7.0: hidden-element coverage matches official web_fetch filter')
+{
+  const page = (noise) => `<html><body><main><article><p>正文段落保持原样。</p>${noise}</article></main></body></html>`
+  const cases = [
+    ['article hidden', '<article hidden>折叠文章</article>'],
+    ['heading hidden', '<h3 hidden>隐藏标题</h3>'],
+    ['ol hidden', '<ol hidden>隐藏有序列表</ol>'],
+    ['dl hidden', '<dl hidden>隐藏定义列表</dl>'],
+    ['details hidden', '<details hidden>折叠面板</details>'],
+    ['pre hidden', '<pre hidden>隐藏预格式</pre>'],
+    ['visibility:collapse', '<ul style="visibility:collapse">塌陷列表</ul>'],
+    ['display : none (spaces)', '<div style="display : none">空格隐藏</div>'],
+    ['visibility : hidden (spaces)', '<div style="visibility : hidden">空格不可见</div>'],
+    ['object fallback text', '<object data="x.swf">对象回退文本</object>'],
+  ]
+  for (const [name, noise] of cases) {
+    const r = m.extract(page(noise), 'text')
+    assert.ok(r.text.includes('正文段落保持原样'), `body kept (${name})`)
+    assert.ok(!r.text.includes(noise.match(/>([^<]+)</)[1]), `noise stripped (${name}): ${r.text}`)
+    passed++
+    console.log(`  ok - strips ${name}`)
+  }
+}
+
+console.log('v1.7.0: untrusted-content notice on every external render')
+{
+  // read_url render: the notice rides with the body only — errors and
+  // empty-text pages emit no external content, so no notice.
+  const out = m.renderResult({ title: '示例', text: '这里是正文内容。', charsTotal: 100 })
+  assert.ok(out.includes('untrusted'), `notice present: ${out.slice(0, 120)}`)
+  assert.ok(!m.renderResult({ error: 'boom' }).includes('untrusted'), 'error output has no notice')
+  assert.ok(!m.renderResult({ title: 't', text: '' }).includes('untrusted'), 'empty text has no notice')
+  passed++
+  console.log('  ok - read_url render: notice only when external text is emitted')
+
+  // batch/site/links renders go through the registered tools' output.render.
+  const tools = []
+  m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: () => undefined }, {})
+  const renderOf = (name) => tools.find((t) => t.name === name).output.render
+  const batch = renderOf('read_url_batch')(null, { succeeded: 1, total: 1, pages: [{ title: 'p', url: 'https://x', chars: 10, text: '正文' }] })[0].text
+  assert.ok(batch.includes('untrusted'), 'batch render carries the notice')
+  const site = renderOf('read_url_site')(null, { host: 'x.com', succeeded: 1, total: 1, pages: [{ depth: 0, title: 'p', url: 'https://x', chars: 10 }], failures: [] })[0].text
+  assert.ok(site.includes('untrusted'), 'site render carries the notice')
+  const links = renderOf('read_url_links')(null, { url: 'https://x', count: 1, links: [{ title: 'a', url: 'https://x/y' }] })[0].text
+  assert.ok(links.includes('untrusted'), 'links render carries the notice')
+  passed++
+  console.log('  ok - batch/site/links renders carry the notice once, at the head')
+
+  for (const t of tools) {
+    assert.ok(t.description.includes('untrusted'), `${t.name} description warns`)
+  }
+  passed++
+  console.log('  ok - all four descriptions carry the untrusted warning')
 }
 
 console.log('v1.4.0: URL fragment anchors')
