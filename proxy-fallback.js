@@ -23,6 +23,19 @@ import { execFile, execFileSync } from 'node:child_process'
 export function looksBinary(buffer) {
   const n = Math.min(buffer.length, 512)
   if (!n) return false
+  const utf16le = buffer[0] === 0xff && buffer[1] === 0xfe
+  const utf16be = buffer[0] === 0xfe && buffer[1] === 0xff
+  if ((utf16le || utf16be) && buffer.length % 2 === 0) {
+    let controls = 0
+    let units = 0
+    for (let i = 2; i + 1 < n; i += 2) {
+      const code = utf16le ? buffer[i] | (buffer[i + 1] << 8) : (buffer[i] << 8) | buffer[i + 1]
+      if (code === 0) return true
+      if (code < 9 || (code > 13 && code < 32)) controls++
+      units++
+    }
+    return units > 0 && controls / units > 0.3
+  }
   let ctrl = 0
   for (let i = 0; i < n; i++) {
     const b = buffer[i]
@@ -30,6 +43,14 @@ export function looksBinary(buffer) {
     if (b < 9 || (b > 13 && b < 32)) ctrl++
   }
   return ctrl / n > 0.3
+}
+
+// Shared by direct and proxy retrieval so a document's route cannot change
+// which text formats are accepted. Structured suffixes include vendor APIs.
+export function isFetchableContentType(contentType) {
+  const mime = (contentType || '').split(';', 1)[0].trim().toLowerCase()
+  return ['text/html', 'application/xhtml+xml', 'text/plain', 'text/markdown', 'text/csv', 'application/json', 'text/json', 'application/xml', 'text/xml'].includes(mime) ||
+    /^[a-z][a-z0-9!#$&^_.+-]{0,63}\/(?:[a-z0-9!#$&^_.+-]{1,127}\+)?(?:json|xml)$/.test(mime)
 }
 
 let sysProxyCache = null // '' = checked & absent; string = proxy URL
@@ -129,7 +150,7 @@ export async function fetchViaCurlProxy(url, cfg, externalSignal, proxyOverride)
       }
     }
     if (!(code >= 200 && code < 300)) return { error: `HTTP ${code}` }
-    if (contentType && !/text\/html|application\/xhtml|text\/plain|\/json|[+/]xml/i.test(contentType)) {
+    if (contentType && !isFetchableContentType(contentType)) {
       return { error: `Unsupported content-type: ${contentType.split(';')[0]}` }
     }
     return { buffer: body, contentType, finalUrl: finalUrlEff, viaProxy: proxy }

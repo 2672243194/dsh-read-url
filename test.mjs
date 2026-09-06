@@ -2,6 +2,10 @@
 import assert from 'node:assert/strict'
 import * as m from './index.js'
 import { looksLikeSpa, looksLikeChallenge } from './spa.js'
+import { runMarkdownTests } from './test-markdown.mjs'
+import { runNetworkTests } from './test-network.mjs'
+import { runCrawlTests } from './test-crawl.mjs'
+import { runExtractionTests } from './test-extraction.mjs'
 const { decodeBuffer, extract, smartTruncate, blockMd, inlineMd, decodeTextEntities, raceFirstSuccess, metaRefreshTarget, findNextLink } = m
 
 let passed = 0
@@ -224,7 +228,7 @@ ok('offset continues from paragraph boundary without repeating', () => {
   assert.equal(first.charsStart, 0)
   const second = smartTruncate(text, 6, first.text.length)
   assert.equal(second.text, '三三三')
-  assert.equal(second.charsStart, 5)
+  assert.equal(second.charsStart, 7)
   assert.ok(!second.text.includes('一'), 'offset read must not repeat earlier content')
 })
 
@@ -483,7 +487,7 @@ ok('does not flag normal pages as SPA', () => {
   // must degrade with a hint, never crash. Uses top-level await so the assertion
   // is guaranteed to run before the process exits.
   const html = '<html><head><title>SPA Test</title></head><body><div id="app"></div>' + '<script src="/x.js"></script>'.repeat(8) + '</body></html>'
-  const fakeSeam = { fetch: async (u) => ({ content: html, url: u }) }
+  const fakeSeam = { fetch: async ({ url }) => ({ url, statusCode: 200, body: { kind: 'html', content: html }, truncated: false }) }
   const fakeCtx = { get: (k) => (k === 'web' ? fakeSeam : undefined) }
   const r = await m.readUrl({ url: 'https://spa.example.com', maxChars: 500 }, fakeCtx)
   assert.ok(!r.error, 'must not throw')
@@ -494,7 +498,7 @@ ok('does not flag normal pages as SPA', () => {
 
 {
   const html = '<html><head><title>SPA</title></head><body><div id="app"></div>' + '<script src="/x.js"></script>'.repeat(8) + '</body></html>'
-  const fakeSeam = { fetch: async (u) => ({ content: html, url: u }) }
+  const fakeSeam = { fetch: async ({ url }) => ({ url, statusCode: 200, body: { kind: 'html', content: html }, truncated: false }) }
   const fakeCtx = { tools: { register: () => {} }, effect: () => {}, get: (k) => (k === 'web' ? fakeSeam : undefined) }
   const tools = []
   m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: fakeCtx.get }, {})
@@ -509,7 +513,7 @@ ok('does not flag normal pages as SPA', () => {
 {
   // extractLinks dedupe: repeated URLs (nav bars) must collapse to one entry
   const html = '<html><body><a href="/page1">一</a><a href="/page1">二</a><a href="/page1">三</a><a href="/page2">四</a><a href="/page2">五</a></body></html>'
-  const fakeSeam = { fetch: async (u) => ({ content: html, url: u }) }
+  const fakeSeam = { fetch: async ({ url }) => ({ url, statusCode: 200, body: { kind: 'html', content: html }, truncated: false }) }
   const fakeCtx = { tools: { register: () => {} }, effect: () => {}, get: (k) => (k === 'web' ? fakeSeam : undefined) }
   const tools = []
   m.apply({ tools: { register: (t) => tools.push(t) }, effect: () => {}, get: fakeCtx.get }, {})
@@ -1853,6 +1857,10 @@ console.log('v1.6.1: LRU cache promotion')
   console.log('  ok - cache hit promotes the entry (LRU, hot pages survive)')
 }
 
+passed += await runMarkdownTests(m)
+passed += await runNetworkTests(m)
+passed += await runCrawlTests(m)
+passed += await runExtractionTests(m)
 console.log(`\n${passed} assertions passed`)
 // All assertions are synchronous or top-level awaited; reaching here means every
 // one passed, so force a clean exit (avoids environment-specific exit-code noise).

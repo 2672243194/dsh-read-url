@@ -16,7 +16,7 @@
 //   - session-level cache, compact text render (lowest token cost)
 import { TextDecoder } from 'node:util'
 import { looksLikeSpa, renderPage, closeBrowser, looksLikeChallenge } from './spa.js'
-import { detectProxy, fetchViaCurlProxy, looksBinary } from './proxy-fallback.js'
+import { detectProxy, fetchViaCurlProxy, looksBinary, isFetchableContentType } from './proxy-fallback.js'
 // Re-export for tests / programmatic (PTC) cleanup.
 export { closeBrowser, renderPage, looksLikeSpa, looksLikeChallenge } from './spa.js'
 
@@ -104,7 +104,6 @@ export function decodeBuffer(buffer, contentType) {
 // XML (RSS/Atom feeds) and plain-text families (txt/md/csv — logs, docs,
 // datasets) are read natively — see readUrl's type dispatch.
 // Note "application/rss+xml": the separator before xml is '+', not '/'.
-const FETCHABLE_CT = /text\/html|application\/xhtml|text\/(?:plain|markdown|csv)|\/json|[+/]xml/i
 
 // Retry-After header (seconds form) → ms, capped; undefined when absent/invalid.
 function retryAfterMs(res) {
@@ -138,7 +137,7 @@ async function directFetchOnce(url, signal, cfg) {
       return { error: `HTTP ${res.status} ${res.statusText}` }
     }
     const contentType = res.headers.get('content-type') || ''
-    if (contentType && !FETCHABLE_CT.test(contentType)) {
+    if (contentType && !isFetchableContentType(contentType)) {
       discardBody()
       return { error: `Unsupported content-type: ${contentType.split(';')[0]}` }
     }
@@ -245,7 +244,9 @@ async function raceFetch(url, externalSignal, cfg, proxy) {
 }
 
 async function fetchPage(url, externalSignal, cfg) {
+  if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
   const proxy = await detectProxy()
+  if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
   if (proxy) {
     const winner = await raceFetch(url, externalSignal, cfg, proxy)
     if (winner.success) return winner.value
@@ -268,19 +269,35 @@ async function fetchPage(url, externalSignal, cfg) {
 // Seam calls get the same cooperative timeout as fetchPage (a hanging
 // provider should not block the tool call forever).
 async function fetchViaWebSeam(ctx, url, externalSignal, cfg) {
+  let web
   try {
     // ctx.get for a non-injected service throws on strict cordis hosts (seen
     // with 'settings') — treat that as "seam absent" and fall through.
-    const web = ctx && typeof ctx.get === 'function' ? ctx.get('web') : undefined
-    if (!web || typeof web.fetch !== 'function') return null
-    const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs)
-    const signal = externalSignal ? AbortSignal.any([externalSignal, timeoutSignal]) : timeoutSignal
-    const res = await web.fetch(url, { signal })
-    if (!res || typeof res.content !== 'string') return null
-    const finalUrl = res.url || res.finalUrl || url
-    return { html: res.content, finalUrl }
+    web = ctx && typeof ctx.get === 'function' ? ctx.get('web') : undefined
   } catch {
     return null
+  }
+  if (!web || typeof web.fetch !== 'function') return null
+  try {
+    const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs)
+    const signal = externalSignal ? AbortSignal.any([externalSignal, timeoutSignal]) : timeoutSignal
+    if (signal.aborted) return { error: 'cancelled' }
+    const res = await new Promise((resolve, reject) => {
+      const onAbort = () => reject(signal.reason || new Error('cancelled'))
+      signal.addEventListener('abort', onAbort, { once: true })
+      Promise.resolve().then(() => web.fetch({ url }, signal)).then(resolve, reject)
+        .finally(() => signal.removeEventListener('abort', onAbort))
+    })
+    if (!res || !Number.isInteger(res.statusCode) || !res.body || typeof res.body.content !== 'string' || !['html', 'text'].includes(res.body.kind)) {
+      return { error: 'Web provider returned an unsupported response' }
+    }
+    if (res.statusCode < 200 || res.statusCode >= 300) return { error: `HTTP ${res.statusCode}` }
+    if (Buffer.byteLength(res.body.content, 'utf8') > cfg.maxBytes) return { error: `Page exceeds ${cfg.maxBytes} bytes` }
+    return { html: res.body.content, kind: res.body.kind, finalUrl: res.url || url, sourceTruncated: res.truncated === true }
+  } catch (e) {
+    if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
+    if (e && e.code === 'WEB_PROVIDER_UNAVAILABLE') return null
+    return { error: `Web provider failed: ${String((e && e.message) || e).slice(0, 160)}` }
   }
 }
 
@@ -402,28 +419,64 @@ function xmlText(s) {
 }
 
 // RSS 2.0 <item> / Atom <entry> → compact list "title — url\n  summary".
-function parseFeed(xml, limit) {
+function parseFeed(xml, limit, baseUrl = '') {
   xml = defuseLt(xml) // keeps the item scan linear
-  const isAtom = /<feed[\s>]/i.test(xml)
-  const itemRe = isAtom ? /<entry[\s>][\s\S]*?<\/entry\s*>/gi : /<item[\s>][\s\S]*?<\/item\s*>/gi
-  // Without a single closing tag nothing can pair, so the scan is skipped.
-  const closable = isAtom ? /<\/entry\s*>/i.test(xml) : /<\/item\s*>/i.test(xml)
+  const root = /<(?:[a-z][\w.-]{0,31}:)?(?:feed|rss|RDF)(?=[\s>])[^>]{0,1000}>/i.exec(xml)
+  const isAtom = !!root && /:?(?:feed)\b/i.test(root[0].split(/[\s>]/, 1)[0])
+  const resolve = (value, base) => {
+    try {
+      const u = new URL(decodeUrlAttribute(value), base || undefined)
+      return /^https?:$/.test(u.protocol) ? u.href : ''
+    } catch { return '' }
+  }
+  const feedBase = resolve(root ? htmlAttributes(root[0])['xml:base'] || '' : '', baseUrl) || baseUrl
+  const field = (body, names) => {
+    const re = new RegExp(`<((?:[a-z][\\w.-]{0,31}:)?(?:${names}))(?=[\\s>])[^>]{0,1000}>([\\s\\S]{0,200000}?)</\\1\\s{0,1000}>`, 'i')
+    return re.exec(body)
+  }
+  const textOf = (m) => {
+    if (!m) return ''
+    const attrs = htmlAttributes(m[0].slice(0, m[0].indexOf('>') + 1))
+    if (isAtom && (!attrs.type || attrs.type === 'text')) {
+      return decodeTextEntities(m[2].replace(/<!\[CDATA\[([\s\S]{0,200000}?)\]\]>/g, '$1')).trim()
+    }
+    return xmlText(m[2])
+  }
+  const itemRe = /<(\/?)([a-z][\w.-]{0,31}:)?(entry|item)(?=[\s>])[^>]{0,1000}>/gi
   const items = []
+  let start = null
   let m
-  while (closable && (m = itemRe.exec(xml)) && items.length < limit) {
-    const it = m[0]
-    const title = xmlText(/<title[^>]*>([\s\S]*?)<\/title>/i.exec(it)?.[1] || '')
-    const linkTag = /<link[^>]*>([\s\S]*?)<\/link>/i.exec(it)
-    const linkHref = /<link[^>]+href=["']([^"']+)["']/i.exec(it)
-    const link = (linkTag && xmlText(linkTag[1])) || (linkHref && linkHref[1]) || ''
+  while ((m = itemRe.exec(xml)) && items.length < limit) {
+    if (m[3].toLowerCase() !== (isAtom ? 'entry' : 'item')) continue
+    if (!m[1]) { if (!start) start = m; continue }
+    if (!start || (start[2] || '') !== (m[2] || '')) continue
+    const opening = start[0]
+    const it = xml.slice(start.index + opening.length, m.index)
+    start = null
+    const itemBase = resolve(htmlAttributes(opening)['xml:base'] || '', feedBase) || feedBase
+    const title = textOf(field(it, 'title'))
+    let link = ''
+    if (isAtom) {
+      for (const lm of it.matchAll(/<(?:[a-z][\w.-]{0,31}:)?link(?=[\s/>])[^>]{0,1000}>/gi)) {
+        const attrs = htmlAttributes(lm[0])
+        if (attrs.rel && attrs.rel !== 'alternate') continue
+        const target = resolve(attrs.href || '', resolve(attrs['xml:base'] || '', itemBase) || itemBase)
+        if (!target || !attrs.href) continue
+        link = target
+        if (!attrs.type || /^(?:text\/html|application\/xhtml\+xml)$/i.test(attrs.type)) break
+      }
+    } else {
+      const rawLink = field(it, 'link')?.[2]?.trim()
+      if (rawLink) link = resolve(rawLink.replace(/<!\[CDATA\[([\s\S]{0,10000}?)\]\]>/g, '$1'), itemBase)
+    }
     // Namespaced fields (WordPress <content:encoded>) pair via a captured
     // name + backreference: the closer must match the SAME name, so a
     // <content:encoded> opener can never pair with a distant </description>.
-    const desc = xmlText(/<((?:description|summary|content)(?::[a-zA-Z0-9]+)?)(?:\s[^>]*)?>([\s\S]*?)<\/\1\s*>/i.exec(it)?.[2] || '')
+    const desc = textOf(field(it, 'description|summary|content(?::encoded)?'))
     if (!title && !link && !desc) continue
     items.push({ title: title.slice(0, 120), url: link, summary: desc.slice(0, 200) })
   }
-  const feedTitle = xmlText(/<title[^>]*>([\s\S]*?)<\/title>/i.exec(xml)?.[1] || '')
+  const feedTitle = textOf(field(xml, 'title'))
   const lines = []
   for (const it of items) {
     lines.push(`- ${it.title}${it.url ? ` — ${it.url}` : ''}`)
@@ -498,13 +551,14 @@ function tagBlockAt(html, openIdx, tagName, maxScan = Infinity) {
 // continues from the removed block's end, so removed interiors are never
 // rescanned and total cost stays near-linear in the surviving input.
 const BALANCED_SCAN_WINDOW = 100000
-function stripBalanced(html, openTagRe) {
+function stripBalanced(html, openTagRe, accept = () => true) {
   openTagRe.lastIndex = 0
   let out = ''
   let last = 0
   let m
   while ((m = openTagRe.exec(html))) {
     const tag = m[1].toLowerCase()
+    if (!accept(m[0], tag)) continue
     const block = tagBlockAt(html, m.index, tag, BALANCED_SCAN_WINDOW)
     if (!block) continue // unclosed container — keep the content
     out += html.slice(last, m.index) + ' '
@@ -519,12 +573,19 @@ export function pickMain(html) {
   // collect all of them instead of only the first. A tiny <article> (e.g. a
   // newsletter card while the real content sits in <main>) falls through to
   // <main> when present.
-  const articles = /<\/article/i.test(html)
-    ? [...html.matchAll(/<article[\s>][\s\S]*?<\/article\s*>/gi)]
-    : [] // without a closer in the document nothing can pair
+  const articles = []
+  let articleDepth = 0
+  let articleStart = 0
+  for (const m of html.matchAll(/<\/?article(?=[\s>])[^>]{0,1000}>/gi)) {
+    if (m[0][1] !== '/') {
+      if (articleDepth++ === 0) articleStart = m.index
+    } else if (articleDepth > 0 && --articleDepth === 0) {
+      articles.push(html.slice(articleStart, m.index + m[0].length))
+    }
+  }
   const hasMain = /<main[\s>]/i.test(html)
-  if (articles.length && (!hasMain || textOnly(articles.map((a) => a[0]).join('')).length >= 200)) {
-    return articles.map((a) => a[0]).join('\n')
+  if (articles.length && (!hasMain || textOnly(articles.join('')).length >= 200)) {
+    return articles.join('\n')
   }
   const roleMain = /<(main|div)[^>]{0,1000}role=["']main["'][\s>]/i.exec(html)
   if (roleMain) {
@@ -549,55 +610,101 @@ export function pickMain(html) {
   return densityFilter(html)
 }
 
-// Some sites (e.g. baidu.com) ship CSS/HTML inside hidden <textarea> with
-// entity-escaped tags (&lt;style&gt;...). Reveal TAG-SHAPED sequences so noise
-// rules can strip them. &lt; is revealed only when a tag name follows: a bare
-// &lt; from prose ("a &lt; b") would be swallowed by the tag stripper up to
-// the next real '>'. Bare &gt; / &quot; never open a strip span and are
-// revealed unconditionally.
-function revealEscapedTags(html) {
-  return html
-    .replace(/&lt;(?=\/?[a-zA-Z!])/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
+// Parse complete, bounded opening tags; quoted values remain one attribute.
+function htmlAttributes(tag) {
+  const attrs = Object.create(null)
+  if (tag.length > 1002) return attrs
+  const start = /^<[a-z][a-z0-9:-]{0,63}/i.exec(tag)
+  if (!start) return attrs
+  const re = /\s{1,1000}([^\s"'<>/=]{1,64})(?:\s{0,1000}=\s{0,1000}(?:"([^"]{0,1000})"|'([^']{0,1000})'|([^\s"'=<>`]{1,1000})))?/gy
+  re.lastIndex = start[0].length
+  let m
+  while ((m = re.exec(tag))) {
+    const key = m[1].toLowerCase()
+    if (!Object.hasOwn(attrs, key)) attrs[key] = m[2] ?? m[3] ?? m[4] ?? ''
+  }
+  return attrs
+}
+
+// Raw-text elements and comments cannot supply visible document containers.
+function stripRawElements(html) {
+  const open = /<!--|<(script|style|textarea|noscript|template)(?=[\s>])[^>]{0,1000}>/gi
+  const parts = []
+  let last = 0
+  let m
+  while ((m = open.exec(html))) {
+    let end
+    if (!m[1]) {
+      const close = html.indexOf('-->', open.lastIndex)
+      end = close < 0 ? html.length : close + 3
+    } else {
+      const close = new RegExp(`</${m[1]}\\s{0,1000}>`, 'gi')
+      close.lastIndex = open.lastIndex
+      const match = close.exec(html)
+      end = match ? close.lastIndex : html.length
+    }
+    parts.push(html.slice(last, m.index), ' ')
+    last = end
+    open.lastIndex = end
+  }
+  parts.push(html.slice(last))
+  return parts.join('')
+}
+
+// Track native noise containers in one pass, including large embedded assets.
+function stripStructuralNoise(html) {
+  const re = /<(\/?)(nav|footer|header|aside|form|iframe|svg|canvas|dialog|object|embed)(?=[\s/>])/gi
+  const active = new Map()
+  const ranges = []
+  let m
+  while ((m = re.exec(html))) {
+    const end = html.indexOf('>', re.lastIndex)
+    if (end < 0) break
+    const name = m[2].toLowerCase()
+    if (!m[1] && name === 'svg' && html[end - 1] === '/') {
+      ranges.push({ start: m.index, end: end + 1 })
+    } else if (!m[1]) {
+      const state = active.get(name)
+      if (state) state.depth++
+      else {
+        const range = { start: m.index, end: 0, depth: 1 }
+        ranges.push(range)
+        active.set(name, range)
+      }
+    } else if (end - re.lastIndex <= 1000 && !html.slice(re.lastIndex, end).trim()) {
+      const state = active.get(name)
+      if (state && --state.depth === 0) {
+        state.end = end + 1
+        active.delete(name)
+      }
+    }
+    re.lastIndex = end + 1
+  }
+  const parts = []
+  let last = 0
+  for (const range of ranges) {
+    if (!range.end || range.end <= last) continue
+    if (range.start > last) parts.push(html.slice(last, range.start))
+    parts.push(' ')
+    last = range.end
+  }
+  parts.push(html.slice(last))
+  return parts.join('')
 }
 
 function stripNoise(mainHtml) {
-  // Attribute runs are bounded so a '<' whose '>' is far away costs a bounded
-  // scan instead of a run to that '>'; real attributes never approach 1000
-  // chars. Container groups only include tags whose closing tag exists in the
-  // input — absent closers cannot pair, so scanning for their body is wasted
-  // work.
-  const closers = new Set()
-  for (const c of mainHtml.matchAll(/<\/([a-z0-9]+)/gi)) closers.add(c[1].toLowerCase())
-  const group = (names) => names.filter((n) => closers.has(n))
-  const raw = group(['textarea', 'style', 'script', 'noscript', 'template'])
-  const box = group(['nav', 'footer', 'header', 'aside', 'form', 'iframe', 'svg', 'canvas', 'dialog', 'object', 'embed'])
-  let out = mainHtml.replace(/<!--[\s\S]*?-->/g, ' ')
-  if (raw.length) {
-    out = out.replace(new RegExp(`<(${raw.join('|')})[\\s>][\\s\\S]*?<\\/\\1\\s*>`, 'gi'), ' ')
-  }
-  if (box.length) {
-    out = out.replace(new RegExp(`<(${box.join('|')})[\\s>][\\s\\S]*?<\\/\\1>`, 'gi'), ' ')
-  }
-  // Elements explicitly hidden from users are invisible decoration or stateful
-  // UI (collapsed panels, modal templates) — their text must not leak into the
-  // body. The tag list covers every container that real pages use for hidden
-  // blocks (nav/footer/header/aside already fell to the box group above).
-  // `visibility:collapse` hides table rows and flex items the same way
-  // `display:none` hides boxes, and whitespace around the style colon is legal
-  // CSS. The [\s"'] guard keeps `hidden`/`style` from matching inside compound
-  // attr names (data-hidden, aria-hidden). Consent/GDPR banners mount by id
-  // (onetrust, cookiebot, cybot, gdpr) rather than class, so a second pass
-  // keys on the id attribute. Removal is a depth-counted balanced scan —
-  // banners are deeply nested and a lazy `[\s\S]*?` would stop at the first
-  // inner closer, leaking the rest of the banner text.
-  out = stripBalanced(out, /<(div|span|section|p|ul|ol|dl|li|article|main|details|figure|pre|table|h[1-6])\b[^>]{0,1000}[\s"'](?:hidden\b|aria-hidden\s*=\s*["']?true|style\s*=\s*["'][^"']{0,200}(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)))[^>]{0,1000}>/gi)
-  out = stripBalanced(out, /<([a-z][a-z0-9]*)\s+id=["'][^"']{0,120}(?:onetrust|cookiebot|cybot|gdpr|consent|cookie-law|cookie_banner|cmp-)[^"']{0,120}["'][^>]{0,1000}>/gi)
-  return out.replace(
-    /<([a-z][a-z0-9]*)[^>]{1,1000}class=["'][^"']{0,300}(ad-|ads|advert|banner|sidebar|social|share|comment|popup|modal|cookie)[^"']{0,300}["'][^>]{0,1000}>[\s\S]*?<\/\1>/gi,
-    ' ',
-  )
+  // Bounded attribute parsing and balanced removal preserve nested content.
+  const out = stripStructuralNoise(stripRawElements(mainHtml))
+  // Attribute names determine visibility; class heuristics apply to containers
+  // so source-code tokens remain visible. Noise names match whole word segments.
+  return stripBalanced(out, /<([a-z][a-z0-9-]{0,63})\b[^>]{0,1000}>/gi, (tag, name) => {
+    const attrs = htmlAttributes(tag)
+    if (Object.hasOwn(attrs, 'hidden') || attrs['aria-hidden']?.toLowerCase() === 'true') return true
+    if (/(?:^|;)\s{0,200}(?:display\s{0,20}:\s{0,20}none|visibility\s{0,20}:\s{0,20}(?:hidden|collapse))\s{0,20}(?:!important\s{0,20})?(?:;|$)/i.test(attrs.style || '')) return true
+    if (/(?:onetrust|cookiebot|cybot|gdpr|consent|cookie-law|cookie_banner|cmp-)/i.test(attrs.id || '')) return true
+    if (!/^(?:div|section|article|ul|ol|li|p)$/.test(name)) return false
+    return /(?:^|[\s_-])(?:ads?|adsbygoogle|advert(?:isement|ising)?|banner|sidebar|social|share|comments?|popup|modal|cookies?)(?=$|[\s_-])/i.test(attrs.class || '')
+  })
 }
 
 // ---- HTML -> Markdown (lightweight, tag-state machine) ----
@@ -610,8 +717,14 @@ function escInline(s) {
 // sentinel so escInline cannot escape the generated brackets. Decorative
 // images (empty alt) are dropped — the model cannot see pixels anyway.
 const IMG_SENTINEL = '\u0001'
+let markdownSentinelId = 0
 function imgsToMarkdown(html) {
-  const store = []
+  const store = new Map()
+  const protect = (value) => {
+    const id = markdownSentinelId++
+    store.set(id, value)
+    return `${IMG_SENTINEL}${id}${IMG_SENTINEL}`
+  }
   // AMP pages use <amp-img> instead of <img>; responsive layouts wrap images
   // in <picture><source srcset>. When the <img> fallback carries no usable
   // src (lazy placeholder), the first source URL is injected into it so the
@@ -634,15 +747,15 @@ function imgsToMarkdown(html) {
       const lazy = /data-(?:src|original|lazy-src)=["']([^"']+)["']/i.exec(tag)
       if (lazy) srcVal = lazy[1]
     }
-    store.push(srcVal && alt && alt[1].trim() ? `![${alt[1].trim()}](${srcVal})` : '')
-    return `${IMG_SENTINEL}${store.length - 1}${IMG_SENTINEL}`
+    return protect(srcVal && alt && alt[1].trim() ? `![${alt[1].trim()}](${srcVal})` : '')
   })
   return {
     html: out,
+    protect,
     // Unknown sentinel indexes are PRESERVED (a nested walker's restore must
     // not eat sentinels owned by an outer frame — blockMd recurses into itself).
-    restore: (s) => s.replace(new RegExp(`${IMG_SENTINEL}(\\d+)${IMG_SENTINEL}`, 'g'), (m, i) => {
-      const v = store[Number(i)]
+    restore: (s) => s.replace(new RegExp(`${IMG_SENTINEL}(\\d{1,16})${IMG_SENTINEL}`, 'g'), (m, i) => {
+      const v = store.get(Number(i))
       return v === undefined ? m : v
     }),
   }
@@ -661,7 +774,31 @@ function stripUnmatchedOpeners(html) {
   const closers = new Set()
   for (const m of html.matchAll(/<\/([a-zA-Z0-9]+)/g)) closers.add(m[1].toLowerCase())
   html = defuseLt(html)
-  return html.replace(OPEN_TAG_RE, (m, name) => (closers.has(name.toLowerCase()) ? m : ''))
+  return html.replace(OPEN_TAG_RE, (m, name) => {
+    const tag = name.toLowerCase()
+    return tag === 'br' || tag === 'hr' || closers.has(tag) ? m : ''
+  })
+}
+
+function codeText(html) {
+  return decodeTextEntities(html.replace(/<br\b[^>]{0,1000}>/gi, '\n').replace(/<[^>]{1,1000}>/g, ''))
+}
+
+function backtickFence(code, minLength) {
+  let longest = 0, run = 0
+  for (const ch of code) {
+    run = ch === '`' ? run + 1 : 0
+    if (run > longest) longest = run
+  }
+  return '`'.repeat(Math.max(minLength, longest + 1))
+}
+
+function inlineCode(html) {
+  const code = codeText(html).replace(/\r\n?|\n/g, ' ')
+  if (!code) return ''
+  const fence = backtickFence(code, 1)
+  const pad = /^[ `]|[ `]$/.test(code) && /[^ ]/.test(code) ? ' ' : ''
+  return `${fence}${pad}${code}${pad}${fence}`
 }
 
 export function inlineMd(html, depth = 0) {
@@ -671,16 +808,24 @@ export function inlineMd(html, depth = 0) {
   const img = imgsToMarkdown(html)
   html = stripUnmatchedOpeners(img.html)
   let out = ''
-  const re = /<([a-zA-Z0-9]+)((?:"[^"]*"|'[^']*'|[^'">]){0,1000})>([\s\S]*?)<\/\1>|<[^>]{1,1000}>|([^<]+)/g
+  const re = /<(?:br|hr)\b[^>]{0,1000}>|<([a-zA-Z0-9]{1,100})((?:"[^"]{0,1000}"|'[^']{0,1000}'|[^'">]){0,1000})>([\s\S]{0,3145728}?)<\/\1>|<[^>]{1,1000}>|([^<]{1,3145728})/gi
   let m
   while ((m = re.exec(html))) {
     if (m[4] !== undefined) {
-      out += escInline(decodeTextEntities(m[4]))
+      out += escInline(decodeTextEntities(m[4]).replace(/[ \t]{1,3145728}/g, ' '))
       continue
     }
-    if (!m[1]) continue
+    if (!m[1]) {
+      if (/^<br\b/i.test(m[0])) out += img.protect('  \n')
+      else if (/^<hr\b/i.test(m[0])) out += img.protect('\n\n---\n\n')
+      continue
+    }
     const tag = m[1].toLowerCase()
     if (tag === 'style' || tag === 'script' || tag === 'textarea' || tag === 'template' || tag === 'noscript') continue
+    if (tag === 'code') {
+      out += img.protect(inlineCode(m[3]))
+      continue
+    }
     const inner = inlineMd(m[3], depth + 1)
     if (tag === 'a') {
       const href = /href=["']([^"']+)["']/i.exec(m[2])
@@ -690,11 +835,9 @@ export function inlineMd(html, depth = 0) {
       out += href ? `[${inner}](${href[1].replace(/\)/g, '%29').replace(/\(/g, '%28')})` : inner
     } else if (tag === 'strong' || tag === 'b') out += `**${inner}**`
     else if (tag === 'em' || tag === 'i') out += `*${inner}*`
-    else if (tag === 'code') out += `\`${inner}\``
-    else if (tag === 'br') out += '  \n'
     else out += inner
   }
-  return img.restore(out.replace(/[ \t]+/g, ' ').trim())
+  return img.restore(out.trim())
 }
 
 export function blockMd(html, depth = 0) {
@@ -704,14 +847,18 @@ export function blockMd(html, depth = 0) {
   const img = imgsToMarkdown(html)
   html = stripUnmatchedOpeners(img.html)
   let out = ''
-  const re = /<([a-zA-Z0-9]+)((?:"[^"]*"|'[^']*'|[^'">]){0,1000})>([\s\S]*?)<\/\1>|<[^>]{1,1000}>|([^<]+)/g
+  const re = /<(?:br|hr)\b[^>]{0,1000}>|<([a-zA-Z0-9]{1,100})((?:"[^"]{0,1000}"|'[^']{0,1000}'|[^'">]){0,1000})>([\s\S]{0,3145728}?)<\/\1>|<[^>]{1,1000}>|([^<]{1,3145728})/gi
   let m
   while ((m = re.exec(html))) {
     if (m[4] !== undefined) {
       out += decodeTextEntities(m[4])
       continue
     }
-    if (!m[1]) continue
+    if (!m[1]) {
+      if (/^<br\b/i.test(m[0])) out += '  \n'
+      else if (/^<hr\b/i.test(m[0])) out += '\n\n---\n\n'
+      continue
+    }
     const tag = m[1].toLowerCase()
     const attrs = m[2] || ''
     const inner = m[3]
@@ -735,19 +882,20 @@ export function blockMd(html, depth = 0) {
       // Strip wrapper tags FIRST, then decode entities — a literal &lt;div&gt;
       // in the code must become <div> in the fenced block, but a real nested
       // tag must not survive the strip to be rendered as markdown.
-      const code = decodeTextEntities(inner.replace(/<[^>]{1,1000}>/g, '')).trim()
+      const code = codeText(inner).replace(/^\r?\n|\r?\n$/g, '')
       // Language hint from common highlighter conventions: the model reads
       // ```js fenced blocks far more accurately than unlabelled ones.
       const lang =
-        /<code[^>]+class=["'][^"']*(?:language|lang)-([\w#+.-]+)["']/i.exec(inner)?.[1] || ''
-      out += `\n\n\`\`\`${lang}\n${code}\n\`\`\``
+        /<code\b[^>]{0,1000}class=["'][^"']{0,1000}(?:language|lang)-([\w#+.-]{1,80})(?:[\s"'])/i.exec(inner)?.[1] || ''
+      const fence = backtickFence(code, 3)
+      out += `\n\n${fence}${lang}\n${code}\n${fence}`
     } else if (tag === 'code') {
-      out += `\`${textOnly(inner)}\``
+      out += img.protect(inlineCode(inner))
     } else if (tag === 'ul' || tag === 'ol') {
       // Without a single </li> nothing can pair, so the item scan is skipped.
       const items = []
-      if (inner.includes('</li')) {
-        const liRe = /<li[^>]{0,1000}>([\s\S]*?)<\/li>/gi
+      if (/<\/li\b/i.test(inner)) {
+        const liRe = /<li\b[^>]{0,1000}>([\s\S]{0,3145728}?)<\/li>/gi
         let lm, idx = 1
         while ((lm = liRe.exec(inner))) {
           const t = inlineMd(lm[1], depth + 1)
@@ -764,33 +912,38 @@ export function blockMd(html, depth = 0) {
       out += '\n\n---'
     } else if (tag === 'table') {
       const rows = []
-      if (inner.includes('</tr')) {
-        const trRe = /<tr[^>]{0,1000}>([\s\S]*?)<\/tr>/gi
+      let rowCount = 0, columnCount = 0
+      if (/<\/tr\b/i.test(inner)) {
+        const trRe = /<tr\b[^>]{0,1000}>([\s\S]{0,3145728}?)<\/tr>/gi
         let tm
         while ((tm = trRe.exec(inner))) {
           const cells = []
-          if (tm[1].includes('</t')) {
-            const tdRe = /<t[dh][^>]{0,1000}>([\s\S]*?)<\/t[dh]>/gi
+          if (/<\/t[dh]\b/i.test(tm[1])) {
+            const tdRe = /<t[dh]\b[^>]{0,1000}>([\s\S]{0,3145728}?)<\/t[dh]>/gi
+            if (rows.length >= MD_TABLE_MAX_ROWS) {
+              if (tdRe.test(tm[1])) rowCount++
+              continue
+            }
             let cm
-            while ((cm = tdRe.exec(tm[1]))) cells.push(inlineMd(cm[1], depth + 1).replace(/\|/g, '\\|'))
+            while ((cm = tdRe.exec(tm[1]))) cells.push(inlineMd(cm[1], depth + 1).replace(/\|/g, '\\|').split(/\r?\n/).map(line => line.trimEnd()).join('<br>'))
           }
-          if (cells.length) rows.push(`| ${cells.join(' | ')} |`)
+          if (cells.length) {
+            if (!rows.length) columnCount = cells.length
+            rows.push(`| ${cells.join(' | ')} |`)
+            rowCount++
+          }
         }
       }
       if (rows.length) {
-        const header = rows[0]
-        // unescape cells' escaped pipes before deriving the separator row,
-        // otherwise the --- line is one char wider per escaped pipe
-        const sep = header.replace(/\\\|/g, '|').replace(/[^|]/g, '-')
+        const sep = `| ${Array(columnCount).fill('---').join(' | ')} |`
         // Compatibility tables (40+ rows × many columns) are the single
         // largest token sink in markdown mode; the hint keeps the model
         // aware the table continues without repeating the cell noise.
-        const kept = rows.length > MD_TABLE_MAX_ROWS ? rows.slice(0, MD_TABLE_MAX_ROWS) : rows
-        const more = rows.length - kept.length
-        out += `\n\n${kept.join('\n')}\n${sep}${more > 0 ? `\n…+${more} rows` : ''}`
+        const more = rowCount - rows.length
+        out += `\n\n${[rows[0], sep, ...rows.slice(1)].join('\n')}${more > 0 ? `\n…+${more} rows` : ''}`
       }
     } else if (tag === 'a' || tag === 'strong' || tag === 'b' || tag === 'em' || tag === 'i') {
-      const t = inlineMd(inner, depth + 1)
+      const t = inlineMd(m[0], depth + 1)
       if (t) out += t
     } else {
       const t = blockMd(inner, depth + 1)
@@ -805,10 +958,11 @@ export function blockMd(html, depth = 0) {
 // the content value may itself contain quotes — locate the tag first, then
 // read content from inside it with a backreference pair.
 function metaContent(html, key) {
-  const tagM = new RegExp(`<meta\\b[^>]{0,1000}(?:property|name)=["']${key}["'][^>]{0,1000}>`, 'i').exec(html)
-  if (!tagM) return ''
-  const m = /content=("([^"]*)"|'([^']*)')/i.exec(tagM[0])
-  return m ? (m[2] || m[3] || '') : ''
+  for (const m of html.matchAll(/<meta(?=[\s/>])[^>]{0,1000}>/gi)) {
+    const attrs = htmlAttributes(m[0])
+    if ((attrs.property || attrs.name || '').toLowerCase() === key) return attrs.content || ''
+  }
+  return ''
 }
 
 // Page-level metadata the model actually asks about (who wrote it, when) —
@@ -947,10 +1101,15 @@ function noscriptBody(html) {
 // their own <time> tags) are out of scope. Empty attribute is a no-op.
 function timeTagMeta(html) {
   if (!html) return ''
-  const marked = /<time\b[^>]{0,1000}(?:itemprop=["']datePublished["']|pubdate\b)[^>]{0,1000}datetime=["']([^"']{1,60})["']/i.exec(html)
-  if (marked) return marked[1].trim().slice(0, 40)
-  const m = /<time\b[^>]{0,1000}datetime=["']([^"']{1,60})["']/i.exec(html)
-  return m ? m[1].trim().slice(0, 40) : ''
+  let first = ''
+  for (const m of html.matchAll(/<time(?=[\s>])[^>]{0,1000}>/gi)) {
+    const attrs = htmlAttributes(m[0])
+    const value = (attrs.datetime || '').trim().slice(0, 40)
+    if (!value) continue
+    if (/(?:^|\s)datePublished(?:\s|$)/i.test(attrs.itemprop || '') || Object.hasOwn(attrs, 'pubdate')) return value
+    if (!first) first = value
+  }
+  return first
 }
 
 // CJK / loose-variant dates normalize to ISO so the metadata line stays
@@ -1023,8 +1182,7 @@ export function extract(html, mode, anchor = '') {
   const ogTitle = metaContent(html, 'og:title')
   const siteName = metaContent(html, 'og:site_name')
   const langMatch = /<html[^>]{1,1000}lang=["']([\w-]+)["']/i.exec(html)
-  let main = stripNoise(pickMain(html))
-  main = stripNoise(revealEscapedTags(main))
+  const main = stripNoise(pickMain(stripRawElements(html)))
   // A URL fragment scopes the read to one section of a long reference page —
   // slice at the anchor so only that section is extracted. Unmatched anchors
   // degrade to the full document instead of failing.
@@ -1113,48 +1271,53 @@ async function getReadabilityExtractor() {
 
 export function smartTruncate(text, maxChars, offset = 0) {
   const total = text.length
+  offset = Math.max(0, Math.floor(Number(offset) || 0))
+  maxChars = Math.max(0, Math.floor(Number(maxChars) || 0))
   if (offset >= total) {
     return { text: '', truncated: false, charsTotal: total, charsReturned: 0, charsStart: offset }
   }
   if (total <= maxChars && offset === 0) {
     return { text, truncated: false, charsTotal: total, charsReturned: total, charsStart: 0 }
   }
-  const paragraphs = text.split(/\n\n+/)
-  let pos = 0
-  let start = 0
-  for (let i = 0; i < paragraphs.length; i++) {
-    if (pos + paragraphs[i].length > offset) {
-      start = i
-      break
+  let start = offset
+  // Continuations omit paragraph separators and report the exact source span.
+  if (text[start] === '\n' && (text[start - 1] === '\n' || text[start + 1] === '\n')) {
+    while (start < total && text[start] === '\n') start++
+  }
+  let end = Math.min(total, start + maxChars)
+  if (end < total && maxChars > 0) {
+    const window = text.slice(start, end + 2)
+    let boundary = window.lastIndexOf('\n\n', end - start)
+    if (boundary >= 0) boundary += start
+    while (boundary > start && text[boundary - 1] === '\n') boundary--
+    if (boundary > start) end = boundary
+    else {
+      // Prefer the last complete sentence inside the current window.
+      for (let i = end - 1; i >= start; i--) {
+        if ('.!?\n。！？'.includes(text[i])) {
+          end = i + 1
+          break
+        }
+      }
     }
-    pos += paragraphs[i].length + 2
+    // Keep UTF-16 surrogate pairs together when the hard limit splits one.
+    const previous = text.charCodeAt(end - 1), next = text.charCodeAt(end)
+    if (end > start + 1 && previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--
   }
-  let acc = ''
-  for (let i = start; i < paragraphs.length; i++) {
-    const p = paragraphs[i]
-    if (acc.length + p.length + (acc ? 2 : 0) > maxChars) break
-    acc += (acc ? '\n\n' : '') + p
-  }
-  if (!acc && maxChars > 0) {
-    // The first paragraph after the offset is itself longer than maxChars.
-    // Keep the alignment promise at sentence level before hard-slicing.
-    const p = paragraphs[start] || ''
-    const rel = Math.max(0, offset - pos)
-    const rest = p.length > rel ? p.slice(rel) : text.slice(offset)
-    const sentences = rest.match(/[^.!?\n。！？]+[.!?\n。！？]*/g) || [rest]
-    for (const s of sentences) {
-      if (acc.length + s.length > maxChars) break
-      acc += s
-    }
-    if (!acc) acc = rest.slice(0, maxChars)
-  }
+  const acc = text.slice(start, end)
   return {
     text: acc,
-    truncated: offset + acc.length < total,
+    truncated: end < total,
     charsTotal: total,
     charsReturned: acc.length,
-    charsStart: offset,
+    charsStart: start,
   }
+}
+
+function decodeUrlAttribute(value) {
+  // Attribute entities preserve bare query keys followed by an equals sign.
+  return value.replace(/&(?:#(?:\d{1,10}|x[0-9a-f]{1,8});?|[a-z][a-z0-9]{1,7}(?:;|(?![a-z0-9=])))/gi,
+    (entity) => decodeTextEntities(entity))
 }
 
 // <base href> overrides the document base for relative URL resolution (old
@@ -1167,7 +1330,7 @@ function detectBaseHref(html, finalUrl) {
   const head = headEnd >= 0 ? html.slice(0, headEnd) : html.slice(0, 16384)
   const base = /<base\b[^>]{0,1000}href=["']([^"']+)["'][^>]{0,1000}>/i.exec(head)
   if (!base) return finalUrl
-  const href = base[1].trim()
+  const href = decodeUrlAttribute(base[1]).trim()
   if (!href) return finalUrl
   try {
     const u = new URL(href, finalUrl)
@@ -1196,7 +1359,7 @@ function extractLinks(html, limit, baseUrl) {
   let scans = 0
   const maxScans = limit * 4
   while ((m = re.exec(html)) && links.length < limit && scans++ < maxScans) {
-    const href = m[1].trim()
+    const href = decodeUrlAttribute(m[1]).trim()
     if (!href || /^(javascript|mailto|tel|data):/i.test(href)) continue
     let url
     try {
@@ -1231,7 +1394,7 @@ function hostOf(url) {
 // the model had to notice the truncation and re-call the tool per page. The
 // recognition is deliberately conservative: rel=next (standard) or a short
 // anchor whose whole text is a next-page marker — no fuzzy guessing.
-const NEXT_TEXT_RE = /^(?:[›»>]+\s*)?(?:下一页|下页|下一篇|下一頁|下頁|后一页|後一頁|next page|next|older entries|[›»>]{1,3})(?:\s*[›»>]+)?$/i
+const NEXT_TEXT_RE = /^(?:[›»>]{1,3}\s{0,4})?(?:下一页|下页|下一頁|下頁|后一页|後一頁|next page|next|older entries|[›»>]{1,3})(?:\s{0,4}[›»>]{1,3})?$/i
 
 export function findNextLink(html, baseUrl) {
   // Same <base href> rule as extractLinks: frame/forum sites pin their
@@ -1239,7 +1402,7 @@ export function findNextLink(html, baseUrl) {
   const base = detectBaseHref(html || '', baseUrl)
   const resolve = (href) => {
     try {
-      const u = new URL(href, base)
+      const u = new URL(decodeUrlAttribute(href), base)
       return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null
     } catch {
       return null
@@ -1320,7 +1483,7 @@ export function compactJson(value) {
     if (typeof v === 'string') return clip(v)
     if (Array.isArray(v)) return v.map((x) => walk(x, depth + 1))
     if (v && typeof v === 'object' && depth < 12) {
-      const o = {}
+      const o = Object.create(null)
       for (const k of Object.keys(v)) o[k] = walk(v[k], depth + 1)
       return o
     }
@@ -1384,36 +1547,42 @@ export function metaRefreshTarget(html, baseUrl) {
 // cache key is the ORIGINAL url, and a shell re-request should re-follow
 // rather than serve a foreign page.
 const MAX_META_REFRESH_HOPS = 3
-async function followMetaRefresh(html, finalUrl, externalSignal, cfg) {
+async function followMetaRefresh(html, finalUrl, externalSignal, cfg, ctx) {
   let cur = html
   let curUrl = finalUrl
   let curCharset = '' // set only when a hop actually happened
+  let sourceTruncated
   const seen = new Set([normalizeUrl(finalUrl)])
   // Chain budget: each hop carries its own fetch timeout, so 3 hops could
   // triple the call's cost — the whole follow chain shares ONE timeout.
   const t0 = Date.now()
+  const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs)
+  const hopSignal = externalSignal ? AbortSignal.any([externalSignal, timeoutSignal]) : timeoutSignal
   for (let i = 0; i < MAX_META_REFRESH_HOPS; i++) {
+    if (hopSignal.aborted) break
     const target = metaRefreshTarget(cur, curUrl)
     if (!target) break
     if (Date.now() - t0 > cfg.timeoutMs) break
     const norm = normalizeUrl(target)
     if (!norm || seen.has(norm)) break
     seen.add(norm)
-    const page = await fetchPage(target, externalSignal, cfg)
+    const page = await fetchViaWebSeam(ctx, target, hopSignal, cfg) || await fetchPage(target, hopSignal, cfg)
     if (page.error) break
-    const ct = (page.contentType || '').split(';')[0].toLowerCase().trim()
+    const ct = page.kind === 'html' ? 'text/html' : (page.contentType || '').split(';')[0].toLowerCase().trim()
     if (!/html|xhtml/.test(ct)) break
-    const decoded = decodeBuffer(page.buffer, page.contentType)
+    const decoded = typeof page.html === 'string' ? { text: page.html, charset: 'provider-decoded' } : decodeBuffer(page.buffer, page.contentType)
     cur = decoded.text
     curCharset = decoded.charset
     curUrl = page.finalUrl || target
+    sourceTruncated = page.sourceTruncated === true
   }
-  return { html: cur, finalUrl: curUrl, charset: curCharset }
+  return { html: cur, finalUrl: curUrl, charset: curCharset, sourceTruncated }
 }
 
 export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   const url = String((args && args.url) || '').trim()
   if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
+  if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
   const maxChars = Math.max(500, Math.min(20000, Number(args.maxChars) || cfg.maxChars))
   const mode = args.mode === 'markdown' ? 'markdown' : 'text'
   const offset = Math.max(0, Number(args.offset) || 0)
@@ -1468,6 +1637,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   }
 
   const failWith = (error) => {
+    if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
     cacheFail(cacheKey, error)
     return { error }
   }
@@ -1482,71 +1652,101 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     try {
       return JSON.parse(t)
     } catch {
-      return JSON.parse(t.replace(/-?(?:NaN|Infinity)\b/g, 'null'))
+      const parts = []
+      let quoted = false
+      let start = 0
+      for (let i = 0; i < t.length; i++) {
+        const ch = t[i]
+        if (quoted) {
+          if (ch === '\\') i++
+          else if (ch === '"') quoted = false
+          continue
+        }
+        if (ch === '"') { quoted = true; continue }
+        if (ch !== 'N' && ch !== 'I' && ch !== '-') continue
+        const begin = i
+        const literal = ch === '-' ? i + 1 : i
+        const length = t.startsWith('Infinity', literal) ? 8 : t.startsWith('NaN', literal) ? 3 : 0
+        if (!length) continue
+        const end = literal + length
+        if ((begin > 0 && !':,[ \t\r\n'.includes(t[begin - 1])) || (end < t.length && !',]} \t\r\n'.includes(t[end]))) continue
+        parts.push(t.slice(start, begin), 'null')
+        start = end
+        i = end - 1
+      }
+      parts.push(t.slice(start))
+      return JSON.parse(parts.join(''))
     }
   }
   const dispatch = async () => {
     const viaSeam = await fetchViaWebSeam(ctx, url, externalSignal, cfg)
-    if (viaSeam) {
-      const t = viaSeam.html.trim()
-      if (t.startsWith('{') || t.startsWith('[')) {
-        try {
-          return { kind: 'json', text: compactJson(parseJsonLoose(t)) }
-        } catch { /* not JSON — keep HTML pipeline */ }
-      }
-      return { kind: 'html', html: viaSeam.html, finalUrl: viaSeam.finalUrl, charset: 'provider-decoded' }
-    }
-    const page = await fetchPage(url, externalSignal, cfg)
+    const page = viaSeam || await fetchPage(url, externalSignal, cfg)
     if (page.error) return { error: page.error }
-    const ct = (page.contentType || '').split(';')[0].toLowerCase().trim()
-    const decoded = decodeBuffer(page.buffer, page.contentType)
-    if (/json$/.test(ct)) {
+    const ct = viaSeam ? (page.kind === 'text' ? 'text/plain' : 'text/html') : (page.contentType || '').split(';')[0].toLowerCase().trim()
+    const decoded = viaSeam ? { text: page.html, charset: 'provider-decoded' } : decodeBuffer(page.buffer, page.contentType)
+    const meta = { finalUrl: page.finalUrl || url, sourceTruncated: page.sourceTruncated === true }
+    const trimmed = decoded.text.trim()
+    if (/json$/.test(ct) || ((viaSeam || !ct || ct === 'text/plain') && (trimmed.startsWith('{') || trimmed.startsWith('[')))) {
       try {
-        return { kind: 'json', text: compactJson(parseJsonLoose(decoded.text)) }
+        return { ...meta, kind: 'json', text: compactJson(parseJsonLoose(trimmed)) }
       } catch { /* invalid JSON — serve through the HTML pipeline as text */ }
     }
-    if (/[+/]xml$/.test(ct)) {
-      if (/<urlset[\s>]/i.test(decoded.text) || /<sitemapindex[\s>]/i.test(decoded.text)) {
+    if (/[+/]xml$/.test(ct) || viaSeam || !ct || ct === 'text/plain') {
+      let xmlHead = trimmed.slice(0, 16384)
+      for (let i = 0; i < 8; i++) {
+        const close = xmlHead.startsWith('<?') ? '?>' : xmlHead.startsWith('<!--') ? '-->' : ''
+        if (!close) break
+        const end = xmlHead.indexOf(close)
+        if (end < 0) break
+        xmlHead = xmlHead.slice(end + close.length).trimStart()
+      }
+      const root = /^<(?:[A-Za-z_][\w.-]{0,63}:)?(rss|feed|urlset|sitemapindex|RDF)(?=[\s>])/i.exec(xmlHead)
+      const xmlKind = root ? root[1].toLowerCase() : ''
+      if (xmlKind === 'urlset' || xmlKind === 'sitemapindex') {
         return { error: 'Unsupported content (XML sitemap)' }
       }
-      if (/<rss[\s>]/i.test(decoded.text) || /<feed[\s>]/i.test(decoded.text)) {
-        return { kind: 'feed', feed: parseFeed(decoded.text, cfg.maxLinks) }
+      if (xmlKind === 'rss' || xmlKind === 'feed' || (xmlKind === 'rdf' && /<(?:[A-Za-z_][\w.-]{0,63}:)?item(?=[\s>])/i.test(decoded.text))) {
+        return { ...meta, kind: 'feed', feed: parseFeed(decoded.text, cfg.maxLinks, meta.finalUrl) }
       }
     }
     // Plain-text families (txt/md/csv): line structure IS the content — the
     // HTML pipeline would flatten every newline into spaces. Pages that are
     // actually HTML but mislabelled text/plain keep the HTML pipeline.
-    if (/^text\/(?:plain|markdown|csv)$/.test(ct)) {
+    if (!ct || /^text\/(?:plain|markdown|csv)$/.test(ct)) {
       const head = decoded.text.slice(0, 5000)
-      if (!/<(?:html|body|div|p|table)\b[\s>]/i.test(head)) {
+      if ((viaSeam && page.kind === 'text') || ct === 'text/markdown' || ct === 'text/csv' || !/<(?:html|body|div|p|table)\b[\s>]/i.test(head)) {
         const text = decoded.text
           .replace(/\r\n?/g, '\n')
           .replace(/[ \t]+\n/g, '\n')
           .replace(/\n{4,}/g, '\n\n\n')
           .trim()
-        return { kind: 'text', text, charset: decoded.charset }
+        return { ...meta, kind: 'text', text, charset: decoded.charset }
       }
     }
-    return { kind: 'html', html: decoded.text, finalUrl: page.finalUrl || url, charset: decoded.charset }
+    return { ...meta, kind: 'html', html: decoded.text, charset: decoded.charset }
   }
   const payload = await dispatch()
+  if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
   if (payload.error) return failWith(payload.error)
+  const resultUrl = payload.finalUrl || url
+  const truncatedHint = '提供方已截断原文，当前内容不是完整页面'
+  let sourceHint = payload.sourceTruncated ? truncatedHint : ''
 
   if (payload.kind === 'text') {
-    const full = { url, title: '', siteName: hostOf(url), lang: '', charset: payload.charset, mode: 'text', fullText: payload.text, paginated: 1 }
+    const full = { url: resultUrl, title: '', siteName: hostOf(resultUrl), lang: '', charset: payload.charset, mode: 'text', fullText: payload.text, paginated: 1, spaHint: sourceHint }
     cacheStore(cacheKey, full, cfg.cacheMax)
     return sliceFrom(full, offset, maxChars)
   }
   if (payload.kind === 'json') {
-    const full = { url, title: '', siteName: hostOf(url), lang: '', charset: 'json', mode: 'json', fullText: payload.text, paginated: 1 }
+    const full = { url: resultUrl, title: '', siteName: hostOf(resultUrl), lang: '', charset: 'json', mode: 'json', fullText: payload.text, paginated: 1, spaHint: sourceHint }
     cacheStore(cacheKey, full, cfg.cacheMax)
     return sliceFrom(full, offset, maxChars)
   }
   if (payload.kind === 'feed') {
     const f = payload.feed
     const full = {
-      url, title: f.title || '', siteName: hostOf(url), lang: '', charset: 'feed',
-      mode: 'feed', fullText: f.text, paginated: 1, feedCount: f.count,
+      url: resultUrl, title: f.title || '', siteName: hostOf(resultUrl), lang: '', charset: 'feed',
+      mode: 'feed', fullText: f.text, paginated: 1, feedCount: f.count, spaHint: sourceHint,
       links: args.includeLinks === true ? f.items : undefined,
     }
     cacheStore(cacheKey, full, cfg.cacheMax)
@@ -1561,11 +1761,13 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   // follow immediately, BEFORE extraction and SPA rendering — a shell that
   // redirects needs no headless round-trip, and extracting the stub is wasted
   // work. Fails open on any fetch problem; the follow is hop-bounded.
-  const followed = await followMetaRefresh(html, finalUrl, externalSignal, cfg)
+  const followed = await followMetaRefresh(html, finalUrl, externalSignal, cfg, ctx)
+  if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
   html = followed.html
   finalUrl = followed.finalUrl
   // The target may use a different encoding than the shell page — reflect it.
   if (followed.charset) charset = followed.charset
+  if (followed.sourceTruncated !== undefined) sourceHint = followed.sourceTruncated ? truncatedHint : ''
 
   let extracted = extract(html, mode, anchor)
   // Optional readability upgrade: cleaner article extraction when installed.
@@ -1599,7 +1801,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   // lose, rendering is always worth one bounded attempt. Pages with no
   // scripts at all cannot change under rendering and are skipped.
   let rendered = false
-  let spaHint = ''
+  let spaHint = sourceHint
   let renderedHtml = null
   const needsRender = !extracted.text || extracted.text.length < 200
   const scriptShell = !extracted.text && /<script[\s>]/i.test(html)
@@ -1659,14 +1861,18 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     const nu = normalizeUrl(nextUrl)
     if (!nu || seen.has(nu)) break
     seen.add(nu)
-    const page = await fetchPage(nextUrl, externalSignal, cfg)
+    const page = await fetchViaWebSeam(ctx, nextUrl, externalSignal, cfg) || await fetchPage(nextUrl, externalSignal, cfg)
     if (page.error) break
-    const ct = (page.contentType || '').split(';')[0].toLowerCase().trim()
+    const pageFinal = normalizeUrl(page.finalUrl || nextUrl)
+    if (!pageFinal || !sameHost(pageFinal, startHost) || (pageFinal !== nu && seen.has(pageFinal))) break
+    seen.add(pageFinal)
+    const ct = page.kind === 'html' ? 'text/html' : (page.contentType || '').split(';')[0].toLowerCase().trim()
     if (!/html|xhtml/.test(ct)) break
-    const nextHtml = decodeBuffer(page.buffer, page.contentType).text
+    const nextHtml = typeof page.html === 'string' ? page.html : decodeBuffer(page.buffer, page.contentType).text
     const nextEx = extract(nextHtml, mode)
     if (!nextEx.text || nextEx.text.length < 20) break
     extracted.text = joinPageText(extracted.text, nextEx.text)
+    if (page.sourceTruncated && !spaHint.includes(truncatedHint)) spaHint = [spaHint, truncatedHint].filter(Boolean).join('；')
     paginated++
     nextUrl = findNextLink(nextHtml, page.finalUrl || nextUrl)
   }
@@ -1678,6 +1884,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     spaHint = '正文极短（可能登录墙或反爬拦截）'
   }
 
+  if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
   const full = {
     url: finalUrl,
     title: extracted.title || '',
@@ -1806,20 +2013,13 @@ function readLinksTool(ctx, cfg) {
       const url = String((args && args.url) || '').trim()
       if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
       const limit = Math.max(1, Math.min(50, Number(args.limit) || cfg.maxLinks))
-      const viaSeam = await fetchViaWebSeam(ctx, url, exec && exec.signal, cfg)
-      let html, finalUrl
-      if (viaSeam) {
-        html = viaSeam.html
-        finalUrl = viaSeam.finalUrl
-      } else {
-        const page = await fetchPage(url, exec && exec.signal, cfg)
-        if (page.error) return { error: page.error }
-        html = decodeBuffer(page.buffer, page.contentType).text
-        finalUrl = page.finalUrl || url
-      }
+      const page = await fetchViaWebSeam(ctx, url, exec && exec.signal, cfg) || await fetchPage(url, exec && exec.signal, cfg)
+      if (page.error) return { error: page.error }
+      let html = typeof page.html === 'string' ? page.html : decodeBuffer(page.buffer, page.contentType).text
+      let finalUrl = page.finalUrl || url
       // Same meta-refresh shell following as read_url: a link hop serves a
       // stub whose real links live at the target. Fails open, hop-bounded.
-      const followed = await followMetaRefresh(html, finalUrl, exec && exec.signal, cfg)
+      const followed = await followMetaRefresh(html, finalUrl, exec && exec.signal, cfg, ctx)
       html = followed.html
       finalUrl = followed.finalUrl
       let links = extractLinks(html, limit, finalUrl)
@@ -1999,34 +2199,44 @@ function isNoiseUrl(url) {
 // static assets / auth paths are skipped; visited URLs are deduped; a per-page
 // failure is recorded and does not abort the crawl. No SPA rendering here —
 // that is read_url's job; crawling favors speed and breadth.
-async function crawlSite(entryUrl, cfg, opts, externalSignal) {
+async function crawlSite(entryUrl, cfg, opts, externalSignal, ctx) {
   const { maxPages, maxDepth, includeContent, perMax } = opts
-  const host = hostOf(entryUrl)
+  let host = hostOf(entryUrl)
   const visited = new Set()
+  const resolved = new Set()
+  let attempted = 0
   const pages = []
   const failures = []
   const queue = [{ url: entryUrl, depth: 0 }]
   // Stop once the host's cooperative signal fires (tool budget hit): without
   // this the loop keeps draining the queue on instantly-aborted fetches.
-  while (queue.length && pages.length < maxPages && !(externalSignal && externalSignal.aborted)) {
+  while (queue.length && attempted < maxPages && !(externalSignal && externalSignal.aborted)) {
     // Never overshoot the page budget within a batch round.
-    const batch = queue.splice(0, Math.min(2, maxPages - pages.length, queue.length))
+    const batch = queue.splice(0, Math.min(2, maxPages - attempted, queue.length))
     const results = await Promise.all(
       batch.map(async ({ url, depth }) => {
         const norm = normalizeUrl(url)
         if (!norm || visited.has(norm)) return null
         visited.add(norm)
-        const page = await fetchPage(url, externalSignal, cfg)
+        attempted++
+        const page = await fetchViaWebSeam(ctx, url, externalSignal, cfg) || await fetchPage(url, externalSignal, cfg)
         if (page.error) return { url, depth, error: page.error }
-        let html = decodeBuffer(page.buffer, page.contentType).text
+        let html = typeof page.html === 'string' ? page.html : decodeBuffer(page.buffer, page.contentType).text
         let pageUrl = page.finalUrl || url
+        if (depth > 0 && !sameHost(pageUrl, host)) {
+          return { url, depth, error: `Redirected outside the site: ${pageUrl}` }
+        }
         // Same shell-following as read_url: a meta-refresh stub would otherwise
         // be crawled AS the page (title-less hop text pollutes results and the
         // real content is never reached). Fails open — fetch problems keep the
         // stub's own HTML.
-        const followed = await followMetaRefresh(html, pageUrl, externalSignal, cfg)
+        const followed = await followMetaRefresh(html, pageUrl, externalSignal, cfg, ctx)
         html = followed.html
         pageUrl = followed.finalUrl
+        if (depth === 0) host = hostOf(pageUrl)
+        else if (!sameHost(pageUrl, host)) {
+          return { url, depth, error: `Redirected outside the site: ${pageUrl}` }
+        }
         const ex = extract(html, 'text')
         const links = extractLinks(html, 100, pageUrl)
         return {
@@ -2045,6 +2255,10 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal) {
         failures.push({ url: r.url, error: r.error })
         continue
       }
+      const finalNorm = normalizeUrl(r.url)
+      if (!finalNorm || resolved.has(finalNorm)) continue
+      resolved.add(finalNorm)
+      visited.add(finalNorm)
       pages.push(r)
       if (r.depth + 1 <= maxDepth) {
         // Queue cap: a huge site (millions of links) would otherwise grow the
@@ -2123,12 +2337,12 @@ function readUrlSiteTool(ctx, cfg) {
     async execute(args, exec) {
       const url = String((args && args.url) || '').trim()
       if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
-      const maxPages = Math.max(2, Math.min(50, Number(args.maxPages) || 15))
+      const maxPages = Math.floor(Math.max(2, Math.min(50, Number(args.maxPages) || 15)))
       const maxDepth = Math.max(1, Math.min(5, Number(args.maxDepth) || 2))
       const includeContent = args.includeContent === true
       const perMax = Math.max(200, Math.min(2000, Number(args.maxCharsPerPage) || 500))
       const { host, pages, failures } = await crawlSite(
-        url, cfg, { maxPages, maxDepth, includeContent, perMax }, exec && exec.signal,
+        url, cfg, { maxPages, maxDepth, includeContent, perMax }, exec && exec.signal, ctx,
       )
       return {
         host,

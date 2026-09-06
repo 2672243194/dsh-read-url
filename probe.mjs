@@ -37,6 +37,10 @@ t('decodeTextEntities 200k numeric entities', () => decodeTextEntities('&#65;'.r
 // table with many rows
 const TBL = `<table>${Array.from({ length: 3000 }, (_, i) => `<tr><td>a${i}|b</td><td>c</td></tr>`).join('')}</table>`
 t('blockMd 3000-row table', () => blockMd(TBL).length)
+for (const n of [80000, 160000, 320000]) {
+  t(`blockMd table code ${n} spaces`, () => blockMd(`<table><tr><td><code>a${' '.repeat(n)}b</code></td></tr></table>`).length)
+  t(`extract footer ${n} embedded bytes`, () => extract(`<main><footer><img src="data:image/png;base64,${'A'.repeat(n)}"></footer><p>keep</p></main>`, 'text').text)
+}
 // nested lists
 const LISTS = `<ul>${'<li><ul><li>'.repeat(2000)}x${'</li></ul></li>'.repeat(2000)}</ul>`
 t('blockMd 2000-deep nested lists', () => blockMd(LISTS).length)
