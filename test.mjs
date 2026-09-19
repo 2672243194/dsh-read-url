@@ -7,6 +7,7 @@ import { runNetworkTests } from './test-network.mjs'
 import { runCrawlTests } from './test-crawl.mjs'
 import { runExtractionTests } from './test-extraction.mjs'
 import { runLifecycleTests } from './test-lifecycle.mjs'
+import { runDirectOriginTests } from './test-direct-origins.mjs'
 const { decodeBuffer, extract, smartTruncate, blockMd, inlineMd, decodeTextEntities, raceFirstSuccess, metaRefreshTarget, findNextLink } = m
 
 let passed = 0
@@ -1863,6 +1864,7 @@ passed += await runNetworkTests(m)
 passed += await runCrawlTests(m)
 passed += await runExtractionTests(m)
 passed += await runLifecycleTests()
+passed += await runDirectOriginTests(m)
 console.log(`\n${passed} assertions passed`)
 // All assertions are synchronous or top-level awaited; reaching here means every
 // one passed, so force a clean exit (avoids environment-specific exit-code noise).

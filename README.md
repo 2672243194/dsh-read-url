@@ -47,7 +47,7 @@ DSH agents can search (getting links and snippets) but lack the step of "reading
 
 Implemented per official docs (`docs/capability-seams.md`, `docs/cordis-primer.md`, `docs/tool-execution-pipeline.md`):
 
-1. **Web access via the `ctx.web` capability seam** — use `ctx.web.fetch({ url }, signal)` and its decoded `body.kind/content` result for reads, redirects and crawl requests; fall back to direct retrieval when the service or provider is unavailable. Provider HTTP errors and policy decisions remain errors;
+1. **Web access via the `ctx.web` capability seam** — use `ctx.web.fetch({ url }, signal)` and its decoded `body.kind/content` result for reads, redirects and crawl requests; fall back to direct retrieval when the service or provider is unavailable. Provider HTTP errors and policy decisions remain errors. The optional `directFetchOrigins` profile setting selects explicit direct retrieval for trusted origins;
 2. **Reversible side effects** — the session cache is registered under `ctx.effect`, auto-cleared on plugin unload (temporal composability);
 3. **Cooperative tool-call timeout** — `ToolDefinition.timeoutMs` declares the budget, `execute(args, exec)` forwards `exec.signal` to fetch; the timeout policy is enforced by the pipeline, never exposed to the model;
 4. **Model-facing simplicity** — render emits compact text (`title:` header + body); the model consumes it directly with no JSON parsing. Defaults are the most token-efficient; structured output is opt-in;
@@ -181,6 +181,27 @@ Override via the profile's `cordis.patch.yml` (defaults in the plugin's own `cor
 
 Values are coerced and clamped to sane ranges at load — quoted numbers in YAML work, garbage falls back to defaults.
 
+#### Explicit direct origins (v1.9.0)
+
+`directFetchOrigins` defaults to `[]`. For a trusted local reverse proxy (for example, a GitHub hostname mapped by your hosts file), explicitly list the origins in the plugin's **profile configuration**, then reload the plugin/profile:
+
+```yaml
+- id: dsh-read-url
+  config:
+    directFetchOrigins:
+      - https://github.com
+      - https://api.github.com
+      - https://raw.githubusercontent.com
+```
+
+Listed origins use direct fetch immediately, bypassing the host web provider **and its SSRF checks**. Add only origins you trust; this also permits their DNS/hosts mappings to local or private addresses. The option is not a tool argument. Unlisted initial URLs keep the existing provider selection and fallback behavior; a provider refusal does not enable this exception automatically.
+
+Matching is exact after URL normalization: scheme, hostname and port must match; subdomains are separate. At most 32 entries of 2,048 characters each are accepted. Only an HTTP(S) origin with an optional trailing `/` is valid: credentials, paths, queries, fragments, wildcards and ambiguous syntax cause a configuration error. Unlike numeric options, invalid entries do not fall back to defaults.
+
+Once a request selects explicit direct retrieval, every subsequent HTTP redirect, meta-refresh, pagination request and descendant crawl stays within the list. Redirects handled internally by the provider remain on the provider path. Direct HTTP requests follow at most 5 redirects per attempt and stop loops early. An outside target is stopped before requesting it; refresh/pagination blocked by this policy retain the readable static result with a hint. Explicit direct reads use neither the plugin's curl proxy race nor SPA rendering, preventing those mechanisms from widening the exception. When `spaRender` is enabled and `read_url` or `read_url_links` would otherwise render a script-only page, they return a static-reading hint. Cancellation, response-size limits and one bounded Retry-After retry still apply. All four tools share the policy; success and failure caches are isolated by the complete normalized list, including after changing or clearing it.
+
+Controlled HTTP servers and provider fixtures cover default refusals, explicit routing, redirects, pagination, all four tools, cache isolation, cancellation, timeouts and response-size limits.
+
 ### Output (compact)
 
 ```json
@@ -286,6 +307,13 @@ Plus a **15-item DSH acceptance round** (a real agent driving every read_url too
 - The 152-site run returned **104 OK / 23 THIN+EMPTY / 25 ERR / 0 THREW**, with no noise among OK results. The three known NOISE sites have identical decoded content and extracted output against v1.8.0 using the same input. Network errors and intentionally unsupported types remain separate from extraction results.
 - SPA cancellation closes the active page; plugin disposal awaits browser shutdown. Valid success-cache entries take precedence over concurrent failures. Crawl filtering uses path boundaries. Charset and Markdown attributes use bounded parsing.
 - Fixed model input cost remains **1,159 description characters / 1,876 schema characters**, within the 1,250 / 2,000 budgets.
+
+### v1.9.0 validation (2026-09-19)
+
+- **322 zero-dependency unit assertions, 15 real Chromium SPA assertions and 53 adversarial probes** passed. The suite includes 22 direct-origin policy checks and 3 SPA restriction checks.
+- The 152-site sweep returned **105 OK / 23 THIN+EMPTY / 24 ERR / 0 THREW**, with no noise in OK results.
+- Vue, React and Kugou's known NOISE cases matched v1.8.1 exactly using identical HTML and optional dependencies, in both text/Markdown and full/800-character outputs. Errors were network, anti-bot, invalid-address or expected content-type boundaries.
+- All four tools enforce the explicit origin policy, including redirect/crawl boundaries, cache isolation and visible static-reading hints. Model input remains **1,159 description characters / 1,876 schema characters**, within the 1,250 / 2,000 budgets.
 
 ## Roadmap
 

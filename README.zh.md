@@ -47,7 +47,7 @@ DSH 的 Agent 能搜索（返回链接和片段），但缺"把 URL 读成干净
 
 按官方文档实现（`docs/capability-seams.md`、`docs/cordis-primer.md`、`docs/tool-execution-pipeline.md`）：
 
-1. **网络访问走 `ctx.web` 能力缝**——读取、跳转与爬取使用 `ctx.web.fetch({ url }, signal)` 及解码后的 `body.kind/content`；服务或提供方不可用时回退直连。提供方 HTTP 错误与策略拒绝保留为错误；
+1. **网络访问走 `ctx.web` 能力缝**——读取、跳转与爬取使用 `ctx.web.fetch({ url }, signal)` 及解码后的 `body.kind/content`；服务或提供方不可用时回退直连。提供方 HTTP 错误与策略拒绝保留为错误。可选的 profile 配置 `directFetchOrigins` 为可信来源选择显式直连；
 2. **可逆副作用**——会话缓存注册在 `ctx.effect` 下，插件卸载即自动清理（时间可组合性）；
 3. **协作式工具调用超时**——`ToolDefinition.timeoutMs` 声明预算，`execute(args, exec)` 把 `exec.signal` 转发给 fetch，超时策略由管线强制执行，不把超时暴露给模型；
 4. **模型视角精简**——render 输出紧凑文本（`title:` 头部 + 正文），模型直接消费，无需解析 JSON；默认参数最省 token，结构化能力按需开启；
@@ -181,6 +181,27 @@ chars 800+800/12398 · cached
 
 配置在加载时统一强转数字并钳制到合理范围——YAML 里加引号的数字也能用，非法值回退默认。
 
+#### 显式直连来源（v1.9.0）
+
+`directFetchOrigins` 默认为 `[]`。对于可信的本地反向代理（例如通过 hosts 文件映射 GitHub 域名），在插件的 **profile 配置**中显式列出来源，再重载插件/profile：
+
+```yaml
+- id: dsh-read-url
+  config:
+    directFetchOrigins:
+      - https://github.com
+      - https://api.github.com
+      - https://raw.githubusercontent.com
+```
+
+命中的来源立即直连，跳过宿主 web provider **及其 SSRF 检查**。仅添加你信任的来源；其 DNS/hosts 映射到本机或私有地址也会被允许。此选项不开放为工具参数。未列出的初始 URL 保留既有 provider 选择与回退行为；provider 拒绝不会自动启用此例外。
+
+按 URL 规范化后的协议、域名、端口精确匹配，子域名需单独配置。最多 32 项，每项不超过 2,048 字符。仅接受 HTTP(S) origin，可带一个结尾 `/`；凭据、路径、查询、片段、通配符和歧义写法都会触发配置错误。此选项与数字选项不同，非法项不会静默回退默认值。
+
+请求选用显式直连后，后续 HTTP 重定向、meta-refresh、分页及爬取子页面均限制在列表内；provider 内部处理的跳转仍属于 provider 路径。直连每次尝试最多跟随 5 次 HTTP 重定向，遇循环提前停止。越界目标在发请求前停止；被此策略阻止的刷新跳转或分页保留可读的静态结果并附提示。显式直连不使用插件的 curl 代理竞速或 SPA 渲染，防止它们扩大例外范围；启用 `spaRender` 且 `read_url` 或 `read_url_links` 原本需要渲染脚本空壳时，会提示仅能静态读取。取消、正文大小限制及一次有界 Retry-After 重试继续生效。四个工具统一遵守此策略；成功与失败缓存按完整规范化列表隔离，修改或清空列表后不会误用旧策略的结果。
+
+受控 HTTP 服务与 provider 桩覆盖默认拒绝、显式直连、重定向、分页、四工具、缓存隔离、取消、超时及正文上限。
+
 ### 输出结构（紧凑）
 
 ```json
@@ -286,6 +307,13 @@ v1.4.0 复验（2026-08-28，代理环境）：python-docs stdtypes.html 锚点�
 - 152 站实网结果为 **104 OK / 23 THIN+EMPTY / 25 ERR / 0 THREW**，OK 站零噪声。三个已知 NOISE 站在同输入 v1.8.0 对照中，解码内容与提取结果逐字一致；网络错误与预期不支持的类型单独归类。
 - SPA 取消关闭当前页面，插件卸载等待浏览器关闭；有效成功缓存优先于并发失败；爬取过滤遵循路径边界；编码与 Markdown 属性使用有界解析。
 - 模型固定输入成本仍为 **description 1,159 字符 / schema 1,876 字符**，低于 1,250 / 2,000 预算。
+
+### v1.9.0 验证（2026-09-19）
+
+- **322 个零依赖单元断言、15 个真实 Chromium SPA 断言、53 项对抗探针**通过；包括 22 条直连来源策略检查与 3 条 SPA 限制检查。
+- 152 站实网结果为 **105 OK / 23 THIN+EMPTY / 24 ERR / 0 THREW**，OK 站零噪声。
+- Vue、React、酷狗三个已知 NOISE 站采用同份 HTML 与相同可选依赖对照 v1.8.1，text/Markdown 全文及 800 字符窗口逐字一致；ERR 均为网络、反爬、无效地址或预期不支持的类型。
+- 四个工具统一遵守显式来源策略，覆盖跳转与爬取边界、缓存隔离及可见的静态读取提示。模型固定输入成本为 **description 1,159 字符 / schema 1,876 字符**，低于 1,250 / 2,000 预算。
 
 ## Roadmap
 

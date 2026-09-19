@@ -2,7 +2,8 @@
 // Zero external dependencies (Node 20+ built-ins only).
 // Aligned with DSH architecture:
 //   - all network access goes through the ctx.web capability seam (official
-//     docs/capability-seams.md), falling back to global fetch when absent
+//     docs/capability-seams.md), except explicit directFetchOrigins; falls
+//     back to global fetch when absent
 //   - cache is registered under ctx.effect, so unload fully reverts it
 //     (temporal composability, docs/cordis-primer.md)
 //   - cooperative tool-call timeout via ToolDefinition.timeoutMs + exec.signal
@@ -34,6 +35,7 @@ const DEFAULTS = {
   spaRender: true,
   paginate: true,
   paginateMax: 3,
+  directFetchOrigins: [],
   userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
 }
 
@@ -52,6 +54,51 @@ function cacheStore(key, full, cacheMax) {
   failCache.delete(key)
 }
 const decoders = new Map()
+
+// Owner configuration only: tool arguments cannot widen this trust boundary.
+// Preserve scheme/port, reject ambiguous origin syntax, and fail closed on
+// invalid configuration instead of silently accepting a partial allowlist.
+function directOrigins(values = []) {
+  const invalid = () => new Error('Invalid directFetchOrigins: expected at most 32 exact http(s) origins without credentials, paths, queries, fragments or wildcards')
+  if (!Array.isArray(values) || values.length > 32) throw invalid()
+  const origins = new Set()
+  for (const value of values) {
+    if (typeof value !== 'string' || value.length > 2048) throw invalid()
+    const raw = value.trim()
+    let u
+    try { u = new URL(raw) } catch { throw invalid() }
+    if (!raw.toLowerCase().startsWith(`${u.protocol}//`) ||
+        !['http:', 'https:'].includes(u.protocol) || u.username || u.password ||
+        u.pathname !== '/' || raw.includes('?') || raw.includes('#') ||
+        raw.includes('*') || raw.includes('\\') || raw.includes('@') ||
+        [...raw].some(c => c.charCodeAt(0) <= 32 || c.charCodeAt(0) === 127)) throw invalid()
+    // Do not accept URL parser repairs such as /a/.. or percent escapes in
+    // hostnames. Only an authority and one optional trailing slash are valid.
+    const authority = raw.slice(raw.indexOf('://') + 3)
+    if (authority.includes('%') || authority.replace(/\/$/, '').includes('/')) throw invalid()
+    origins.add(u.origin)
+  }
+  return [...origins].sort()
+}
+
+function createRoute(cfg) {
+  const origins = directOrigins(cfg.directFetchOrigins)
+  return { origins: new Set(origins), key: JSON.stringify(origins), restricted: false, hint: '' }
+}
+
+function matchesDirectOrigin(url, origins) {
+  try { return origins.has(new URL(url).origin) } catch { return false }
+}
+
+function allowedDirectUrl(url, origins) {
+  try {
+    const u = new URL(url)
+    return !u.username && !u.password && origins.has(u.origin) && ['http:', 'https:'].includes(u.protocol)
+  } catch { return false }
+}
+
+const DIRECT_BOUNDARY_ERROR = 'Direct fetch stopped: target is outside directFetchOrigins or contains credentials'
+const DIRECT_SPA_HINT = '已配置直连仅支持静态读取，未启用浏览器渲染'
 
 function getDecoder(enc) {
   let d = decoders.get(enc)
@@ -124,13 +171,31 @@ function retryAfterMs(res) {
 }
 
 // Single fetch attempt. Never throws; maps abort/timeout/network to { error }.
-async function directFetchOnce(url, signal, cfg) {
+async function directFetchOnce(url, signal, cfg, origins) {
   try {
-    const res = await fetch(url, {
-      redirect: 'follow',
-      signal,
-      headers: { 'user-agent': cfg.userAgent, accept: 'text/html,application/xhtml+xml,*/*;q=0.8' },
-    })
+    let currentUrl = url
+    let res
+    const seen = new Set()
+    for (let hops = 0; ; hops++) {
+      if (signal && signal.aborted) return { error: 'cancelled' }
+      if (origins && !allowedDirectUrl(currentUrl, origins)) return { error: DIRECT_BOUNDARY_ERROR }
+      if (origins) {
+        const normalized = normalizeUrl(currentUrl)
+        if (seen.has(normalized)) return { error: 'Direct fetch redirect loop' }
+        seen.add(normalized)
+      }
+      res = await fetch(currentUrl, {
+        redirect: origins ? 'manual' : 'follow',
+        signal,
+        headers: { 'user-agent': cfg.userAgent, accept: 'text/html,application/xhtml+xml,*/*;q=0.8' },
+      })
+      if (!origins || ![301, 302, 303, 307, 308].includes(res.status)) break
+      if (res.body) res.body.cancel().catch(() => {})
+      const location = res.headers.get('location')
+      if (!location) return { error: `HTTP ${res.status} without Location` }
+      if (hops >= 5) return { error: 'Direct fetch exceeded 5 redirects' }
+      currentUrl = new URL(location, currentUrl).href
+    }
     // Early-return paths must cancel the body stream, or the connection is
     // held open undrained and cannot return to the keep-alive pool.
     const discardBody = () => { if (res.body) res.body.cancel().catch(() => {}) }
@@ -150,7 +215,7 @@ async function directFetchOnce(url, signal, cfg) {
       discardBody()
       return { error: `Unsupported content-type: ${contentType.split(';')[0]}` }
     }
-    if (!res.body) return { buffer: Buffer.alloc(0), contentType, finalUrl: res.url }
+    if (!res.body) return { buffer: Buffer.alloc(0), contentType, finalUrl: res.url || currentUrl }
     const chunks = []
     let size = 0
     for await (const chunk of res.body) {
@@ -163,7 +228,7 @@ async function directFetchOnce(url, signal, cfg) {
     if (!contentType && looksBinary(buffer)) {
       return { error: 'Unsupported content-type (no header, binary body)' }
     }
-    return { buffer, contentType, finalUrl: res.url }
+    return { buffer, contentType, finalUrl: res.url || currentUrl }
   } catch (e) {
     if (e.name === 'AbortError' || e.name === 'TimeoutError') {
       return { error: `Timeout after ${cfg.timeoutMs}ms or cancelled` }
@@ -180,15 +245,15 @@ async function directFetchOnce(url, signal, cfg) {
 // Exported for tests: the double-throttle path must always produce an { error }
 // shape — a second `{ retryAfterMs }` would otherwise leak past the race
 // filter into decodeBuffer as a bufferless "success" (bare TypeError there).
-export async function directFetch(url, signal, cfg) {
-  const first = await directFetchOnce(url, signal, cfg)
+export async function directFetch(url, signal, cfg, origins) {
+  const first = await directFetchOnce(url, signal, cfg, origins)
   if (first && first.retryAfterMs !== undefined && !(signal && signal.aborted)) {
     await new Promise((resolve) => {
       const t = setTimeout(resolve, first.retryAfterMs)
       if (signal) signal.addEventListener('abort', () => { clearTimeout(t); resolve() }, { once: true })
     })
     if (signal && signal.aborted) return { error: 'cancelled' }
-    const second = await directFetchOnce(url, signal, cfg)
+    const second = await directFetchOnce(url, signal, cfg, origins)
     // The retry budget is spent — report the rate limit instead of returning
     // a shapeless { retryAfterMs } (no buffer, no error) to the caller.
     if (second && second.retryAfterMs !== undefined) {
@@ -308,6 +373,27 @@ async function fetchViaWebSeam(ctx, url, externalSignal, cfg) {
     if (e && e.code === 'WEB_PROVIDER_UNAVAILABLE') return null
     return { error: `Web provider failed: ${String((e && e.message) || e).slice(0, 160)}` }
   }
+}
+
+// Every fetch in a tool call passes here. Once a chain enters an explicit
+// direct origin it stays restricted, including meta refresh and pagination.
+// Never send an exception through curl -L or a browser: both may make further
+// requests outside this origin list. Unlisted initial URLs retain host policy.
+async function fetchResource(ctx, url, externalSignal, cfg, route) {
+  if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
+  if (route.restricted || matchesDirectOrigin(url, route.origins)) {
+    route.restricted = true
+    if (!allowedDirectUrl(url, route.origins)) {
+      route.hint = DIRECT_BOUNDARY_ERROR
+      return { error: DIRECT_BOUNDARY_ERROR }
+    }
+    const timeout = AbortSignal.timeout(cfg.timeoutMs)
+    const signal = externalSignal ? AbortSignal.any([externalSignal, timeout]) : timeout
+    const page = await directFetch(url, signal, cfg, route.origins)
+    if (page.error) route.hint = page.error
+    return page
+  }
+  return await fetchViaWebSeam(ctx, url, externalSignal, cfg) || await fetchPage(url, externalSignal, cfg)
 }
 
 // Decode common HTML entities in already-stripped text. Runs AFTER tag
@@ -1567,7 +1653,7 @@ export function metaRefreshTarget(html, baseUrl) {
 // cache key is the ORIGINAL url, and a shell re-request should re-follow
 // rather than serve a foreign page.
 const MAX_META_REFRESH_HOPS = 3
-async function followMetaRefresh(html, finalUrl, externalSignal, cfg, ctx) {
+async function followMetaRefresh(html, finalUrl, externalSignal, cfg, ctx, route) {
   let cur = html
   let curUrl = finalUrl
   let curCharset = '' // set only when a hop actually happened
@@ -1586,7 +1672,7 @@ async function followMetaRefresh(html, finalUrl, externalSignal, cfg, ctx) {
     const norm = normalizeUrl(target)
     if (!norm || seen.has(norm)) break
     seen.add(norm)
-    const page = await fetchViaWebSeam(ctx, target, hopSignal, cfg) || await fetchPage(target, hopSignal, cfg)
+    const page = await fetchResource(ctx, target, hopSignal, cfg, route)
     if (page.error) break
     const ct = page.kind === 'html' ? 'text/html' : (page.contentType || '').split(';')[0].toLowerCase().trim()
     if (!/html|xhtml/.test(ct)) break
@@ -1603,6 +1689,8 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   const url = String((args && args.url) || '').trim()
   if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
   if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
+  let route
+  try { route = createRoute(cfg) } catch (e) { return { error: e.message } }
   const maxChars = Math.max(500, Math.min(20000, Number(args.maxChars) || cfg.maxChars))
   const mode = args.mode === 'markdown' ? 'markdown' : 'text'
   const offset = Math.max(0, Number(args.offset) || 0)
@@ -1632,7 +1720,9 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   } catch {
     /* keep bare url */
   }
-  const cacheKey = `${cacheUrl}|${mode}|${args.includeLinks === true ? 'links' : 'no-links'}`
+  // Include the complete policy: an unlisted entry may reach a listed origin
+  // through refresh/pagination, and must not reuse content after revocation.
+  const cacheKey = `${route.key}|${cacheUrl}|${mode}|${args.includeLinks === true ? 'links' : 'no-links'}`
   const hit = cache.get(cacheKey)
   if (hit && Date.now() - hit.time < cfg.cacheTtlMs) {
     // Valid content takes precedence over a concurrent fetch failure.
@@ -1700,9 +1790,9 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     }
   }
   const dispatch = async () => {
-    const viaSeam = await fetchViaWebSeam(ctx, url, externalSignal, cfg)
-    const page = viaSeam || await fetchPage(url, externalSignal, cfg)
+    const page = await fetchResource(ctx, url, externalSignal, cfg, route)
     if (page.error) return { error: page.error }
+    const viaSeam = typeof page.html === 'string'
     const ct = viaSeam ? (page.kind === 'text' ? 'text/plain' : 'text/html') : (page.contentType || '').split(';')[0].toLowerCase().trim()
     const decoded = viaSeam ? { text: page.html, charset: 'provider-decoded' } : decodeBuffer(page.buffer, page.contentType)
     const meta = { finalUrl: page.finalUrl || url, sourceTruncated: page.sourceTruncated === true }
@@ -1782,7 +1872,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   // follow immediately, BEFORE extraction and SPA rendering — a shell that
   // redirects needs no headless round-trip, and extracting the stub is wasted
   // work. Fails open on any fetch problem; the follow is hop-bounded.
-  const followed = await followMetaRefresh(html, finalUrl, externalSignal, cfg, ctx)
+  const followed = await followMetaRefresh(html, finalUrl, externalSignal, cfg, ctx, route)
   if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
   html = followed.html
   finalUrl = followed.finalUrl
@@ -1826,7 +1916,10 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   let renderedHtml = null
   const needsRender = !extracted.text || extracted.text.length < 200
   const scriptShell = !extracted.text && /<script[\s>]/i.test(html)
-  if (cfg.spaRender !== false && needsRender && (looksLikeSpa(html) || scriptShell)) {
+  if (route.restricted && cfg.spaRender !== false && needsRender && (looksLikeSpa(html) || scriptShell)) {
+    spaHint = [spaHint, DIRECT_SPA_HINT].filter(Boolean).join('；')
+  }
+  if (!route.restricted && cfg.spaRender !== false && needsRender && (looksLikeSpa(html) || scriptShell)) {
     const rr = await renderPage(finalUrl || url, externalSignal)
     if (rr.html) {
       renderedHtml = rr.html
@@ -1882,7 +1975,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     const nu = normalizeUrl(nextUrl)
     if (!nu || seen.has(nu)) break
     seen.add(nu)
-    const page = await fetchViaWebSeam(ctx, nextUrl, externalSignal, cfg) || await fetchPage(nextUrl, externalSignal, cfg)
+    const page = await fetchResource(ctx, nextUrl, externalSignal, cfg, route)
     if (page.error) break
     const pageFinal = normalizeUrl(page.finalUrl || nextUrl)
     if (!pageFinal || !sameHost(pageFinal, startHost) || (pageFinal !== nu && seen.has(pageFinal))) break
@@ -1897,6 +1990,8 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     paginated++
     nextUrl = findNextLink(nextHtml, page.finalUrl || nextUrl)
   }
+
+  if (route.hint) spaHint = [spaHint, route.hint].filter(Boolean).join('；')
 
   // A near-empty body (login wall, anti-bot shell) with no render hint yet
   // still looks like "the page content" to the model — one constant-cost line
@@ -1992,8 +2087,9 @@ function renderLinks(value) {
   if (typeof value === 'string') return value
   const r = value || {}
   if (r.error) return `Error: ${r.error}`
-  if (!Array.isArray(r.links) || r.links.length === 0) return `No links found on ${r.url}`
+  if (!Array.isArray(r.links) || r.links.length === 0) return `No links found on ${r.url}${r.spaHint ? `\n提示: ${r.spaHint}` : ''}`
   const lines = [`${r.count} link(s) on ${r.url}:`, UNTRUSTED_NOTICE]
+  if (r.spaHint) lines.push(`提示: ${r.spaHint}`)
   for (const l of r.links) lines.push(`- ${l.title || l.url} — ${l.url}`)
   return lines.join('\n')
 }
@@ -2034,13 +2130,14 @@ function readLinksTool(ctx, cfg) {
       const url = String((args && args.url) || '').trim()
       if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
       const limit = Math.max(1, Math.min(50, Number(args.limit) || cfg.maxLinks))
-      const page = await fetchViaWebSeam(ctx, url, exec && exec.signal, cfg) || await fetchPage(url, exec && exec.signal, cfg)
+      const route = createRoute(cfg)
+      const page = await fetchResource(ctx, url, exec && exec.signal, cfg, route)
       if (page.error) return { error: page.error }
       let html = typeof page.html === 'string' ? page.html : decodeBuffer(page.buffer, page.contentType).text
       let finalUrl = page.finalUrl || url
       // Same meta-refresh shell following as read_url: a link hop serves a
       // stub whose real links live at the target. Fails open, hop-bounded.
-      const followed = await followMetaRefresh(html, finalUrl, exec && exec.signal, cfg, ctx)
+      const followed = await followMetaRefresh(html, finalUrl, exec && exec.signal, cfg, ctx, route)
       html = followed.html
       finalUrl = followed.finalUrl
       let links = extractLinks(html, limit, finalUrl)
@@ -2048,7 +2145,8 @@ function readLinksTool(ctx, cfg) {
       // render it and re-extract when the static result looks empty. Any
       // <script> counts as renderable when there are no links at all — the
       // static shell may be a JS-redirect (same rationale as read_url).
-      if (links.length < 3 && cfg.spaRender !== false && (looksLikeSpa(html) || (links.length === 0 && /<script[\s>]/i.test(html)))) {
+      const needsRender = links.length < 3 && cfg.spaRender !== false && (looksLikeSpa(html) || (links.length === 0 && /<script[\s>]/i.test(html)))
+      if (!route.restricted && needsRender) {
         const rr = await renderPage(finalUrl || url, exec && exec.signal)
         // A challenge interstitial's links are the challenge's own scripts —
         // never an improvement over whatever the static HTML offered.
@@ -2060,7 +2158,8 @@ function readLinksTool(ctx, cfg) {
           }
         }
       }
-      return { url: finalUrl, count: links.length, links }
+      const spaHint = [route.hint, route.restricted && needsRender ? DIRECT_SPA_HINT : ''].filter(Boolean).join('；')
+      return { url: finalUrl, count: links.length, links, ...(spaHint ? { spaHint } : {}) }
     },
   }
 }
@@ -2092,6 +2191,7 @@ function renderBatch(value) {
     }
     const head = p.title || p.url
     lines.push('', `--- ${head} (${p.chars} 字符${p.cached ? ' · cached' : ''}) ---`, p.text || '(无可读内容)')
+    if (p.spaHint) lines.push(`提示: ${p.spaHint}`)
     if (Array.isArray(p.links) && p.links.length) {
       const ls = p.links.map((l) => l.title + ' — ' + l.url)
       lines.push(`links: ${ls.slice(0, 6).join(' | ')}${ls.length > 6 ? ` …共${ls.length}个` : ''}`)
@@ -2182,6 +2282,7 @@ function readUrlBatchTool(ctx, cfg) {
             text: p.text,
           }
           if (Array.isArray(p.links) && p.links.length) out.links = p.links
+          if (p.spaHint) out.spaHint = p.spaHint
           return out
         }),
       }
@@ -2227,6 +2328,7 @@ function isNoiseUrl(url) {
 // that is read_url's job; crawling favors speed and breadth.
 async function crawlSite(entryUrl, cfg, opts, externalSignal, ctx) {
   const { maxPages, maxDepth, includeContent, perMax } = opts
+  const policy = createRoute(cfg)
   let host = hostOf(entryUrl)
   const visited = new Set()
   const resolved = new Set()
@@ -2240,12 +2342,13 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal, ctx) {
     // Never overshoot the page budget within a batch round.
     const batch = queue.splice(0, Math.min(2, maxPages - attempted, queue.length))
     const results = await Promise.all(
-      batch.map(async ({ url, depth }) => {
+      batch.map(async ({ url, depth, restricted = false }) => {
         const norm = normalizeUrl(url)
         if (!norm || visited.has(norm)) return null
         visited.add(norm)
         attempted++
-        const page = await fetchViaWebSeam(ctx, url, externalSignal, cfg) || await fetchPage(url, externalSignal, cfg)
+        const route = { ...policy, restricted }
+        const page = await fetchResource(ctx, url, externalSignal, cfg, route)
         if (page.error) return { url, depth, error: page.error }
         let html = typeof page.html === 'string' ? page.html : decodeBuffer(page.buffer, page.contentType).text
         let pageUrl = page.finalUrl || url
@@ -2256,7 +2359,7 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal, ctx) {
         // be crawled AS the page (title-less hop text pollutes results and the
         // real content is never reached). Fails open — fetch problems keep the
         // stub's own HTML.
-        const followed = await followMetaRefresh(html, pageUrl, externalSignal, cfg, ctx)
+        const followed = await followMetaRefresh(html, pageUrl, externalSignal, cfg, ctx, route)
         html = followed.html
         pageUrl = followed.finalUrl
         if (depth === 0) host = hostOf(pageUrl)
@@ -2272,6 +2375,8 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal, ctx) {
           chars: ex.text.length,
           text: includeContent ? smartTruncate(ex.text, perMax).text : undefined,
           links,
+          route,
+          ...(route.hint ? { spaHint: route.hint } : {}),
         }
       }),
     )
@@ -2285,7 +2390,8 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal, ctx) {
       if (!finalNorm || resolved.has(finalNorm)) continue
       resolved.add(finalNorm)
       visited.add(finalNorm)
-      pages.push(r)
+      const { route, ...publicPage } = r
+      pages.push(publicPage)
       if (r.depth + 1 <= maxDepth) {
         // Queue cap: a huge site (millions of links) would otherwise grow the
         // queue unboundedly while maxPages bounds only what we *process*.
@@ -2293,7 +2399,7 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal, ctx) {
         for (const l of r.links) {
           if (!sameHost(l.url, host) || isNoiseUrl(l.url)) continue
           const n = normalizeUrl(l.url)
-          if (n && !visited.has(n)) queue.push({ url: l.url, depth: r.depth + 1 })
+          if (n && !visited.has(n)) queue.push({ url: l.url, depth: r.depth + 1, restricted: route.restricted })
         }
       }
     }
@@ -2310,6 +2416,7 @@ function renderSite(value) {
     const indent = '  '.repeat(p.depth)
     const head = p.title || p.url
     lines.push(`${indent}[${p.depth}] ${head} (${p.chars} 字符)  ${p.url}`)
+    if (p.spaHint) lines.push(`${indent}提示: ${p.spaHint}`)
     if (p.text) lines.push(`${indent}   ${p.text.slice(0, 80)}`)
   }
   for (const f of v.failures) lines.push(`[失败] ${f.url} — ${f.error}`)
@@ -2378,6 +2485,7 @@ function readUrlSiteTool(ctx, cfg) {
         pages: pages.map((p) => {
           const o = { url: p.url, depth: p.depth, title: p.title || '', chars: p.chars }
           if (p.text) o.text = p.text
+          if (p.spaHint) o.spaHint = p.spaHint
           return o
         }),
         failures,
@@ -2406,6 +2514,7 @@ export function apply(ctx, config) {
   if (typeof cfg.userAgent !== 'string' || !cfg.userAgent.trim()) cfg.userAgent = DEFAULTS.userAgent
   if (typeof cfg.spaRender !== 'boolean') cfg.spaRender = DEFAULTS.spaRender
   if (typeof cfg.paginate !== 'boolean') cfg.paginate = DEFAULTS.paginate
+  cfg.directFetchOrigins = directOrigins(cfg.directFetchOrigins)
 
   // Temporal composability: unload must fully revert side effects.
   ctx.effect(() => () => {

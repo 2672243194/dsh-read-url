@@ -22,6 +22,7 @@ export async function runLifecycleTests(source = fileURLToPath(new URL('.', impo
   await writeFile(join(fixtureDir, 'package.json'), '{"name":"playwright","type":"module","exports":"./index.js"}')
   await writeFile(join(fixtureDir, 'index.js'), 'export const chromium = { launch: () => globalThis.__dshLifecycleFixture.launch() }')
   const original = globalThis.__dshLifecycleFixture
+  const originalFetch = globalThis.fetch
   const m = await import(pathToFileURL(join(dir, 'index.js')).href)
   let passed = 0, failed = 0
   const makeState = () => {
@@ -59,7 +60,7 @@ export async function runLifecycleTests(source = fileURLToPath(new URL('.', impo
   const check = async (name, run) => {
     try { await run(makeState()); passed++; console.log(`  ok - ${name}`) }
     catch (error) { failed++; console.error(`  FAIL - ${name}: ${error.message}`) }
-    finally { await m.closeBrowser() }
+    finally { globalThis.fetch = originalFetch; await m.closeBrowser() }
   }
   console.log('SPA cancellation / browser lifecycle (local fixture)')
   try {
@@ -158,7 +159,87 @@ export async function runLifecycleTests(source = fileURLToPath(new URL('.', impo
       assert.ok((await m.renderPage('https://fixture.invalid/')).html)
       assert.equal(count, 5)
     })
-  } finally { globalThis.__dshLifecycleFixture = original }
+    const shell = '<html><head><title>Static shell</title>' + '<script src="/boot.js"></script>'.repeat(5) + '</head><body><div id="app"></div></body></html>'
+    const cfg = {
+      timeoutMs: 500, maxBytes: 3 * 1024 * 1024, maxChars: 6000,
+      maxLinks: 20, cacheTtlMs: 0, cacheMax: 32,
+      spaRender: true, paginate: false, paginateMax: 3, userAgent: 'lifecycle-test',
+      directFetchOrigins: ['https://direct-lifecycle.invalid'],
+    }
+    const providerResult = (url, content) => ({ url, statusCode: 200, body: { kind: 'html', content }, truncated: false })
+    const redirect = url => `<meta http-equiv="refresh" content="0; url=${url}">`
+    await check('explicit direct read_url retains static content without launching a browser', async state => {
+      const requested = 'https://direct-lifecycle.invalid/read-shell'
+      let directCalls = 0, providerCalls = 0
+      globalThis.fetch = async url => {
+        assert.equal(String(url), requested)
+        directCalls++
+        return new Response(shell, { headers: { 'Content-Type': 'text/html' } })
+      }
+      const ctx = { get: () => ({ fetch: async () => { providerCalls++; throw new Error('URL resolves to a non-public IP address') } }) }
+      const output = await m.readUrl({ url: requested }, ctx, undefined, cfg)
+      assert.equal(output.error, undefined)
+      assert.equal(directCalls, 1)
+      assert.equal(providerCalls, 0)
+      assert.equal(state.launches, 0)
+      assert.match(output.spaHint, /static|静态/i)
+    })
+    await check('a provider-to-direct meta-refresh chain neither leaves the allowed origin nor launches a browser', async state => {
+      const requested = 'https://provider-lifecycle.invalid/start-chain'
+      const directUrl = 'https://direct-lifecycle.invalid/relay-chain'
+      const finalUrl = 'https://provider-lifecycle.invalid/final-chain'
+      const providerCalls = []
+      let directCalls = 0
+      globalThis.fetch = async url => {
+        assert.equal(String(url), directUrl)
+        directCalls++
+        return new Response(redirect(finalUrl) + shell, { headers: { 'Content-Type': 'text/html' } })
+      }
+      const ctx = { get: () => ({ fetch: async ({ url }) => {
+        providerCalls.push(url)
+        assert.equal(url, requested)
+        return providerResult(url, redirect(directUrl))
+      } }) }
+      const output = await m.readUrl({ url: requested }, ctx, undefined, cfg)
+      assert.equal(output.error, undefined)
+      assert.equal(output.url, directUrl)
+      assert.deepEqual(providerCalls, [requested])
+      assert.equal(directCalls, 1)
+      assert.equal(state.launches, 0)
+      assert.match(output.spaHint, /static|静态/i)
+    })
+    await check('read_url_links does not render a provider meta-refresh target fetched through an explicit direct origin', async state => {
+      const requested = 'https://provider-lifecycle.invalid/links-entry'
+      const directUrl = 'https://direct-lifecycle.invalid/links-shell'
+      const registered = new Map()
+      let dispose, directCalls = 0, providerCalls = 0
+      globalThis.fetch = async url => {
+        assert.equal(String(url), directUrl)
+        directCalls++
+        return new Response(shell, { headers: { 'Content-Type': 'text/html' } })
+      }
+      const ctx = {
+        get: () => ({ fetch: async ({ url }) => {
+          assert.equal(url, requested)
+          providerCalls++
+          return providerResult(url, redirect(directUrl))
+        } }),
+        tools: { register(tool) { registered.set(tool.name, tool) } },
+        effect(fn) { dispose = fn() },
+      }
+      m.apply(ctx, cfg)
+      try {
+        const output = await registered.get('read_url_links').execute({ url: requested }, {})
+        assert.equal(output.error, undefined)
+        assert.equal(output.url, directUrl)
+        assert.equal(output.count, 0)
+        assert.equal(directCalls, 1)
+        assert.equal(providerCalls, 1)
+        assert.equal(state.launches, 0)
+        assert.match(output.spaHint, /static|静态/i)
+      } finally { await dispose() }
+    })
+  } finally { globalThis.fetch = originalFetch; globalThis.__dshLifecycleFixture = original }
   assert.equal(failed, 0, `${failed} lifecycle checks failed`)
   return passed
 }
