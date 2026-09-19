@@ -274,9 +274,18 @@ Plus a **15-item DSH acceptance round** (a real agent driving every read_url too
 | Batch + failure isolation | 4-URL mix | ✅ 2/4 ok, failures isolated |
 | Site crawl | Ruan Yifeng blog | ✅ 5/5 pages tree map |
 
+### Released v1.8.0 validation snapshot
+
 - **276 zero-dependency assertions + 12 SPA assertions** pass. `node test.mjs` covers provider contracts, cancellation/retry, extraction/metadata, RSS/Atom, Markdown, continuation, batching and crawl boundaries. `node probe.mjs` checks pathological tags, nesting, long whitespace and bounded scanning.
 - Local maintenance validation (2026-09-07): **102 OK / 27 THIN+EMPTY / 23 ERR / 0 THREW** across 152 sites, with no noise among OK results; 53 adversarial probes pass. ERR results are network/anti-bot failures, invalid addresses or intentionally unsupported binary types. Known NOISE flags were checked against the previous code using identical inputs.
 - Real case: on a Xiaoheihe post, comment like-counts (`up` field) could not be attributed from flattened text — **precise fields should come from the page's underlying data API** (e.g. `/bbs/app/link/tree` JSON). This is a shared boundary of text extractors, not a defect.
+
+### v1.8.1 maintenance validation (2026-09-19)
+
+- **297 zero-dependency assertions + 15 real Chromium SPA assertions + 53 adversarial probes** pass. `test-lifecycle.mjs`, included in `test.mjs`, uses a local browser fixture for cancellation, launch failures, concurrent cleanup and restart checks.
+- The 152-site run returned **104 OK / 23 THIN+EMPTY / 25 ERR / 0 THREW**, with no noise among OK results. The three known NOISE sites have identical decoded content and extracted output against v1.8.0 using the same input. Network errors and intentionally unsupported types remain separate from extraction results.
+- SPA cancellation closes the active page; plugin disposal awaits browser shutdown. Valid success-cache entries take precedence over concurrent failures. Crawl filtering uses path boundaries. Charset and Markdown attributes use bounded parsing.
+- Fixed model input cost remains **1,159 description characters / 1,876 schema characters**, within the 1,250 / 2,000 budgets.
 
 ## Roadmap
 
@@ -306,7 +315,7 @@ Plus a **15-item DSH acceptance round** (a real agent driving every read_url too
 
 ```bash
 node test.mjs          # zero-dependency self-tests (charset/extract/markdown/truncate)
-node test-spa.mjs      # SPA rendering tests (12 assertions; SKIPs if playwright absent)
+node test-spa.mjs      # SPA rendering tests (15 assertions; SKIPs if playwright absent)
 node multi-site.mjs    # 152-site real-world sweep (needs network, CONC=8 tunable): portals/SPA/login-walls/static/feeds/JSON/anti-bot/net-boundaries
 
 # End-to-end (requires DSH CLI)

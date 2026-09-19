@@ -4,6 +4,11 @@
 // When absent, reads fall back to static extraction with a clear hint.
 
 let browserPromise = null
+const closingBrowsers = new Set()
+
+function renderError(error) {
+  return `Render failed: ${String(error?.message || error).split('\n', 1)[0].slice(0, 500)}`
+}
 
 // Heuristic: a page whose HTML carries many <script> tags is likely a
 // client-rendered SPA (Vue/React) whose body lives only after JS execution.
@@ -33,12 +38,19 @@ async function getBrowser() {
   if (!browserPromise) {
     // A failed launch (playwright later installed / chromium download finished)
     // must not stay cached as a rejected promise — reset so the next call retries.
-    browserPromise = import('playwright')
+    const pending = import('playwright')
       .then(({ chromium }) => chromium.launch({ headless: true }))
+      .then((browser) => {
+        browser.once('disconnected', () => {
+          if (browserPromise === pending) browserPromise = null
+        })
+        return browser
+      })
       .catch((e) => {
-        browserPromise = null
+        if (browserPromise === pending) browserPromise = null
         throw e
       })
+    browserPromise = pending
   }
   return browserPromise
 }
@@ -49,12 +61,23 @@ export async function renderPage(url, externalSignal) {
   let browser
   try {
     browser = await getBrowser()
-  } catch {
-    return { error: 'SPA 渲染需 playwright（npm i playwright && npx playwright install chromium）' }
+  } catch (error) {
+    if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
+    return { error: error?.code === 'ERR_MODULE_NOT_FOUND'
+      ? 'SPA 渲染需 playwright（npm i playwright && npx playwright install chromium）'
+      : renderError(error) }
   }
+  if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
   let page
+  let pageClosing
+  const closePage = () => {
+    if (page && !pageClosing) pageClosing = page.close().catch(() => {})
+    return pageClosing
+  }
   try {
     page = await browser.newPage()
+    externalSignal?.addEventListener('abort', closePage, { once: true })
+    if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
     // 'domcontentloaded' instead of 'networkidle': heartbeat-polling sites
     // (qq-news, juejin) never go idle and would time out at 30s. Instead wait
     // for the DOM to stabilize (content stops growing) up to 10s — SPA paint
@@ -72,7 +95,8 @@ export async function renderPage(url, externalSignal) {
         .evaluate(() => (document.body ? document.body.innerHTML.length : 0))
         .catch(() => -1)
       if (Date.now() - t0 > 10000) break
-      if (len === -1 && ++evalFails >= 2) break
+      evalFails = len === -1 ? evalFails + 1 : 0
+      if (evalFails >= 2) break
       // stop once two consecutive reads agree — including empty bodies (a
       // blank page should not burn the full 10s poll)
       if (len === prevLen && prevLen >= 0) break
@@ -93,25 +117,33 @@ export async function renderPage(url, externalSignal) {
         if (!looksLikeChallenge(html)) break
       }
     }
+    if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
     const finalUrl = page.url()
     return { html, finalUrl }
   } catch (e) {
     if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
-    return { error: `Render failed: ${e.message}` }
+    return { error: renderError(e) }
   } finally {
-    if (page) await page.close().catch(() => {})
+    externalSignal?.removeEventListener('abort', closePage)
+    await closePage()
   }
 }
 
 // Called on plugin unload (temporal composability): release the browser.
 export async function closeBrowser() {
-  if (!browserPromise) return
   const p = browserPromise
   browserPromise = null
-  try {
-    const b = await p
-    await b.close().catch(() => {})
-  } catch {
-    // launch never completed — nothing to close
+  if (p) {
+    const closing = (async () => {
+      try {
+        const b = await p
+        await b.close()
+      } catch {
+        // A failed launch or an already closed browser needs no further cleanup.
+      }
+    })()
+    closingBrowsers.add(closing)
+    closing.finally(() => closingBrowsers.delete(closing))
   }
+  await Promise.all(closingBrowsers)
 }

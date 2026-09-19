@@ -151,6 +151,36 @@ export async function runNetworkTests(m) {
       assert.equal(retry.text, 'Fresh body.')
       assert.ok(!retry.cached)
     })
+    for (const successFirst of [true, false]) {
+      await check(`concurrent ${successFirst ? 'success then failure' : 'failure then success'} retains the successful cache`, async () => {
+        const requested = url()
+        const pending = []
+        let started
+        const bothStarted = new Promise((resolve) => { started = resolve })
+        const provider = ctx(() => new Promise((resolve) => {
+          pending.push(resolve)
+          if (pending.length === 2) started()
+        }))
+        const success = m.readUrl({ url: requested }, provider, undefined, cfg)
+        const failure = m.readUrl({ url: requested }, provider, undefined, cfg)
+        await bothStarted
+        const finishSuccess = async () => {
+          pending[0](result(requested, 'Successful concurrent body.', 'text'))
+          assert.equal((await success).text, 'Successful concurrent body.')
+        }
+        const finishFailure = async () => {
+          pending[1](result(requested, 'Temporarily unavailable.', 'text', { statusCode: 503 }))
+          assert.equal((await failure).error, 'HTTP 503')
+        }
+        if (successFirst) { await finishSuccess(); await finishFailure() }
+        else { await finishFailure(); await finishSuccess() }
+        const cached = await m.readUrl({ url: requested }, provider, undefined, cfg)
+        assert.equal(cached.text, 'Successful concurrent body.')
+        assert.equal(cached.cached, true)
+        assert.equal(cached.error, undefined)
+        assert.equal(pending.length, 2)
+      })
+    }
     await check('meta-refresh follows through the selected web provider', async () => {
       const requested = url()
       const target = `${requested}/next`

@@ -9,6 +9,35 @@ export async function runExtractionTests(m) {
     console.log(`  ok - ${name}`)
   }
   console.log('HTML structure / metadata / syndication')
+  check('charset attributes accept spaces, unquoted values and mixed case', () => {
+    for (const tag of ['<meta charset = "gbk">', '<meta charset=gbk>', '<META CHARSET = GBK>']) {
+      const decoded = m.decodeBuffer(Buffer.concat([Buffer.from(tag), Buffer.from('d6d0cec4', 'hex')]), 'text/html')
+      assert.equal(decoded.text, tag + '中文')
+      assert.equal(decoded.charset, 'gbk')
+    }
+  })
+  check('metadata values and compound attributes cannot declare a charset', () => {
+    for (const tag of ['<meta data-charset="gbk">', '<meta name="note" content="charset=gbk">', '<meta data-note="charset=gbk">']) {
+      const decoded = m.decodeBuffer(Buffer.from(tag + '你好'), 'text/html')
+      assert.equal(decoded.text, tag + '你好')
+      assert.equal(decoded.charset, 'utf-8')
+    }
+  })
+  check('legacy charset declarations honor attribute names and either order', () => {
+    for (const tag of ['<meta content = "text/html; charset = GB2312" HTTP-EQUIV = Content-Type>', '<meta http-equiv="content-type" content="text/html;charset=gbk">']) {
+      const decoded = m.decodeBuffer(Buffer.concat([Buffer.from(tag), Buffer.from('d6d0cec4', 'hex')]), 'text/html')
+      assert.equal(decoded.text, tag + '中文')
+      assert.equal(decoded.charset, 'gbk')
+    }
+  })
+  check('HTTP charset parameters allow spacing without accepting compound names', () => {
+    assert.equal(m.decodeBuffer(Buffer.from('d6d0cec4', 'hex'), 'text/html; CHARSET = "GBK"').text, '中文')
+    assert.equal(m.decodeBuffer(Buffer.from('你好'), 'text/html; x-charset=gbk').text, '你好')
+  })
+  check('HTTP charset takes precedence over HTML metadata', () => {
+    const html = '<meta charset=gbk>你好'
+    assert.equal(m.decodeBuffer(Buffer.from(html), 'text/html; charset=utf-8').text, html)
+  })
   check('custom elements keep their own content and following paragraphs', () => {
     for (const tag of ['script-widget', 'template-card', 'style-panel']) {
       assert.equal(m.extract(`<main><${tag}>WIDGET</${tag}><p>REAL BODY</p></main>`, 'text').text, 'WIDGET\n\nREAL BODY')

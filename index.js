@@ -49,6 +49,7 @@ function cacheFail(key, error) {
 function cacheStore(key, full, cacheMax) {
   if (cache.size >= cacheMax) cache.delete(cache.keys().next().value)
   cache.set(key, { time: Date.now(), full })
+  failCache.delete(key)
 }
 const decoders = new Map()
 
@@ -65,21 +66,29 @@ function getDecoder(enc) {
   return d
 }
 
+function declaredCharset(contentType) {
+  const m = /(?:^|;)[ \t]{0,1000}charset[ \t]{0,1000}=[ \t]{0,1000}(?:"([\w.:-]{1,80})"|'([\w.:-]{1,80})'|([\w.:-]{1,80}))(?=[ \t;]|$)/i.exec(contentType || '')
+  return m ? m[1] || m[2] || m[3] : null
+}
+
 function sniffCharset(buffer, contentType) {
   // BOM first — byte-level evidence beats any declared charset (a UTF-16 body
   // with a latin1-read <meta> probe garbles the meta match anyway).
   if (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) return 'utf-8'
   if (buffer[0] === 0xff && buffer[1] === 0xfe) return 'utf-16le'
   if (buffer[0] === 0xfe && buffer[1] === 0xff) return 'utf-16be'
-  const m = /charset=["']?([\w-]+)/i.exec(contentType || '')
-  if (m) return m[1]
-  const head = buffer.subarray(0, 2048).toString('latin1').toLowerCase()
-  const meta = /<meta[^>]{0,1000}charset=["']?([\w-]+)/i.exec(head)
-  if (meta) return meta[1]
-  // Legacy form: <meta http-equiv="Content-Type" content="text/html; charset=gb2312">
-  // (no charset= attribute anywhere) — common on old GBK pages with no header charset.
-  const metaEquiv = /<meta[^>]{0,1000}(?:http-equiv)=["']content-type["'][^>]{0,1000}content=["'][^"']*charset=([\w-]+)/i.exec(head)
-  if (metaEquiv) return metaEquiv[1]
+  const header = declaredCharset(contentType)
+  if (header) return header
+  const head = buffer.subarray(0, 2048).toString('latin1')
+  for (const meta of head.matchAll(/<meta(?=[\s/>])[^>]{0,1000}>/gi)) {
+    const attrs = htmlAttributes(meta[0])
+    const charset = attrs.charset?.trim()
+    if (charset && /^[\w.:-]{1,80}$/.test(charset)) return charset
+    if (attrs['http-equiv']?.toLowerCase() === 'content-type') {
+      const legacy = declaredCharset(attrs.content)
+      if (legacy) return legacy
+    }
+  }
   return null
 }
 
@@ -712,6 +721,12 @@ function escInline(s) {
   return s.replace(/([\\`*_[\]])/g, '\\$1')
 }
 
+function markdownTarget(value) {
+  return decodeUrlAttribute(value).trim()
+    .replace(/\(/g, '%28').replace(/\)/g, '%29')
+    .replace(/[<>\s\\]/g, encodeURIComponent)
+}
+
 // <img> is a void element (never matches the paired-tag regex in either md
 // walker): convert descriptive images to markdown BEFORE the tag walk, via a
 // sentinel so escInline cannot escape the generated brackets. Decorative
@@ -729,25 +744,30 @@ function imgsToMarkdown(html) {
   // in <picture><source srcset>. When the <img> fallback carries no usable
   // src (lazy placeholder), the first source URL is injected into it so the
   // normal img pass below still emits the image.
-  html = html.replace(/<picture\b[^>]*>([\s\S]{0,50000}?)<\/picture\s*>/gi, (block) => {
+  html = html.replace(/<picture\b[^>]{0,1000}>([\s\S]{0,50000}?)<\/picture\s{0,1000}>/gi, (block) => {
     const imgTag = /<img\b[^>]{0,1000}>/i.exec(block)
-    const imgSrc = imgTag && /(?:^|\s)src=["']([^"']+)["']/i.exec(imgTag[0])
-    if (imgTag && imgSrc && !/^data:/i.test(imgSrc[1])) return block
-    const source = /<source\b[^>]{0,1000}\bsrcset=["']([^"'\s>]+)/i.exec(block)
-    if (!source || !imgTag) return block
-    return block.replace(/<img\b[^>]{0,1000}>/i, (img0) => img0.replace(/<img/i, `<img src="${source[1]}"`))
+    const imgSrc = imgTag && htmlAttributes(imgTag[0]).src
+    if (!imgTag || (imgSrc && !/^data:/i.test(imgSrc))) return block
+    let source = ''
+    for (const tag of block.matchAll(/<source\b[^>]{0,1000}>/gi)) {
+      source = htmlAttributes(tag[0]).srcset?.trim().split(/[\s,]{1,1000}/, 1)[0] || ''
+      if (source) break
+    }
+    if (!source) return block
+    const escaped = decodeUrlAttribute(source).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+    return block.replace(imgTag[0], () => `<img src="${escaped}"${imgTag[0].slice(4)}`)
   })
   const out = html.replace(/<(?:amp-)?img\b[^>]{0,1000}>/gi, (tag) => {
-    const alt = /alt=["']([^"']*)["']/i.exec(tag)
-    let src = /src=["']([^"']+)["']/i.exec(tag)
-    let srcVal = src && src[1]
+    const attrs = htmlAttributes(tag)
+    const alt = decodeTextEntities(attrs.alt || '').replace(/\s{1,1000}/g, ' ').trim()
+    let srcVal = attrs.src?.trim()
     // Lazy-load wrappers keep the real URL in data-* attributes; a data: URI
     // src is an inline placeholder spacer, not a usable image reference.
     if (!srcVal || /^data:/i.test(srcVal)) {
-      const lazy = /data-(?:src|original|lazy-src)=["']([^"']+)["']/i.exec(tag)
-      if (lazy) srcVal = lazy[1]
+      const lazy = attrs['data-src'] || attrs['data-original'] || attrs['data-lazy-src']
+      if (lazy) srcVal = lazy.trim()
     }
-    return protect(srcVal && alt && alt[1].trim() ? `![${alt[1].trim()}](${srcVal})` : '')
+    return protect(srcVal && alt ? `![${escInline(alt)}](${markdownTarget(srcVal)})` : '')
   })
   return {
     html: out,
@@ -828,11 +848,11 @@ export function inlineMd(html, depth = 0) {
     }
     const inner = inlineMd(m[3], depth + 1)
     if (tag === 'a') {
-      const href = /href=["']([^"']+)["']/i.exec(m[2])
+      const href = htmlAttributes(`<a${m[2]}>`).href
       // A raw ')' in the target would terminate the markdown link early
       // (common on wiki/framework URLs) — percent-encode parens to keep the
       // link parseable by the model.
-      out += href ? `[${inner}](${href[1].replace(/\)/g, '%29').replace(/\(/g, '%28')})` : inner
+      out += href?.trim() ? `[${inner}](${markdownTarget(href)})` : inner
     } else if (tag === 'strong' || tag === 'b') out += `**${inner}**`
     else if (tag === 'em' || tag === 'i') out += `*${inner}*`
     else out += inner
@@ -1613,6 +1633,16 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
     /* keep bare url */
   }
   const cacheKey = `${cacheUrl}|${mode}|${args.includeLinks === true ? 'links' : 'no-links'}`
+  const hit = cache.get(cacheKey)
+  if (hit && Date.now() - hit.time < cfg.cacheTtlMs) {
+    // Valid content takes precedence over a concurrent fetch failure.
+    failCache.delete(cacheKey)
+    // LRU touch keeps hot pages available throughout their TTL.
+    cache.delete(cacheKey)
+    cache.set(cacheKey, hit)
+    const sliced = sliceFrom(hit.full, offset, maxChars)
+    return { ...sliced, cached: true }
+  }
   // Failed fetches are cached briefly so the model doesn't re-request a
   // broken URL in a loop (token + latency saver).
   const fh = failCache.get(cacheKey)
@@ -1625,15 +1655,6 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
       return { error: fh.error, cached: true }
     }
     failCache.delete(cacheKey)
-  }
-  const hit = cache.get(cacheKey)
-  if (hit && Date.now() - hit.time < cfg.cacheTtlMs) {
-    // LRU touch: hot pages survive eviction even when cached long ago — the
-    // Map re-insertion moves the entry to the newest slot.
-    cache.delete(cacheKey)
-    cache.set(cacheKey, hit)
-    const sliced = sliceFrom(hit.full, offset, maxChars)
-    return { ...sliced, cached: true }
   }
 
   const failWith = (error) => {
@@ -2189,10 +2210,15 @@ function sameHost(a, b) {
 }
 
 // URLs not worth crawling: static assets, login/auth paths, feeds, sitemaps.
-const NOISE_EXT = /\.(png|jpe?g|gif|svg|webp|ico|bmp|css|js|json|xml|pdf|zip|gz|tar|7z|mp3|m3u8?|mpd|flv|ts|mp4|avi|mov|webm|woff2?|ttf|eot|map)(\?|#|$)/i
-const NOISE_PATH = /(\/login|\/signin|\/register|\/logout|\/signup|\/api\/|\/admin|\/wp-admin|\/wp-login|\/feed|\/rss|\/sitemap|\/robots\.txt|\/cdn-cgi)/i
+const NOISE_EXT = /\.(png|jpe?g|gif|svg|webp|ico|bmp|css|js|json|xml|pdf|zip|gz|tar|7z|mp3|m3u8?|mpd|flv|ts|mp4|avi|mov|webm|woff2?|ttf|eot|map)$/i
+const NOISE_PATH = /\/(?:login|signin|register|logout|signup|api|admin|wp-admin|wp-login|feed|rss|sitemap|robots\.txt|cdn-cgi)(?:\/|[.;]|$)/i
 function isNoiseUrl(url) {
-  return NOISE_EXT.test(url) || NOISE_PATH.test(url)
+  try {
+    const path = new URL(url).pathname
+    return NOISE_EXT.test(path) || NOISE_PATH.test(path)
+  } catch {
+    return true
+  }
 }
 
 // BFS crawl of a single site. Only same-host http(s) pages are followed;
@@ -2385,7 +2411,7 @@ export function apply(ctx, config) {
   ctx.effect(() => () => {
     cache.clear()
     failCache.clear()
-    closeBrowser().catch(() => {})
+    return closeBrowser()
   })
 
   console.log('[dsh-read-url] plugin loaded; tools read_url, read_url_batch, read_url_links, read_url_site registered')

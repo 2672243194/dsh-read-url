@@ -144,6 +144,36 @@ export async function runMarkdownTests(m) {
     assert.equal(m.blockMd('<p><a href="/a(b)">Link</a></p>').trim(), '[Link](/a%28b%29)')
   })
 
+  ok('Markdown links use real href attributes with spaces or unquoted values', () => {
+    for (const attrs of ['href = "/right"', 'href=/right', 'data-href="/wrong" href="/right"']) {
+      assert.equal(m.inlineMd(`<a ${attrs}>Read</a>`), '[Read](/right)')
+    }
+    assert.equal(m.inlineMd('<a data-href="/wrong">Read</a>'), 'Read')
+  })
+
+  ok('Markdown destinations decode URL entities and encode syntax delimiters', () => {
+    assert.equal(m.inlineMd('<a href="/a(b)?x=1&amp;y=2">Read</a>'), '[Read](/a%28b%29?x=1&y=2)')
+    assert.equal(m.inlineMd('<a href="/a b?x=&amp;amp;">Read</a>'), '[Read](/a%20b?x=&amp;)')
+  })
+
+  ok('Markdown images respect src and alt attribute boundaries', () => {
+    assert.equal(m.inlineMd('<img alt = "diagram" src = "/right.png">'), '![diagram](/right.png)')
+    assert.equal(m.inlineMd('<img alt=diagram src=/right.png>'), '![diagram](/right.png)')
+    assert.equal(m.inlineMd('<img data-alt="wrong" alt="right" data-src="/wrong.png" src="/right.png">'), '![right](/right.png)')
+    assert.equal(m.inlineMd('<img data-alt="wrong" src="/right.png">'), '')
+  })
+
+  ok('Markdown images retain lazy sources and escape decoded alternate text', () => {
+    assert.equal(m.inlineMd('<img alt="A &amp; [B]" src="data:image/gif;base64,AAA" data-src = "/figure(1).png?a=1&amp;b=2">'), '![A & \\[B\\]](/figure%281%29.png?a=1&b=2)')
+    assert.equal(m.inlineMd('<amp-img alt=diagram data-original=/right.png></amp-img>'), '![diagram](/right.png)')
+  })
+
+  ok('picture fallback reads srcset attributes while retaining real image sources', () => {
+    assert.equal(m.inlineMd('<picture><source srcset = "/first.png 1x, /second.png 2x"><img alt=diagram></picture>'), '![diagram](/first.png)')
+    assert.equal(m.inlineMd('<picture><source srcset="/first.png 1x"><img alt=diagram src = "/real.png"></picture>'), '![diagram](/real.png)')
+    assert.equal(m.inlineMd('<picture><source srcset="/first.png?a=1&amp;b=2 1x"><img alt="one&#10;two"></picture>'), '![one two](/first.png?a=1&b=2)')
+  })
+
   ok('table separators follow the header and use actual cell counts', () => {
     const output = m.blockMd('<table><tr><th>a|b</th><th>c</th></tr><tr><td>1</td><td>2</td></tr></table>').trim()
     assert.equal(output, '| a\\|b | c |\n| --- | --- |\n| 1 | 2 |')

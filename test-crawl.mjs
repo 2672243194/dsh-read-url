@@ -5,6 +5,8 @@ export async function runCrawlTests(m) {
   let passed = 0
   const hits = []
   const article = (title, links = '') => `<html><head><title>${title}</title></head><body><article><p>${title} ${'Readable article content. '.repeat(24)}</p></article>${links}</body></html>`
+  const readablePaths = ['/feedback', '/admin-guide', '/story?next=/login', '/story?attachment=guide.pdf']
+  const skippedPaths = ['/login', '/login/reset', '/user/signin', '/wp-login.php', '/feed', '/api/items', '/admin/users', '/sitemap.xml', '/robots.txt', '/cdn-cgi/trace', '/asset.png?v=1']
   const server = http.createServer((req, res) => {
     hits.push(req.url)
     const u = new URL(req.url, 'http://fixture.test')
@@ -17,6 +19,8 @@ export async function runCrawlTests(m) {
     if (u.pathname === '/entity-two') return res.end(article(u.searchParams.get('page') === '2' ? 'CORRECT_SECOND_PAGE' : 'WRONG_QUERY_PAGE'))
     if (u.pathname === '/budget') return res.end(article('BUDGET', Array.from({ length: 5 }, (_, i) => `<a href="/missing-${i}">Missing ${i}</a>`).join('') + '<a href="/success">Success</a>'))
     if (u.pathname === '/success') return res.end(article('SUCCESS'))
+    if (u.pathname === '/path-filter') return res.end(article('PATH_FILTER', [...readablePaths, ...skippedPaths].map((path, i) => `<a href="${path}">Link ${i}</a>`).join('')))
+    if (readablePaths.includes(req.url)) return res.end(article('READABLE_PATH'))
     if (u.pathname === '/redirect-root') return res.end(article('ROOT', '<a href="/outside-hop">External</a><a href="/outside-meta">Meta</a>'))
     if (u.pathname === '/outside-hop') {
       res.writeHead(302, { location: `http://localhost:${server.address().port}/outside` })
@@ -88,6 +92,13 @@ export async function runCrawlTests(m) {
     const fractional = await registered.read_url_site.execute({ url: `${base}/budget`, maxPages: 2.9, maxDepth: 1 })
     assert.equal(fractional.total, 2)
     assert.equal(hits.length, 2)
+    passed++
+
+    hits.length = 0
+    const filtered = await registered.read_url_site.execute({ url: `${base}/path-filter`, maxPages: 20, maxDepth: 1 })
+    assert.equal(filtered.failed, 0)
+    assert.equal(filtered.succeeded, readablePaths.length + 1)
+    assert.deepEqual(hits, ['/path-filter', ...readablePaths])
     passed++
 
     const redirects = await registered.read_url_site.execute({ url: `${base}/redirect-root`, maxPages: 5, maxDepth: 1, includeContent: true })

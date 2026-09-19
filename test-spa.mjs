@@ -15,6 +15,7 @@ import http from 'node:http'
 import * as m from './index.js'
 
 const PORT = 18090
+let onSlowRequest
 
 const SPA_HTML = `<!DOCTYPE html>
 <html><head><title>SPA 测试页</title></head>
@@ -60,7 +61,11 @@ setTimeout(() => {
 function startServer() {
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
-      if (req.url === '/app.js') {
+      if (req.url === '/slow') {
+        const timer = setTimeout(() => res.end('<article>Delayed page.</article>'), 5000)
+        res.on('close', () => clearTimeout(timer))
+        onSlowRequest?.()
+      } else if (req.url === '/app.js') {
         res.setHeader('content-type', 'application/javascript; charset=utf-8')
         res.end(APP_JS)
       } else if (req.url === '/fill.js') {
@@ -90,11 +95,12 @@ const url = `http://127.0.0.1:${PORT}/`
 try {
   // 0) playwright availability (renderPage returns { error } when missing)
   const probe = await m.renderPage(url)
-  if (probe.error && probe.error.includes('playwright')) {
+  if (probe.error && probe.error.startsWith('SPA 渲染需 playwright')) {
     console.log('SKIP: playwright not installed — install with `npm i playwright && npx playwright install chromium`')
     server.close()
     process.exit(0)
   }
+  assert.ok(!probe.error, probe.error)
 
   // 1) read_url renders JS-generated body
   const r1 = await m.readUrl({ url, maxChars: 800 })
@@ -130,6 +136,23 @@ try {
   const r5 = await m.readUrl({ url: shellUrl, maxChars: 800 })
   ok('JS 跳转壳（2 scripts + 空 body）触发渲染', r5.rendered === true)
   ok('JS 跳转壳渲染后返回正文', (r5.text || '').includes('壳页渲染标题'))
+
+  // Abort after the real browser has entered a pending navigation.
+  const entered = new Promise(resolve => { onSlowRequest = resolve })
+  const controller = new AbortController()
+  const slow = m.renderPage(`${url}slow`, controller.signal)
+  let watchdog
+  await Promise.race([entered, new Promise((_, reject) => {
+    watchdog = setTimeout(() => reject(new Error('Browser did not request the local fixture')), 10000)
+  })]).finally(() => clearTimeout(watchdog))
+  const abortedAt = performance.now()
+  controller.abort()
+  const cancelled = await slow
+  ok('SPA 导航取消返回 cancelled', cancelled.error === 'cancelled')
+  ok('SPA 导航取消无需等候响应超时', performance.now() - abortedAt < 2000)
+  await m.closeBrowser()
+  const reopened = await m.renderPage(shellUrl)
+  ok('浏览器关闭后可重新渲染', (reopened.html || '').includes('壳页渲染标题'))
 } finally {
   server.close()
   await m.closeBrowser().catch(() => {})
