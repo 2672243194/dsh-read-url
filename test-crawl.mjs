@@ -156,6 +156,37 @@ export async function runCrawlTests(m) {
     assert.ok(refusedSite.failures[0].error.includes('Provider refused'))
     assert.equal(hits.length, 0)
     passed++
+
+    const summaryTools = {}
+    const summaryBody = 'Summary fact ' + 'q'.repeat(420) + ' END_MARKER'
+    m.apply({ tools: { register: tool => { summaryTools[tool.name] = tool } }, effect: () => {},
+      get: () => ({ fetch: async ({ url }) => ({ url, statusCode: 200,
+        body: { kind: 'html', content: `<article><p>${summaryBody}</p></article>` } }) }),
+    }, { spaRender: false })
+    const summaryTool = summaryTools.read_url_site
+    const summaryArgs = { url: 'https://crawl-summary.invalid/', includeContent: true, maxCharsPerPage: 500 }
+    const summary = await summaryTool.execute(summaryArgs)
+    const summaryText = summaryTool.output.render(summaryArgs, summary)[0].text
+    assert.equal(summary.pages[0].text, summaryBody)
+    assert.ok(summaryText.includes(summaryBody))
+    passed++
+    console.log('  ok - site renderer preserves the requested bounded summary')
+
+    const shortArgs = { ...summaryArgs, maxCharsPerPage: 200 }
+    const shortSummary = await summaryTool.execute(shortArgs)
+    const shortText = summaryTool.output.render(shortArgs, shortSummary)[0].text
+    assert.equal(shortSummary.pages[0].text.length, 200)
+    assert.ok(shortText.includes(shortSummary.pages[0].text))
+    assert.ok(!shortText.includes('END_MARKER'))
+    passed++
+    console.log('  ok - site summary rendering respects the character limit')
+
+    const structureArgs = { url: summaryArgs.url }
+    const structure = await summaryTool.execute(structureArgs)
+    assert.equal(structure.pages[0].text, undefined)
+    assert.ok(!summaryTool.output.render(structureArgs, structure)[0].text.includes('Summary fact'))
+    passed++
+    console.log('  ok - site content remains omitted by default')
   } finally {
     server.closeAllConnections()
     await new Promise((resolve) => server.close(resolve))

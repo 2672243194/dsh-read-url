@@ -315,6 +315,14 @@ Plus a **15-item DSH acceptance round** (a real agent driving every read_url too
 - Vue, React and Kugou's known NOISE cases matched v1.8.1 exactly using identical HTML and optional dependencies, in both text/Markdown and full/800-character outputs. Errors were network, anti-bot, invalid-address or expected content-type boundaries.
 - All four tools enforce the explicit origin policy, including redirect/crawl boundaries, cache isolation and visible static-reading hints. Model input remains **1,159 description characters / 1,876 schema characters**, within the 1,250 / 2,000 budgets.
 
+### Maintenance validation (2026-09-28, unreleased)
+
+- **352 zero-dependency unit assertions, 15 real Chromium SPA assertions and 59 adversarial probes** passed. Navigation tests cover real attributes, quoted `>` characters, empty anchors, refresh entities and semicolons; cancellation, retry cleanup and the rendered site-summary limit have regression coverage. Asynchronous probes now await completion and report failures through the exit code.
+- The final 152-site sweep returned **103 OK / 25 THIN+EMPTY / 24 ERR / 0 THREW**, with no noise in OK results. Vue, React, Kugou and Hatena matched v1.9.0 using identical HTML, including full continuation and 800-character outputs. Weibo's variable static/SPA results also matched on identical HTML/DOM snapshots; the error-site set was unchanged.
+- Navigation uses bounded, quote-aware attribute scanning and advances through each anchor body once. Runs with 25k/50k/100k unclosed anchors containing `href` took about **27/57/118 ms** on this machine. The existing 1,000-character attribute boundary remains in place.
+- [DSH 0.1.7-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.2) compatibility was checked against official npm package byte differences and community upgrade notes (available through rc.1). Both published v1.9.0 and this maintenance code passed **17 actual official-service integration checks each**; the published patch passed **4 loader checks** covering loading, execution, configuration remount and removal. Web-provider/runtime contracts remain compatible; no adaptation change is needed for the checked interfaces. These checks used controlled provider responses, not a complete host UI/model session.
+- Core runtime dependencies remain zero. Model input stays at **1,159 description characters / 1,876 schema characters**; site body summaries remain opt-in and respect `maxCharsPerPage` without an extra 80-character render cutoff.
+
 ## Roadmap
 
 - [x] Single-page continuation (`offset` parameter)

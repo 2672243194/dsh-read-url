@@ -168,6 +168,31 @@ export async function runLifecycleTests(source = fileURLToPath(new URL('.', impo
     }
     const providerResult = (url, content) => ({ url, statusCode: 200, body: { kind: 'html', content }, truncated: false })
     const redirect = url => `<meta http-equiv="refresh" content="0; url=${url}">`
+    await check('read_url_links cancellation during rendering closes the page without returning old links', async state => {
+      const requested = 'https://provider-lifecycle.invalid/cancel-links-render'
+      const entered = deferred()
+      state.onPage = page => { page.goto = () => { entered.resolve(); return page.navigation.promise } }
+      const controller = new AbortController()
+      const registered = new Map()
+      let dispose
+      m.apply({
+        get: () => ({ fetch: async ({ url }) => {
+          assert.equal(url, requested)
+          return providerResult(url, shell.replace('<div id="app"></div>', '<a href="/old">OLD_SHELL_LINK</a>'))
+        } }),
+        tools: { register(tool) { registered.set(tool.name, tool) } },
+        effect(fn) { dispose = fn() },
+      }, { ...cfg, directFetchOrigins: [] })
+      try {
+        const pending = registered.get('read_url_links').execute({ url: requested }, { signal: controller.signal })
+        await entered.promise
+        controller.abort()
+        const output = await pending
+        assert.deepEqual(output, { error: 'cancelled' })
+        assert.equal(state.pages.length, 1)
+        assert.equal(state.pages[0].closes, 1)
+      } finally { controller.abort(); await dispose() }
+    })
     await check('explicit direct read_url retains static content without launching a browser', async state => {
       const requested = 'https://direct-lifecycle.invalid/read-shell'
       let directCalls = 0, providerCalls = 0

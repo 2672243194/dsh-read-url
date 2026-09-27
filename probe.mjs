@@ -7,16 +7,24 @@ import {
 const textOnly = (html) => extract(`<body>${html}</body>`, 'text').text
 import { looksBinary } from './proxy-fallback.js'
 
+const pending = []
+let failures = 0
 const t = (name, fn) => {
   const start = performance.now()
-  try {
-    const out = fn()
+  const pass = (out) => {
     const ms = (performance.now() - start).toFixed(1)
     console.log(`PASS ${ms.padStart(8)}ms ${name}${out !== undefined ? ' → ' + String(out).slice(0, 60) : ''}`)
-  } catch (e) {
+  }
+  const fail = (e) => {
+    failures++
     const ms = (performance.now() - start).toFixed(1)
     console.log(`THROW ${ms.padStart(7)}ms ${name} — ${e.message}`)
   }
+  try {
+    const out = fn()
+    if (out && typeof out.then === 'function') pending.push(Promise.resolve(out).then(pass, fail))
+    else pass(out)
+  } catch (e) { fail(e) }
 }
 
 console.log('=== A. regex-backtracking candidates (each should finish < 300ms) ===')
@@ -32,6 +40,16 @@ t('textOnly 200k anchors never closed', () => textOnly(`<a href="/x">${'y'.repea
 // extractLinks: thousands of anchors, some malformed
 const MANY_ANCHORS = Array.from({ length: 20000 }, (_, i) => `<a href="/p${i}">t${i}</a>`).join('')
 t('extractLinks via findNextLink 20k anchors', () => findNextLink(MANY_ANCHORS, 'https://x.com/'))
+// A missing closer must not restart a body scan from every opening tag.
+for (const n of [25000, 50000, 100000]) {
+  for (const tag of ['<a>', '<a href="/next">']) {
+    t(`findNextLink ${n} unclosed ${tag} anchors`, () => {
+      const result = findNextLink(tag.repeat(n) + 'Next', 'https://x.com/')
+      if (result !== null) throw new Error('Unclosed anchors must not navigate')
+      return 'no navigation'
+    })
+  }
+}
 // entity decode bombs
 t('decodeTextEntities 200k numeric entities', () => decodeTextEntities('&#65;'.repeat(200000)).length)
 // table with many rows
@@ -161,4 +179,6 @@ t('3000 noscript blocks (longest wins)', () =>
 t('unclosed noscript (fail-open)', () =>
   extract('<html><body><div>壳</div><noscript>' + 'n'.repeat(300000) + '</body></html>', 'text').text.length)
 
-console.log('\nprobe done')
+await Promise.all(pending)
+if (failures) process.exitCode = 1
+console.log(`\nprobe done: ${failures} failures`)

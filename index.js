@@ -247,10 +247,19 @@ async function directFetchOnce(url, signal, cfg, origins) {
 // filter into decodeBuffer as a bufferless "success" (bare TypeError there).
 export async function directFetch(url, signal, cfg, origins) {
   const first = await directFetchOnce(url, signal, cfg, origins)
-  if (first && first.retryAfterMs !== undefined && !(signal && signal.aborted)) {
+  if (first && first.retryAfterMs !== undefined) {
+    if (signal && signal.aborted) return { error: 'cancelled' }
     await new Promise((resolve) => {
-      const t = setTimeout(resolve, first.retryAfterMs)
-      if (signal) signal.addEventListener('abort', () => { clearTimeout(t); resolve() }, { once: true })
+      const done = () => {
+        clearTimeout(timer)
+        if (signal) signal.removeEventListener('abort', done)
+        resolve()
+      }
+      const timer = setTimeout(done, first.retryAfterMs)
+      if (signal) {
+        signal.addEventListener('abort', done, { once: true })
+        if (signal.aborted) done()
+      }
     })
     if (signal && signal.aborted) return { error: 'cancelled' }
     const second = await directFetchOnce(url, signal, cfg, origins)
@@ -1427,22 +1436,60 @@ function decodeUrlAttribute(value) {
 }
 
 // <base href> overrides the document base for relative URL resolution (old
-// forums / frame sites). Per HTML spec only the FIRST <base> in <head> counts;
+// forums / frame sites). Only the FIRST <base href> in <head> counts;
 // attribute order is arbitrary and the href may be protocol-relative. Empty
 // href (= document URL) is a no-op; non-http(s) targets are rejected. The
 // head scan is bounded — the tag cannot legally appear beyond it.
 function detectBaseHref(html, finalUrl) {
   const headEnd = html.search(/<\/head\s*>/i)
   const head = headEnd >= 0 ? html.slice(0, headEnd) : html.slice(0, 16384)
-  const base = /<base\b[^>]{0,1000}href=["']([^"']+)["'][^>]{0,1000}>/i.exec(head)
-  if (!base) return finalUrl
-  const href = decodeUrlAttribute(base[1]).trim()
-  if (!href) return finalUrl
-  try {
-    const u = new URL(href, finalUrl)
-    return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : finalUrl
-  } catch {
-    return finalUrl
+  for (const { attrs } of navigationTags(head, /<base(?=[\s/>])/gi)) {
+    if (!Object.hasOwn(attrs, 'href')) continue
+    const href = decodeUrlAttribute(attrs.href).trim()
+    if (!href) return finalUrl
+    try {
+      const u = new URL(href, finalUrl)
+      return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : finalUrl
+    } catch {
+      return finalUrl
+    }
+  }
+  return finalUrl
+}
+
+// Honor quoted '>' without nested regex alternatives. Keep the same total
+// tag-length bound as htmlAttributes; malformed/overlong tags stay inert.
+function* navigationTags(html, open) {
+  let m
+  while ((m = open.exec(html))) {
+    let quote = '', end = -1
+    const limit = Math.min(html.length, m.index + 1002)
+    for (let i = open.lastIndex; i < limit; i++) {
+      const ch = html[i]
+      if (quote) {
+        if (ch === quote) quote = ''
+      } else if (ch === '"' || ch === "'") quote = ch
+      else if (ch === '<') break
+      else if (ch === '>') { end = i + 1; break }
+    }
+    if (end < 0) continue
+    open.lastIndex = end
+    yield { attrs: htmlAttributes(html.slice(m.index, end)), end }
+  }
+}
+
+// Scan each anchor body once; tags without a real href cannot navigate.
+function* navigationAnchors(html) {
+  const open = /<a(?=[\s>])/gi
+  const close = /<\/a\s{0,1000}>/gi
+  for (const { attrs, end: start } of navigationTags(html, open)) {
+    if (!attrs.href?.trim()) continue
+    close.lastIndex = start
+    const end = close.exec(html)
+    if (!end) break
+    const body = html.slice(start, end.index)
+    open.lastIndex = close.lastIndex
+    yield { attrs, body }
   }
 }
 
@@ -1454,18 +1501,14 @@ function extractLinks(html, limit, baseUrl) {
   // A declared <base href> wins over the document URL (frame-site links would
   // otherwise land on the wrong host).
   const linkBase = detectBaseHref(html, baseUrl)
-  // Attribute runs bounded: an unclosed <a whose '>' is far away (or missing)
-  // must not make the regex scan the rest of the string at every anchor
-  // position. Real attributes never approach 1000 chars.
-  const re = /<a\b[^>]{0,1000}href=["']([^"']+)["'][^>]{0,1000}>([\s\S]*?)<\/a\s*>/gi
-  let m
   // Iteration cap: a page whose nav repeats the same links thousands of times
   // would otherwise scan the whole HTML to fill `limit` unique entries. Scan
   // at most limit*4 anchors; dedupe keeps the result bounded regardless.
   let scans = 0
   const maxScans = limit * 4
-  while ((m = re.exec(html)) && links.length < limit && scans++ < maxScans) {
-    const href = decodeUrlAttribute(m[1]).trim()
+  for (const { attrs, body } of navigationAnchors(html)) {
+    if (links.length >= limit || scans++ >= maxScans) break
+    const href = decodeUrlAttribute(attrs.href).trim()
     if (!href || /^(javascript|mailto|tel|data):/i.test(href)) continue
     let url
     try {
@@ -1481,7 +1524,7 @@ function extractLinks(html, limit, baseUrl) {
     // keeps the link list compact (tokens) without losing coverage
     if (seen.has(url)) continue
     seen.add(url)
-    const t = textOnly(m[2])
+    const t = textOnly(body)
     if (t) links.push({ title: t.slice(0, 80), url })
   }
   return links
@@ -1507,6 +1550,7 @@ export function findNextLink(html, baseUrl) {
   // document base, and a "next page" link resolves against it.
   const base = detectBaseHref(html || '', baseUrl)
   const resolve = (href) => {
+    if (!href?.trim()) return null
     try {
       const u = new URL(decodeUrlAttribute(href), base)
       return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null
@@ -1514,21 +1558,20 @@ export function findNextLink(html, baseUrl) {
       return null
     }
   }
-  const rel = /<(?:link|a)\b[^>]{0,1000}rel=["']next["'][^>]{0,1000}>/i.exec(html || '')
-  if (rel) {
-    const href = /href=["']([^"']+)["']/i.exec(rel[0])
-    const r = href && resolve(href[1])
+  for (const { attrs } of navigationTags(html || '', /<(?:link|a)(?=[\s/>])/gi)) {
+    const rel = decodeUrlAttribute(attrs.rel || '').toLowerCase().split(/[ \t\r\n\f]{1,1000}/)
+    if (!rel.includes('next')) continue
+    const r = resolve(attrs.href)
     if (r) return r
   }
-  const re = /<a\b[^>]{0,1000}href=["']([^"']+)["'][^>]{0,1000}>([\s\S]*?)<\/a\s*>/gi
-  let m
   let scans = 0
   // Bounded like extractLinks: a nav bar with thousands of anchors must not
   // scan the whole DOM hunting for a next-marker.
-  while ((m = re.exec(html || '')) && scans++ < 400) {
-    const t = textOnly(m[2])
+  for (const { attrs, body } of navigationAnchors(html || '')) {
+    if (scans++ >= 400) break
+    const t = textOnly(body)
     if (t.length <= 16 && NEXT_TEXT_RE.test(t)) {
-      const r = resolve(m[1])
+      const r = resolve(attrs.href)
       if (r) return r
     }
   }
@@ -1621,18 +1664,15 @@ export function metaRefreshTarget(html, baseUrl) {
   // Locate the refresh <meta> tag first (any attribute order / case), then
   // read content from inside that tag — a forward regex would demand
   // http-equiv before content and miss the reversed order.
-  const re = /<meta\b[^>]{0,1000}(?:http-equiv|name)=["']refresh["'][^>]{0,1000}>/gi
-  let m
-  while ((m = re.exec(html || ''))) {
-    const tag = m[0]
-    const contentM = /content=("([^"]*)"|'([^']*)')/i.exec(tag)
-    if (!contentM) continue // a refresh meta without content is inert
-    const content = (contentM[2] || contentM[3] || '').trim()
+  for (const { attrs } of navigationTags(html || '', /<meta(?=[\s/>])/gi)) {
+    if (![attrs['http-equiv'], attrs.name].some(value => value?.toLowerCase() === 'refresh')) continue
+    if (!Object.hasOwn(attrs, 'content')) continue
+    const content = decodeUrlAttribute(attrs.content).trim()
     // content="5" | content="0; url=http://…" | content=";url='…'" — the url
     // part may be single/double quoted or bare; "url=" must be a real token.
-    const urlM = /\burl\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s;]+))/i.exec(content)
+    const urlM = /\burl\s{0,1000}=\s{0,1000}(?:"([^"]{0,1000})"|'([^']{0,1000})'|([^\s]{1,1000}))/i.exec(content)
     if (!urlM) return null
-    const delayM = /^\s*(\d+(?:\.\d+)?)/.exec(content)
+    const delayM = /^\s{0,1000}(\d{1,1000}(?:\.\d{1,1000})?)/.exec(content)
     if (delayM && Number(delayM[1]) > 0) return null // timed refresh: keep the page
     const target = (urlM[1] || urlM[2] || urlM[3] || '').trim()
     if (!target) return null
@@ -2130,14 +2170,18 @@ function readLinksTool(ctx, cfg) {
       const url = String((args && args.url) || '').trim()
       if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
       const limit = Math.max(1, Math.min(50, Number(args.limit) || cfg.maxLinks))
+      const signal = exec && exec.signal
+      if (signal && signal.aborted) return { error: 'cancelled' }
       const route = createRoute(cfg)
-      const page = await fetchResource(ctx, url, exec && exec.signal, cfg, route)
+      const page = await fetchResource(ctx, url, signal, cfg, route)
+      if (signal && signal.aborted) return { error: 'cancelled' }
       if (page.error) return { error: page.error }
       let html = typeof page.html === 'string' ? page.html : decodeBuffer(page.buffer, page.contentType).text
       let finalUrl = page.finalUrl || url
       // Same meta-refresh shell following as read_url: a link hop serves a
       // stub whose real links live at the target. Fails open, hop-bounded.
-      const followed = await followMetaRefresh(html, finalUrl, exec && exec.signal, cfg, ctx, route)
+      const followed = await followMetaRefresh(html, finalUrl, signal, cfg, ctx, route)
+      if (signal && signal.aborted) return { error: 'cancelled' }
       html = followed.html
       finalUrl = followed.finalUrl
       let links = extractLinks(html, limit, finalUrl)
@@ -2147,7 +2191,8 @@ function readLinksTool(ctx, cfg) {
       // static shell may be a JS-redirect (same rationale as read_url).
       const needsRender = links.length < 3 && cfg.spaRender !== false && (looksLikeSpa(html) || (links.length === 0 && /<script[\s>]/i.test(html)))
       if (!route.restricted && needsRender) {
-        const rr = await renderPage(finalUrl || url, exec && exec.signal)
+        const rr = await renderPage(finalUrl || url, signal)
+        if (signal && signal.aborted) return { error: 'cancelled' }
         // A challenge interstitial's links are the challenge's own scripts —
         // never an improvement over whatever the static HTML offered.
         if (rr.html && !looksLikeChallenge(rr.html)) {
@@ -2349,6 +2394,7 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal, ctx) {
         attempted++
         const route = { ...policy, restricted }
         const page = await fetchResource(ctx, url, externalSignal, cfg, route)
+        if (externalSignal && externalSignal.aborted) return null
         if (page.error) return { url, depth, error: page.error }
         let html = typeof page.html === 'string' ? page.html : decodeBuffer(page.buffer, page.contentType).text
         let pageUrl = page.finalUrl || url
@@ -2360,6 +2406,7 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal, ctx) {
         // real content is never reached). Fails open — fetch problems keep the
         // stub's own HTML.
         const followed = await followMetaRefresh(html, pageUrl, externalSignal, cfg, ctx, route)
+        if (externalSignal && externalSignal.aborted) return null
         html = followed.html
         pageUrl = followed.finalUrl
         if (depth === 0) host = hostOf(pageUrl)
@@ -2380,6 +2427,7 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal, ctx) {
         }
       }),
     )
+    if (externalSignal && externalSignal.aborted) break
     for (const r of results) {
       if (!r) continue
       if (r.error) {
@@ -2417,7 +2465,7 @@ function renderSite(value) {
     const head = p.title || p.url
     lines.push(`${indent}[${p.depth}] ${head} (${p.chars} 字符)  ${p.url}`)
     if (p.spaHint) lines.push(`${indent}提示: ${p.spaHint}`)
-    if (p.text) lines.push(`${indent}   ${p.text.slice(0, 80)}`)
+    if (p.text) lines.push(`${indent}   ${p.text}`)
   }
   for (const f of v.failures) lines.push(`[失败] ${f.url} — ${f.error}`)
   return lines.join('\n')
@@ -2471,12 +2519,15 @@ function readUrlSiteTool(ctx, cfg) {
       const url = String((args && args.url) || '').trim()
       if (!/^https?:\/\//i.test(url)) return { error: 'Only http/https URLs are supported' }
       const maxPages = Math.floor(Math.max(2, Math.min(50, Number(args.maxPages) || 15)))
+      const signal = exec && exec.signal
+      if (signal && signal.aborted) return { error: 'cancelled' }
       const maxDepth = Math.max(1, Math.min(5, Number(args.maxDepth) || 2))
       const includeContent = args.includeContent === true
       const perMax = Math.max(200, Math.min(2000, Number(args.maxCharsPerPage) || 500))
       const { host, pages, failures } = await crawlSite(
-        url, cfg, { maxPages, maxDepth, includeContent, perMax }, exec && exec.signal, ctx,
+        url, cfg, { maxPages, maxDepth, includeContent, perMax }, signal, ctx,
       )
+      if (signal && signal.aborted) return { error: 'cancelled' }
       return {
         host,
         total: pages.length + failures.length,
