@@ -179,6 +179,27 @@ t('3000 noscript blocks (longest wins)', () =>
 t('unclosed noscript (fail-open)', () =>
   extract('<html><body><div>壳</div><noscript>' + 'n'.repeat(300000) + '</body></html>', 'text').text.length)
 
+console.log('\n=== J. JSON-LD raw-text and author bounds ===')
+for (const n of [10000, 20000, 40000]) {
+  t(`extract ${n} unclosed JSON-LD openers`, () => {
+    const result = extract('<main>keep</main>' + '<script type="application/ld+json">'.repeat(n), 'text')
+    if (result.text !== 'keep' || result.author) throw new Error('Unclosed scripts must not supply article data')
+    return result.text
+  })
+}
+t('extract JSON-LD author nested 40000 arrays', () => {
+  const html = '<main>keep</main><script type="application/ld+json">{"author":' + '['.repeat(40000) + '"too deep"' + ']'.repeat(40000) + '}</script>'
+  const result = extract(html, 'text')
+  if (result.text !== 'keep' || result.author) throw new Error('Deep authors must be ignored')
+  return result.text
+})
+t('extract JSON-LD articleBody nested 40000 arrays', () => {
+  const html = '<main>keep</main><script type="application/ld+json">{"articleBody":' + '['.repeat(40000) + '"too deep"' + ']'.repeat(40000) + '}</script>'
+  const result = extract(html, 'text')
+  if (result.text !== 'keep') throw new Error('Nested articleBody arrays must be ignored')
+  return result.text
+})
+
 await Promise.all(pending)
 if (failures) process.exitCode = 1
 console.log(`\nprobe done: ${failures} failures`)

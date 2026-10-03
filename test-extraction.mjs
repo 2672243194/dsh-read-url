@@ -118,6 +118,144 @@ export async function runExtractionTests(m) {
     assert.equal(m.extract(html, 'text').published, '2025-01-02')
   })
 
+  const ldBody = 'Verified article content with source attribution. '.repeat(8).trim()
+  const ldJson = JSON.stringify({ articleBody: ldBody, author: 'Alice', datePublished: '2026-10-01' })
+  const ldTag = attrs => `<script ${attrs}>${ldJson}</script>`
+  check('JSON-LD accepts spaced and unquoted real type attributes', () => {
+    for (const attrs of ['type = "application/ld+json"', 'type=application/ld+json']) {
+      const result = m.extract(ldTag(attrs), 'text')
+      assert.equal(result.text, ldBody)
+      assert.equal(result.author, 'Alice')
+      assert.equal(result.published, '2026-10-01')
+    }
+  })
+  check('JSON-LD type values support case, whitespace and quoted attribute delimiters', () => {
+    for (const attrs of ['TYPE="APPLICATION/LD+JSON"', 'type=" application/ld+json "', 'data-note="a > b" type="application/ld+json"']) {
+      const result = m.extract(ldTag(attrs), 'text')
+      assert.equal(result.text, ldBody)
+      assert.equal(result.author, 'Alice')
+    }
+  })
+  check('compound type names and quoted lookalikes cannot supply article data', () => {
+    for (const attrs of ['data-type="application/ld+json"', 'data-type="application/ld+json" type="application/json"', 'data-note="type=\'application/ld+json\'"', 'type="text/javascript" data-type="application/ld+json"']) {
+      const result = m.extract(`<main>Visible body</main>${ldTag(attrs)}`, 'text')
+      assert.equal(result.text, 'Visible body')
+      assert.equal(result.author, '')
+      assert.equal(result.published, '')
+    }
+  })
+  check('real JSON-LD type is independent of surrounding data attributes', () => {
+    for (const attrs of ['data-type="application/json" type="application/ld+json"', 'type="application/ld+json" data-type="application/json"']) {
+      assert.equal(m.extract(ldTag(attrs), 'text').text, ldBody)
+    }
+  })
+  check('invalid JSON-LD and ordinary script blocks do not hide a later valid block', () => {
+    const html = '<script type="application/ld+json">{broken</script><script type="application/json">{"author":"Wrong"}</script>' + ldTag('type = "application/ld+json"')
+    const result = m.extract(html, 'text')
+    assert.equal(result.author, 'Alice')
+    assert.equal(result.text, ldBody)
+  })
+  check('JSON-LD retains opening-tag and body-size limits', () => {
+    const longTag = ldTag(`data-note="${'x'.repeat(1100)}" type="application/ld+json"`)
+    const largeBody = `<script type="application/ld+json">${JSON.stringify({ articleBody: 'x'.repeat(100001), author: 'Wrong' })}</script>`
+    for (const html of [longTag, largeBody]) {
+      const rejected = m.extract(`<main>Visible body</main>${html}`, 'text')
+      assert.equal(rejected.text, 'Visible body')
+      assert.equal(rejected.author, '')
+      const followed = m.extract(html + ldTag('type="application/ld+json"'), 'text')
+      assert.equal(followed.author, 'Alice')
+      assert.equal(followed.text, ldBody)
+    }
+  })
+  check('JSON-LD recursion remains bounded', () => {
+    let node = { author: 'Too deep', articleBody: ldBody }
+    for (let i = 0; i < 21; i++) node = { nested: node }
+    const result = m.extract(`<main>Visible body</main><script type="application/ld+json">${JSON.stringify(node)}</script>`, 'text')
+    assert.equal(result.author, '')
+    assert.equal(result.text, 'Visible body')
+  })
+  check('unclosed and nested script text cannot expose an embedded JSON-LD opener', () => {
+    const nested = '<script type="text/plain">' + ldTag('type="application/ld+json"')
+    const unclosed = '<script type="application/ld+json">'.repeat(2000)
+    for (const html of [nested, unclosed]) {
+      const result = m.extract(`<main>Visible body</main>${html}`, 'text')
+      assert.equal(result.author, '')
+      assert.equal(result.text, 'Visible body')
+    }
+  })
+  check('commented script openers cannot consume the next real JSON-LD block', () => {
+    for (const comment of ['<!-- <script src="disabled.js"> -->', '<!-- <script type="application/ld+json">{"author":"Wrong"}</script> -->']) {
+      const result = m.extract(comment + ldTag('type="application/ld+json"'), 'text')
+      assert.equal(result.author, 'Alice')
+      assert.equal(result.text, ldBody)
+    }
+  })
+  check('non-script raw-text containers cannot introduce fake script elements', () => {
+    for (const name of ['textarea', 'style', 'title', 'xmp', 'iframe', 'noembed', 'noframes', 'noscript']) {
+      const html = `<${name}><script src="disabled.js"></${name}>` + ldTag('type="application/ld+json"')
+      const result = m.extract(html, 'text')
+      assert.equal(result.author, 'Alice', name)
+      assert.equal(result.text, ldBody, name)
+    }
+  })
+  check('quoted attributes on ordinary tags cannot introduce script elements', () => {
+    const html = '<div data-note="<script src=\'disabled.js\'>">Visible body</div>' + ldTag('type="application/ld+json"')
+    const result = m.extract(html, 'text')
+    assert.equal(result.author, 'Alice')
+    assert.equal(result.text, ldBody)
+  })
+  check('deep author arrays and name objects degrade without recursion errors', () => {
+    const values = ['['.repeat(40000) + '"Too deep"' + ']'.repeat(40000), '{"name":'.repeat(4000) + '"Too deep"' + '}'.repeat(4000)]
+    for (const author of values) {
+      const html = `<script type="application/ld+json">{"author":${author},"datePublished":"2026-10-01","articleBody":"Visible body"}</script>`
+      const result = m.extract(html, 'text')
+      assert.equal(result.author, '')
+      assert.equal(result.published, '2026-10-01')
+      assert.equal(result.text, 'Visible body')
+    }
+  })
+  check('deep article-body arrays do not trigger recursive string conversion', () => {
+    const body = '['.repeat(40000) + '"Too deep"' + ']'.repeat(40000)
+    const html = `<main>Visible body</main><script type="application/ld+json">{"articleBody":${body},"author":"Alice"}</script>`
+    const result = m.extract(html, 'text')
+    assert.equal(result.author, 'Alice')
+    assert.equal(result.text, 'Visible body')
+  })
+  check('article-body arrays retain strings and omit nontext values', () => {
+    const body = ['First paragraph', { note: 'Wrong object' }, 42, null, ['Wrong nested text'], 'Second paragraph']
+    const result = m.extract(`<script type="application/ld+json">${JSON.stringify({ articleBody: body })}</script>`, 'text')
+    assert.equal(result.text, 'First paragraph\n\nSecond paragraph')
+  })
+
+  const ldTools = {}
+  let ldHtml = ''
+  const ldWeb = { fetch: async ({ url }) => ({ statusCode: 200, url, body: { kind: 'html', content: ldHtml } }) }
+  m.apply({ tools: { register: tool => { ldTools[tool.name] = tool } }, effect: () => {}, get: key => key === 'web' ? ldWeb : undefined }, { spaRender: false, paginate: false, cacheTtlMs: 0 })
+  ldHtml = ldTag('type = "application/ld+json"')
+  const ldArgs = { url: `https://jsonld-fixture.invalid/${Date.now()}/valid`, mode: 'markdown' }
+  const ldResult = await ldTools.read_url.execute(ldArgs)
+  check('tool execution and rendering preserve JSON-LD body and attribution', () => {
+    assert.equal(ldResult.text, ldBody)
+    assert.equal(ldResult.author, 'Alice')
+    assert.equal(ldResult.published, '2026-10-01')
+    const rendered = ldTools.read_url.output.render(ldArgs, ldResult)[0].text
+    assert.ok(rendered.includes(ldBody))
+    assert.ok(rendered.includes('by Alice'))
+    assert.ok(rendered.includes('2026-10-01'))
+    assert.ok(rendered.includes('untrusted'))
+  })
+  ldHtml = '<main>Visible body</main>' + ldTag('data-type="application/ld+json" type="application/json"')
+  const inertArgs = { url: `https://jsonld-fixture.invalid/${Date.now()}/inert` }
+  const inertResult = await ldTools.read_url.execute(inertArgs)
+  check('tool rendering excludes data from a script with an unrelated real type', () => {
+    assert.equal(inertResult.text, 'Visible body')
+    const rendered = ldTools.read_url.output.render(inertArgs, inertResult)[0].text
+    assert.ok(rendered.includes('Visible body'))
+    assert.ok(!rendered.includes(ldBody))
+    assert.ok(!rendered.includes('Alice'))
+    assert.ok(!rendered.includes('2026-10-01'))
+  })
+
   const fixtures = {
     '/atom': '<feed xmlns="http://www.w3.org/2005/Atom"><title>News</title><entry><title>Article</title><link rel="self" href="/entry.atom"/><link rel="enclosure" href="/audio.mp3"/><link rel="alternate" href="/article?a=1&amp;b=2"/><summary>Summary</summary></entry></feed>',
     '/base': '<atom:feed xmlns:atom="http://www.w3.org/2005/Atom" xml:base="/news/"><atom:title>News</atom:title><atom:entry xml:base="issues/"><atom:title>Issue</atom:title><atom:link href="one"/><atom:summary type="text">Use &lt;code&gt; here</atom:summary></atom:entry></atom:feed>',

@@ -1116,7 +1116,39 @@ function extractMeta(html) {
 // Bounded block size keeps a hostile giant script tag from dragging the scan.
 // 100k covers real article-list JSON-LD (news sites often embed dozens of
 // items); metadata sits in the first node anyway.
-const LDJSON_RE = /<script[^>]{0,1000}type=["']application\/ld\+json["'][^>]{0,1000}>([\s\S]{0,100000}?)<\/script\s*>/gi
+function* jsonLdBlocks(html) {
+  const open = /<!--|<([a-z][a-z0-9:-]{0,63})(?=[\s>])/gi
+  const rawNames = new Set(['script', 'style', 'textarea', 'title', 'xmp', 'iframe', 'noembed', 'noframes', 'noscript', 'plaintext'])
+  let match
+  while ((match = open.exec(html))) {
+    if (!match[1]) {
+      const end = html.indexOf('-->', open.lastIndex)
+      if (end < 0) break
+      open.lastIndex = end + 3
+      continue
+    }
+    const tag = navigationTags(html.slice(match.index, match.index + 1002), /^<[a-z][a-z0-9:-]{0,63}(?=[\s>])/gi).next().value
+    if (!tag) continue
+    const end = match.index + tag.end
+    open.lastIndex = end
+    const name = match[1].toLowerCase()
+    if (!rawNames.has(name)) continue
+    if (name === 'plaintext') break
+    const close = new RegExp(`</${name}\\s{0,1000}>`, 'gi')
+    close.lastIndex = end
+    const closing = close.exec(html)
+    if (!closing) break
+    // Raw-text bodies and quoted attributes cannot introduce script elements.
+    open.lastIndex = close.lastIndex
+    if (name !== 'script' || tag.attrs.type?.trim().toLowerCase() !== 'application/ld+json' || closing.index - end > 100000) continue
+    try {
+      yield JSON.parse(html.slice(end, closing.index))
+    } catch {
+      // Invalid data blocks do not prevent reading later JSON-LD blocks.
+    }
+  }
+}
+
 function jsonLdMeta(html) {
   // Recursively collect every node: nested structures are common (ItemList →
   // mainEntity → Article, WebPage → mainEntityOfPage), so a flat top-level
@@ -1136,20 +1168,15 @@ function jsonLdMeta(html) {
       if (v && typeof v === 'object') collect(v, out, depth + 1)
     }
   }
-  const authorOf = (a) => {
+  const authorOf = (a, depth = 0) => {
+    if (depth > 20) return ''
     if (typeof a === 'string') return a
-    if (Array.isArray(a)) return authorOf(a[0])
-    if (a && typeof a === 'object') return typeof a.name === 'string' ? a.name : authorOf(a.name)
+    if (Array.isArray(a)) return authorOf(a[0], depth + 1)
+    if (a && typeof a === 'object') return typeof a.name === 'string' ? a.name : authorOf(a.name, depth + 1)
     return ''
   }
   const clean = (s) => (s ? decodeTextEntities(s).slice(0, 40) : '')
-  for (const m of html.matchAll(LDJSON_RE)) {
-    let json
-    try {
-      json = JSON.parse(m[1])
-    } catch {
-      continue
-    }
+  for (const json of jsonLdBlocks(html)) {
     const nodes = []
     collect(json, nodes)
     for (const n of nodes) {
@@ -1165,15 +1192,9 @@ function jsonLdMeta(html) {
 // (articleBody) while the visible HTML is an anti-bot shell or a thin
 // fragment — a fallback body source the DOM extractors cannot reach. Returns
 // the first string articleBody found (array values joined), stripped to
-// paragraphs via textLines. Block scan is the same bounded LDJSON_RE.
+// paragraphs via textLines. Metadata and body share the bounded block scan.
 function jsonLdArticleBody(html) {
-  for (const m of html.matchAll(LDJSON_RE)) {
-    let json
-    try {
-      json = JSON.parse(m[1])
-    } catch {
-      continue
-    }
+  for (const json of jsonLdBlocks(html)) {
     const nodes = []
     const collect = (node, depth = 0) => {
       if (!node || typeof node !== 'object' || depth > 20) return
@@ -1189,7 +1210,7 @@ function jsonLdArticleBody(html) {
     }
     collect(json)
     for (const n of nodes) {
-      const raw = Array.isArray(n.articleBody) ? n.articleBody.join('\n\n') : n.articleBody
+      const raw = Array.isArray(n.articleBody) ? n.articleBody.filter(part => typeof part === 'string').join('\n\n') : n.articleBody
       if (typeof raw === 'string' && raw.trim()) return textLines(raw).slice(0, 200000)
     }
   }

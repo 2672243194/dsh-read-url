@@ -55,8 +55,16 @@ Implemented per official docs (`docs/capability-seams.md`, `docs/cordis-primer.m
 
 ## Install
 
+### DSH Desktop
+
+Open **Plugins → Add plugin**, enter `dsh-read-url` (npm package), the GitHub repository URL, or the local project directory, and install it. In the plugin details, check the displayed version and that the component is **running**.
+
+Desktop uses its own `desktop` profile and bundled DSH runtime. CLI profile installations and global CLI upgrades are separate from Desktop. When configuring this plugin manually, use the Desktop profile's `cordis.patch.yml`. A local directory installation links to that source directory; restart Desktop after changing its code to load a fresh module.
+
+### CLI / local development
+
 ```bash
-# From GitHub (recommended, easy updates)
+# From GitHub in the web profile
 npx @deepseek-ai/dsh plugin --profile web add github:2672243194/dsh-read-url
 
 # Local development
@@ -322,6 +330,14 @@ Plus a **15-item DSH acceptance round** (a real agent driving every read_url too
 - Navigation uses bounded, quote-aware attribute scanning and advances through each anchor body once. Runs with 25k/50k/100k unclosed anchors containing `href` took about **27/57/118 ms** on this machine. The existing 1,000-character attribute boundary remains in place.
 - [DSH 0.1.7-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.2) compatibility was checked against official npm package byte differences and community upgrade notes (available through rc.1). Both published v1.9.0 and this maintenance code passed **17 actual official-service integration checks each**; the published patch passed **4 loader checks** covering loading, execution, configuration remount and removal. Web-provider/runtime contracts remain compatible; no adaptation change is needed for the checked interfaces. These checks used controlled provider responses, not a complete host UI/model session.
 - Core runtime dependencies remain zero. Model input stays at **1,159 description characters / 1,876 schema characters**; site body summaries remain opt-in and respect `maxCharsPerPage` without an extra 80-character render cutoff.
+
+### v1.9.2 Desktop maintenance validation (2026-10-03)
+
+- **375 zero-dependency unit assertions, 15 real Chromium SPA assertions and 64 adversarial probes** passed. Coverage includes Windows proxy fallback with a minimal PATH, real JSON-LD attributes, comment/raw-text isolation, bounded scans and deeply nested data.
+- The installed **DSH Desktop 0.2.0-rc.2** runtime (Electron 44.0.0 / Node 24.18.1) passed **17 official-service integration checks, 3 tool-scope checks, 2 local proxy A/B checks and 15 Chromium SPA checks**. The minimal preset inherits the four globally registered plugin tools. Service responses were controlled fixtures; these checks do not cover a full model conversation.
+- [DSH 0.2.0-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.0-rc.2) was audited against 0.1.7-rc.2 using byte differences across eight contact packages and four Desktop loading files, with the [community 0.2.0-rc.1 upgrade card](https://github.com/oh-my-dsh/dsh-plugin-upgrade-skill/blob/main/skills/plugin-upgrade/references/v0.2.0-rc.1.md) as a cross-check. The verified interfaces require no adaptation. The newer 0.2.1-alpha.1 was not audited.
+- The 152-site sweep returned **104 OK / 20 THIN / 4 EMPTY / 24 ERR / 0 THREW**, with no noise in OK results. Known NOISE and fluctuating sites matched v1.9.1 on identical HTML/DOM and optional dependencies, including full continuation and 800-character output. The newly failing feed returned HTTP 403 in both versions.
+- JSON-LD metadata/body extraction accepts valid attribute variants and rejects lookalike attributes. Author recursion is bounded; body arrays retain only strings. Core runtime dependencies remain zero, with fixed model input of **1,159 description characters / 1,876 schema characters**.
 
 ## Roadmap
 

@@ -14,6 +14,23 @@
 // caller reports the ORIGINAL direct-connect error with a clear note, so the
 // model/user can act (turn the proxy on, or accept the network boundary).
 import { execFile, execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { win32 } from 'node:path'
+
+// Desktop launches can inherit a reduced PATH. Prefer the Windows-shipped
+// utilities when present; other platforms and custom installations use PATH.
+function systemExecutable(name) {
+  if (process.platform !== 'win32') return name
+  const parts = name === 'powershell'
+    ? ['System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe']
+    : ['System32', 'curl.exe']
+  for (const root of [process.env.SystemRoot, process.env.WINDIR]) {
+    if (typeof root !== 'string' || !win32.isAbsolute(root)) continue
+    const executable = win32.join(root, ...parts)
+    if (existsSync(executable)) return executable
+  }
+  return name
+}
 
 // Some servers omit the Content-Type header entirely; the content-type gate
 // then has nothing to test and a binary body (PDF/PNG/zip) would flow into
@@ -71,7 +88,7 @@ function readWindowsSystemProxy() {
   sysProxyCheckedAt = now
   try {
     const out = execFileSync(
-      'powershell',
+      systemExecutable('powershell'),
       [
         '-NoProfile', '-Command',
         "(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings').ProxyEnable, (Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings').ProxyServer",
@@ -127,7 +144,7 @@ export async function fetchViaCurlProxy(url, cfg, externalSignal, proxyOverride)
   ]
   try {
     const buf = await new Promise((resolve, reject) => {
-      execFile('curl', args, { maxBuffer: cfg.maxBytes + 8192, encoding: 'buffer', windowsHide: true, signal: externalSignal || undefined }, (err, stdout) => {
+      execFile(systemExecutable('curl'), args, { maxBuffer: cfg.maxBytes + 8192, encoding: 'buffer', windowsHide: true, signal: externalSignal || undefined }, (err, stdout) => {
         if (err) return reject(err)
         resolve(stdout)
       })

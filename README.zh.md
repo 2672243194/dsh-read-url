@@ -55,8 +55,16 @@ DSH 的 Agent 能搜索（返回链接和片段），但缺"把 URL 读成干净
 
 ## 安装
 
+### DSH 桌面版
+
+打开 **插件 → 添加插件**，输入 `dsh-read-url`（npm 包名）、GitHub 仓库地址或本地项目目录后安装。在插件详情检查版本，以及组件是否显示 **运行中**。
+
+桌面版使用独立的 `desktop` profile 和内置 DSH 运行时。CLI 各 profile 的安装及全局 CLI 升级与桌面版分别管理。手动配置本插件时，应使用桌面 profile 的 `cordis.patch.yml`。本地目录安装会链接源目录，修改代码后应重启桌面版，以加载新的模块。
+
+### CLI / 本地开发
+
 ```bash
-# 从 GitHub（推荐，便于更新）
+# 从 GitHub 安装到 web profile
 npx @deepseek-ai/dsh plugin --profile web add github:2672243194/dsh-read-url
 
 # 本地开发
@@ -322,6 +330,14 @@ v1.4.0 复验（2026-08-28，代理环境）：python-docs stdtypes.html 锚点�
 - 导航采用有界、识别引号的属性扫描，每段锚点正文只扫描一次。本机 2.5 万/5 万/10 万个含 `href` 的未闭合锚点耗时约 **27/57/118 ms**，保留原有 1,000 字符属性边界。
 - [DSH 0.1.7-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.2) 已完成官方 npm 接触包字节差异核查，并与社区升级卡交叉验证（卡片目前到 rc.1）。发布版 v1.9.0 与当前维护代码各通过 **17 项真实官方服务集成检查**；发布版 patch 另通过 **4 项加载器检查**，覆盖加载、调用、配置重挂和卸载。Web provider/runtime 契约兼容，已核查接口无需适配修改；测试使用受控 provider 响应，未覆盖完整宿主 UI/模型会话。
 - 核心仍为零运行时依赖，模型固定输入仍为 **description 1,159 字符 / schema 1,876 字符**；站点正文摘要仍默认关闭，启用后遵循 `maxCharsPerPage`，不再额外截成 80 字符。
+
+### v1.9.2 桌面版维护验证（2026-10-03）
+
+- **375 个零依赖单元断言、15 个真实 Chromium SPA 断言、64 项对抗探针**通过。覆盖 Windows 精简 PATH 下的代理回退、JSON-LD 真实属性、注释/raw-text 隔离、有界扫描与深层数据。
+- 已安装的 **DSH 桌面版 0.2.0-rc.2** 运行时（Electron 44.0.0 / Node 24.18.1）通过 **17 项官方服务集成、3 项工具作用域、2 项本地代理 A/B 及 15 项 Chromium SPA 检查**。极简 preset 继承全局注册的四个插件工具；服务响应使用受控数据，未覆盖完整模型会话。
+- [DSH 0.2.0-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.0-rc.2) 已对照 0.1.7-rc.2 完成八个接触包与四个桌面加载链文件的字节差异审计，并交叉核对[社区 0.2.0-rc.1 升级卡](https://github.com/oh-my-dsh/dsh-plugin-upgrade-skill/blob/main/skills/plugin-upgrade/references/v0.2.0-rc.1.md)。已核查接口无需适配修改；更新的 0.2.1-alpha.1 未审计。
+- 152 站结果为 **104 OK / 20 THIN / 4 EMPTY / 24 ERR / 0 THREW**，OK 站零噪声。已知 NOISE 与状态波动站使用相同 HTML/DOM 和可选依赖对照 v1.9.1，全文续读及 800 字输出一致；新增失败的订阅站在新旧版本均返回 HTTP 403。
+- JSON-LD 元数据/正文支持合法属性变体并排除伪属性；作者递归有界，正文数组仅保留字符串。核心仍为零运行时依赖，模型固定输入为 **description 1,159 字符 / schema 1,876 字符**。
 
 ## Roadmap
 
