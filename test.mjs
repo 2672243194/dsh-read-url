@@ -11,6 +11,8 @@ import { runDirectOriginTests } from './test-direct-origins.mjs'
 import { runNetworkMaintenanceTests } from './test-network-maintenance.mjs'
 import { runNavigationTests } from './test-navigation.mjs'
 import { runProxyDesktopTests } from './test-proxy-desktop.mjs'
+import { runConfigBoundaryTests } from './test-config-boundaries.mjs'
+import { runProviderTextTests } from './test-provider-text.mjs'
 const { decodeBuffer, extract, smartTruncate, blockMd, inlineMd, decodeTextEntities, raceFirstSuccess, metaRefreshTarget, findNextLink } = m
 
 let passed = 0
@@ -193,6 +195,18 @@ ok('byline fallback handles markdown mode link syntax', () => {
   const page = `<html><body><main><p>作者：[阮一峰](https://ruanyifeng.com)</p><p>${'正文。'.repeat(100)}</p></main></body></html>`
   const r = extract(page, 'markdown')
   assert.ok(!r.author.includes(']('), `markdown link syntax must not leak: ${JSON.stringify(r.author)}`)
+})
+
+ok('challenge markers accept bounded whitespace and optional separators', () => {
+  for (const gap of ['', ' \n', ' | ', ' · ', ' '.repeat(1000), ' '.repeat(1000) + '|' + ' '.repeat(1000)]) {
+    assert.equal(looksLikeChallenge(`Attention Required!${gap}Cloudflare`), true)
+  }
+})
+
+ok('challenge markers reject oversized whitespace gaps', () => {
+  for (const gap of [' '.repeat(1001), ' '.repeat(1001) + '|', '|' + ' '.repeat(1001)]) {
+    assert.equal(looksLikeChallenge(`Attention Required!${gap}Cloudflare`), false)
+  }
 })
 
 ok('looksLikeChallenge detects Cloudflare interstitials, not real pages', () => {
@@ -1871,6 +1885,8 @@ passed += await runDirectOriginTests(m)
 passed += await runNetworkMaintenanceTests(m)
 passed += await runNavigationTests(m)
 passed += await runProxyDesktopTests()
+passed += await runConfigBoundaryTests(m)
+passed += await runProviderTextTests(m)
 console.log(`\n${passed} assertions passed`)
 // All assertions are synchronous or top-level awaited; reaching here means every
 // one passed, so force a clean exit (avoids environment-specific exit-code noise).

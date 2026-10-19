@@ -22,9 +22,11 @@ Continue at `charsStart + charsReturned`; the returned `charsStart` may exceed t
 
 ## Why
 
-DSH agents can search (getting links and snippets) but lack the step of "reading a URL into clean body text". The official `tool-web` `web_fetch` does a **whole-page turndown conversion** (nav/ads/sidebars all preserved) with a default cap of 200,000 characters — a token black hole. This plugin returns only what the model actually needs: **cleaned body + essential metadata**, truncated by default.
+This plugin keeps URL-reading output compact: **cleaned body + essential metadata** from HTML, paragraph-aligned truncation, continuation and a session cache. It also preserves plain text or Markdown returned by the configured DSH provider. DSH 0.2.1-rc.2 includes a DeepSeek Fetch API provider, so available source content and metadata depend on the selected provider.
 
 ### Competitor comparison (measured from source/docs, 2026-08-15)
+
+This is a historical snapshot; it does not describe the newer DeepSeek Fetch API provider.
 
 | Capability | Official `tool-web` web_fetch | dsh-webfetch | dsh-scrape-webpage | **dsh-read-url** |
 |---|---|---|---|---|
@@ -338,6 +340,15 @@ Plus a **15-item DSH acceptance round** (a real agent driving every read_url too
 - [DSH 0.2.0-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.0-rc.2) was audited against 0.1.7-rc.2 using byte differences across eight contact packages and four Desktop loading files, with the [community 0.2.0-rc.1 upgrade card](https://github.com/oh-my-dsh/dsh-plugin-upgrade-skill/blob/main/skills/plugin-upgrade/references/v0.2.0-rc.1.md) as a cross-check. The verified interfaces require no adaptation. The newer 0.2.1-alpha.1 was not audited.
 - The 152-site sweep returned **104 OK / 20 THIN / 4 EMPTY / 24 ERR / 0 THREW**, with no noise in OK results. Known NOISE and fluctuating sites matched v1.9.1 on identical HTML/DOM and optional dependencies, including full continuation and 800-character output. The newly failing feed returned HTTP 403 in both versions.
 - JSON-LD metadata/body extraction accepts valid attribute variants and rejects lookalike attributes. Author recursion is bounded; body arrays retain only strings. Core runtime dependencies remain zero, with fixed model input of **1,159 description characters / 1,876 schema characters**.
+
+### v1.9.3 Desktop maintenance validation (2026-10-19)
+
+- **413 zero-dependency unit assertions, 15 real Chromium SPA assertions and 70 adversarial probes** passed. Fixes cover nested Markdown containers/lists, fractional numeric configuration, literal text-provider content, proxy diagnostics, `NO_PROXY`, curl URL globbing/decompression and bounded challenge detection. Reproductions against v1.9.1/v1.9.2 confirm existing defects; regression tests also cover code-fence and quote boundaries within lists.
+- [DSH 0.2.1-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.2), published October 17, was audited against 0.2.0-rc.2 across eight contact packages, Cordis/Loader and four Desktop loading files. The final plugin passed **17 official-service integration checks and 9 DeepSeek Fetch provider checks**. The published v1.9.2 patch also passed 4 loader and 2 temporary-profile checks. The [community upgrade card](https://github.com/oh-my-dsh/dsh-plugin-upgrade-skill/blob/main/skills/plugin-upgrade/references/v0.2.0-rc.2.md) currently stops at 0.2.0-rc.2; newer behavior was checked directly against official packages.
+- After upgrading Desktop to **0.2.1-rc.2 / Electron 44.7.0 / Node 24.21.0**, its actual bundled runtime passed **17 integration checks, 3 tool-scope checks and 15 Chromium SPA checks** against the same final plugin. The prior 0.2.0-rc.2 runtime also passed 17 integration and 15 SPA checks. Service responses were controlled; these checks do not cover a full model conversation or UI interaction.
+- The release 152-site sweep returned **105 OK / 21 THIN / 4 EMPTY / 22 ERR / 0 THREW**, with no noise in OK results. Errors comprised 13 HTTP refusals/missing pages, 3 expected content-type rejections and 6 network failures. Saved HTML/DOM replays matched v1.9.2 in full text and continuation; Markdown restored structure without losing or duplicating visible text. Dynamic verification pages matched on identical input. The previously garbled Bilibili video page returned readable content after gzip decompression. Real curl 8.19/8.21 passed 12 decompression, size-limit, redirect and cancellation scenarios.
+- The DeepSeek Fetch provider returns Markdown as `body.kind=text`. Single-page reading preserves that text; links/site operations report that HTML navigation was not scanned, rather than interpreting HTML examples as links, redirects or SPA scripts. The provider does not expose the target's final URL or status, so HTML metadata, automatic pagination and site discovery are not equivalent to raw HTML retrieval.
+- Nested Markdown blocks retain paragraph boundaries, list nesting, parent numbering and separate code/quote endings from following text. Attribute scans and the 100-level recursion limit remain bounded. Proxy retrieval decompresses supported HTTP encodings and checks the decoded byte budget even with older curl versions. Core runtime dependencies remain zero; fixed model input remains **1,159 description characters / 1,876 schema characters**.
 
 ## Roadmap
 

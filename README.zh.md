@@ -22,9 +22,11 @@ DeepSeek Harness 的 URL 阅读插件：抓取任意 URL——**网页（HTML）
 
 ## 为什么做它
 
-DSH 的 Agent 能搜索（返回链接和片段），但缺"把 URL 读成干净正文"这一步。官方 `tool-web` 的 `web_fetch` 是**整页 turndown 转换**（导航/广告/侧栏全保留），默认上限 20 万字符——token 黑洞。本插件只返回模型真正需要的：**净化后的正文 + 必要元数据**，并默认截断。
+本插件控制 URL 阅读的输出量：从 HTML 提取**净化后的正文 + 必要元数据**，提供段落截断、续读和会话缓存；也保留 DSH 配置的提供方返回的纯文本或 Markdown。DSH 0.2.1-rc.2 已包含 DeepSeek Fetch API 提供方，可获得的原文和元数据取决于所选提供方。
 
 ### 同类插件对比（2026-08-15 实测源码/文档）
+
+以下是历史快照，不代表新版 DeepSeek Fetch API 提供方的行为。
 
 | 能力 | 官方 `tool-web` web_fetch | dsh-webfetch | dsh-scrape-webpage | **dsh-read-url** |
 |---|---|---|---|---|
@@ -338,6 +340,15 @@ v1.4.0 复验（2026-08-28，代理环境）：python-docs stdtypes.html 锚点�
 - [DSH 0.2.0-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.0-rc.2) 已对照 0.1.7-rc.2 完成八个接触包与四个桌面加载链文件的字节差异审计，并交叉核对[社区 0.2.0-rc.1 升级卡](https://github.com/oh-my-dsh/dsh-plugin-upgrade-skill/blob/main/skills/plugin-upgrade/references/v0.2.0-rc.1.md)。已核查接口无需适配修改；更新的 0.2.1-alpha.1 未审计。
 - 152 站结果为 **104 OK / 20 THIN / 4 EMPTY / 24 ERR / 0 THREW**，OK 站零噪声。已知 NOISE 与状态波动站使用相同 HTML/DOM 和可选依赖对照 v1.9.1，全文续读及 800 字输出一致；新增失败的订阅站在新旧版本均返回 HTTP 403。
 - JSON-LD 元数据/正文支持合法属性变体并排除伪属性；作者递归有界，正文数组仅保留字符串。核心仍为零运行时依赖，模型固定输入为 **description 1,159 字符 / schema 1,876 字符**。
+
+### v1.9.3 桌面版维护验证（2026-10-19）
+
+- **413 个零依赖单元断言、15 个真实 Chromium SPA 断言、70 项对抗探针**通过。修复覆盖 Markdown 嵌套容器/列表、小数配置、提供方纯文本、代理诊断、`NO_PROXY`、curl URL 展开/解压及有界质询页识别；v1.9.1/v1.9.2 对照确认原始缺陷既有，回归测试另覆盖列表内代码围栏闭合及引用块边界。
+- 10 月 17 日发布的 [DSH 0.2.1-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.2) 已对照 0.2.0-rc.2 审计八个接触包、Cordis/Loader 及四个桌面加载链文件。最终插件通过 **17 项官方服务集成和 9 项 DeepSeek Fetch 提供方检查**；已发布 v1.9.2 的 patch 另通过 4 项加载器和 2 项临时 profile 检查。[社区升级卡](https://github.com/oh-my-dsh/dsh-plugin-upgrade-skill/blob/main/skills/plugin-upgrade/references/v0.2.0-rc.2.md)目前仅到 0.2.0-rc.2，新版行为直接用官方包核验。
+- 桌面升级至 **0.2.1-rc.2 / Electron 44.7.0 / Node 24.21.0** 后，实际内置运行时对相同最终插件通过 **17 项集成、3 项工具作用域和 15 项 Chromium SPA 检查**；升级前的 0.2.0-rc.2 运行时也已通过 17 项集成与 15 项 SPA。服务响应使用受控数据，未覆盖完整模型会话或 UI 交互。
+- 发布前 152 站为 **105 OK / 21 THIN / 4 EMPTY / 22 ERR / 0 THREW**，OK 站零噪声；错误包括 13 个 HTTP 拒绝/页面不存在、3 个预期类型拒绝及 6 个网络失败。保存的同一 HTML/DOM 对照 v1.9.2，text 全文与续读一致，Markdown 恢复结构且无可见文字丢失或重复；动态验证页同输入结果一致。此前乱码的 Bilibili 视频页经 gzip 解压后返回正常正文。实际 curl 8.19/8.21 共通过 12 个解压、限额、跳转及取消场景。
+- DeepSeek Fetch 提供方以 `body.kind=text` 返回 Markdown。单页读取保留原文；链接/站点工具明确提示未扫描 HTML 导航，避免把 HTML 示例当作链接、跳转或 SPA 脚本。该提供方不暴露目标最终 URL 和状态，因此 HTML 元数据、自动分页和站点发现不能视为与原始 HTML 抓取等价。
+- Markdown 嵌套块保留段落边界、列表层级、父级编号，代码块/引用与后文正确分隔；属性扫描和 100 层递归上限继续有界。代理读取解压受支持的 HTTP 编码，并对旧版 curl 同样执行解压后字节限额。核心仍为零运行时依赖，模型固定输入仍为 **description 1,159 字符 / schema 1,876 字符**。
 
 ## Roadmap
 

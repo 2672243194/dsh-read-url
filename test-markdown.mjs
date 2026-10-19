@@ -117,7 +117,7 @@ export async function runMarkdownTests(m) {
 
   ok('fenced code retains indentation and language among multiple CSS classes', () => {
     const output = m.blockMd('<pre><code class="source language-js highlight">\n  const x = 1\n    x++\n</code></pre>')
-    assert.equal(output, '\n\n```js\n  const x = 1\n    x++\n```')
+    assert.equal(output, '\n\n```js\n  const x = 1\n    x++\n```\n\n')
   })
 
   ok('fenced code decodes escaped tags while removing highlighting wrappers', () => {
@@ -210,6 +210,86 @@ export async function runMarkdownTests(m) {
   ok('table code retains long internal whitespace runs', () => {
     const spaces = ' '.repeat(160000)
     assert.ok(m.blockMd(`<table><tr><td><code>a${spaces}b</code></td></tr></table>`).includes(`a${spaces}b`))
+  })
+
+  const md = html => m.blockMd(html).replace(/\n{3,}/g, '\n\n').trim()
+  ok('nested containers separate inner paragraphs from parent trailing text', () => {
+    assert.equal(md('<main><div>First<div>Second</div>Third<div>Fourth</div>Fifth</div></main>'), 'First\n\nSecond\n\nThird\n\nFourth\n\nFifth')
+  })
+
+  ok('mixed-case structural containers preserve every nesting boundary', () => {
+    assert.equal(md('<MAIN><section>First<ARTICLE>Second<DIV>Third</DIV>Fourth</ARTICLE>Fifth</section></MAIN>'), 'First\n\nSecond\n\nThird\n\nFourth\n\nFifth')
+  })
+
+  ok('quoted fake container tags cannot move real paragraph boundaries', () => {
+    assert.equal(md('<div title="look </div> here <div>">First<div>Second</div>Third</div>'), 'First\n\nSecond\n\nThird')
+  })
+
+  ok('nested unordered lists preserve children, parent tail and following siblings', () => {
+    assert.equal(md('<ul><li>Parent<ul><li>Child one</li><li>Child two</li></ul>Parent tail</li><li>Next parent</li></ul>'), '- Parent\n\n  - Child one\n  - Child two\n\n  Parent tail\n- Next parent')
+  })
+
+  ok('mixed nested lists keep parent numbering and child indentation', () => {
+    assert.equal(md('<ol><li>Parent<ul><li>Child one</li><li>Child two</li></ul></li><li>Next parent</li></ol>'), '1. Parent\n\n   - Child one\n   - Child two\n2. Next parent')
+    const items = '<li>First</li>'.repeat(9) + '<li>Tenth<ul><li>Child</li></ul></li>'
+    assert.ok(md(`<ol>${items}</ol>`).endsWith('10. Tenth\n\n    - Child'))
+  })
+
+  ok('list items containing only a child list retain distinct parent markers', () => {
+    assert.equal(md('<ul><li><ul><li><ul><li>Leaf</li></ul></li></ul></li></ul>'), '-\n  -\n    - Leaf')
+  })
+
+  ok('paragraphs and sublists remain inside their parent list item', () => {
+    assert.equal(md('<ul><li><p>First paragraph</p><p>Second paragraph</p><ul><li>Child</li></ul></li><li>Sibling</li></ul>'), '- First paragraph\n\n  Second paragraph\n\n  - Child\n- Sibling')
+  })
+
+  ok('nested code fences close before parent tail and following ordered items', () => {
+    const output = md('<ol><li>First<pre><code>a\n&lt;li&gt;b&lt;/li&gt;</code></pre>Tail</li><li>Next</li></ol>')
+    assert.equal(output, '1. First\n\n   ```\n   a\n   <li>b</li>\n   ```\n\n   Tail\n2. Next')
+    assert.equal(output.split('\n').filter(line => line.trim() === '```').length, 2)
+  })
+
+  ok('nested blockquotes end before parent tail and following ordered items', () => {
+    assert.equal(md('<ol><li>First<blockquote>Quote<div>More</div></blockquote>Tail</li><li>Next</li></ol>'), '1. First\n\n   > Quote\n   > \n   > More\n\n   Tail\n2. Next')
+  })
+
+  ok('nested list prose retains literal punctuation, inline code and images', () => {
+    const output = md('<ul><li>Literal *text* <span>`quoted`</span> <strong>bold</strong> <code>a  b</code><ul><li><img alt="figure" src="/f.png"> Child</li></ul>Tail</li></ul>')
+    assert.equal(output, '- Literal \\*text\\* \\`quoted\\` **bold** `a  b`\n\n  - ![figure](/f.png) Child\n\n  Tail')
+    assert.ok(!output.includes('\u0001'))
+  })
+
+  ok('code examples cannot change surrounding container pairing', () => {
+    assert.equal(md('<div>Before<pre><code>&lt;div&gt;&lt;ul&gt;sample&lt;/ul&gt;&lt;/div&gt;</code></pre><div>After</div>Tail</div>'), 'Before\n\n```\n<div><ul>sample</ul></div>\n```\n\nAfter\n\nTail')
+  })
+
+  ok('excessive list nesting degrades without duplicating or dropping the leaf', () => {
+    const output = md('<ul><li>'.repeat(150) + 'Only leaf' + '</li></ul>'.repeat(150))
+    assert.equal(output.match(/Only leaf/g)?.length, 1)
+    assert.ok(output.length < 12000)
+    assert.ok(!/<\/?(?:ul|li)>/.test(output))
+  })
+
+  ok('container pairing preserves the long-attribute boundary and unclosed text', () => {
+    const long = `<div title="${'x'.repeat(1100)}">First<div>Second</div>Third</div>`
+    const output = md(long)
+    assert.ok(output.startsWith('div title="'))
+    assert.ok(output.endsWith('First\n\nSecond\n\nThird'))
+    assert.equal(md('<div>'.repeat(1000) + 'Visible tail'), 'Visible tail')
+  })
+
+  const tools = {}
+  const html = '<main><div>First<div>Second</div>Third</div><ol><li>Parent<ul><li>Child</li></ul></li><li>Sibling</li></ol></main>'
+  m.apply({
+    tools: { register: tool => { tools[tool.name] = tool } }, effect: () => {},
+    get: () => ({ fetch: async ({ url }) => ({ url, statusCode: 200, body: { kind: 'html', content: html } }) }),
+  }, { spaRender: false, paginate: false })
+  const args = { url: `https://markdown-fixture.invalid/nested/${Date.now()}`, mode: 'markdown' }
+  const result = await tools.read_url.execute(args)
+  ok('read_url execute and desktop rendering preserve nested Markdown structure', () => {
+    const expected = 'First\n\nSecond\n\nThird\n\n1. Parent\n\n   - Child\n2. Sibling'
+    assert.equal(result.text, expected)
+    assert.ok(tools.read_url.output.render(args, result)[0].text.includes(expected))
   })
 
   return passed

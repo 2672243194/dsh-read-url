@@ -100,6 +100,10 @@ function allowedDirectUrl(url, origins) {
 const DIRECT_BOUNDARY_ERROR = 'Direct fetch stopped: target is outside directFetchOrigins or contains credentials'
 const DIRECT_SPA_HINT = '已配置直连仅支持静态读取，未启用浏览器渲染'
 
+function providerTextHint(page) {
+  return '提供方返回纯文本，未扫描 HTML 链接或跳转' + (page.sourceTruncated ? '；提供方已截断原文，当前内容不是完整页面' : '')
+}
+
 function getDecoder(enc) {
   let d = decoders.get(enc)
   if (!d) {
@@ -328,7 +332,7 @@ async function raceFetch(url, externalSignal, cfg, proxy) {
 
 async function fetchPage(url, externalSignal, cfg) {
   if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
-  const proxy = await detectProxy()
+  const proxy = await detectProxy(url)
   if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
   if (proxy) {
     const winner = await raceFetch(url, externalSignal, cfg, proxy)
@@ -336,7 +340,7 @@ async function fetchPage(url, externalSignal, cfg) {
     const dErr = winner.failures.find((f) => f.label === 'direct')
     const pErr = winner.failures.find((f) => f.label === 'proxy')
     const px = pErr ? `，代理返回 ${pErr.error}` : '，代理未连通'
-    return { error: `Fetch failed: ${dErr ? dErr.error : 'unknown error'}（直连失败；已尝试代理 ${proxy}${px}）` }
+    return { error: `Fetch failed: ${dErr ? dErr.error : 'unknown error'}（直连失败；已尝试代理${px}）` }
   }
   // No proxy configured: plain direct connect (the original behaviour).
   const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs)
@@ -955,18 +959,78 @@ export function inlineMd(html, depth = 0) {
   return img.restore(out.trim())
 }
 
-export function blockMd(html, depth = 0) {
+// Pair structural blocks in one forward pass so nested siblings keep their
+// own boundaries. Raw/code bodies and quoted attribute values are opaque.
+function markdownBlockPairs(html) {
+  const pairs = new Map()
+  const stacks = new Map()
+  const structural = new Set(['div', 'section', 'article', 'main', 'blockquote', 'ul', 'ol', 'li'])
+  const opaque = new Set(['pre', 'code', 'script', 'style', 'textarea', 'template', 'noscript'])
+  const re = /<!--|<(\/?)([a-z][a-z0-9:-]{0,63})(?=[\s/>])/gi
+  let m
+  while ((m = re.exec(html))) {
+    if (!m[2]) {
+      const end = html.indexOf('-->', re.lastIndex)
+      if (end < 0) break
+      re.lastIndex = end + 3
+      continue
+    }
+    let quote = '', end = -1
+    const limit = Math.min(html.length, m.index + 1002)
+    for (let i = re.lastIndex; i < limit; i++) {
+      const ch = html[i]
+      if (quote) {
+        if (ch === quote) quote = ''
+      } else if (ch === '"' || ch === "'") quote = ch
+      else if (ch === '<') break
+      else if (ch === '>') { end = i + 1; break }
+    }
+    if (end < 0) continue
+    const attrs = html.slice(re.lastIndex, end - 1)
+    re.lastIndex = end
+    const tag = m[2].toLowerCase()
+    if (!m[1] && opaque.has(tag)) {
+      const close = new RegExp(`</${tag}\\s{0,1000}>`, 'gi')
+      close.lastIndex = re.lastIndex
+      if (!close.exec(html)) break
+      re.lastIndex = close.lastIndex
+      continue
+    }
+    if (!structural.has(tag)) continue
+    if (!m[1]) {
+      if (!stacks.has(tag)) stacks.set(tag, [])
+      stacks.get(tag).push({ tag, attrs, index: m.index, start: re.lastIndex })
+    } else if (!attrs.trim()) {
+      const opening = stacks.get(tag)?.pop()
+      if (opening && m.index - opening.start <= 3145728) pairs.set(opening.index, { ...opening, close: m.index, end: re.lastIndex })
+    }
+  }
+  return pairs
+}
+
+export function blockMd(html, depth = 0, escapeText = false) {
   if (depth > MD_MAX_DEPTH) {
-    return decodeTextEntities(html.replace(/<[^>]{1,1000}>/g, ' ')).replace(/\s+/g, ' ').trim()
+    const text = decodeTextEntities(html.replace(/<[^>]{1,1000}>/g, ' ')).replace(/\s+/g, ' ').trim()
+    return escapeText ? escInline(text) : text
   }
   const img = imgsToMarkdown(html)
   html = stripUnmatchedOpeners(img.html)
+  const blocks = markdownBlockPairs(html)
   let out = ''
   const re = /<(?:br|hr)\b[^>]{0,1000}>|<([a-zA-Z0-9]{1,100})((?:"[^"]{0,1000}"|'[^']{0,1000}'|[^'">]){0,1000})>([\s\S]{0,3145728}?)<\/\1>|<[^>]{1,1000}>|([^<]{1,3145728})/gi
   let m
   while ((m = re.exec(html))) {
+    const block = blocks.get(m.index)
+    if (block) {
+      m[0] = html.slice(m.index, block.end)
+      m[1] = block.tag
+      m[2] = block.attrs
+      m[3] = html.slice(block.start, block.close)
+      re.lastIndex = block.end
+    }
     if (m[4] !== undefined) {
-      out += decodeTextEntities(m[4])
+      const text = decodeTextEntities(m[4])
+      out += escapeText ? escInline(text) : text
       continue
     }
     if (!m[1]) {
@@ -988,11 +1052,11 @@ export function blockMd(html, depth = 0) {
       const t = inlineMd(inner, depth + 1)
       if (t) out += `\n\n${t}`
     } else if (tag === 'div' || tag === 'section' || tag === 'article' || tag === 'main') {
-      const t = blockMd(inner, depth + 1)
-      if (t) out += `\n\n${t}`
+      const t = blockMd(inner, depth + 1, escapeText)
+      if (t) out += `\n\n${t}\n\n`
     } else if (tag === 'blockquote') {
-      const t = blockMd(inner, depth + 1).trim()
-      out += `\n\n> ${t.replace(/\n/g, '\n> ')}`
+      const t = blockMd(inner, depth + 1, escapeText).trim()
+      out += `\n\n> ${t.replace(/\n/g, '\n> ')}\n\n`
     } else if (tag === 'pre') {
       // Strip wrapper tags FIRST, then decode entities — a literal &lt;div&gt;
       // in the code must become <div> in the fenced block, but a real nested
@@ -1003,22 +1067,31 @@ export function blockMd(html, depth = 0) {
       const lang =
         /<code\b[^>]{0,1000}class=["'][^"']{0,1000}(?:language|lang)-([\w#+.-]{1,80})(?:[\s"'])/i.exec(inner)?.[1] || ''
       const fence = backtickFence(code, 3)
-      out += `\n\n${fence}${lang}\n${code}\n${fence}`
+      out += `\n\n${fence}${lang}\n${code}\n${fence}\n\n`
     } else if (tag === 'code') {
       out += img.protect(inlineCode(inner))
     } else if (tag === 'ul' || tag === 'ol') {
-      // Without a single </li> nothing can pair, so the item scan is skipped.
       const items = []
-      if (/<\/li\b/i.test(inner)) {
-        const liRe = /<li\b[^>]{0,1000}>([\s\S]{0,3145728}?)<\/li>/gi
-        let lm, idx = 1
-        while ((lm = liRe.exec(inner))) {
-          const t = inlineMd(lm[1], depth + 1)
-          items.push(tag === 'ol' ? `${idx}. ${t}` : `- ${t}`)
-          idx++
-        }
+      const itemBlocks = block ? blocks : markdownBlockPairs(inner)
+      const itemOffset = block ? block.start : 0
+      const liRe = /<li(?=[\s>])/gi
+      let lm, idx = 1
+      while ((lm = liRe.exec(inner))) {
+        const item = itemBlocks.get(itemOffset + lm.index)
+        if (!item) continue
+        liRe.lastIndex = item.end - itemOffset
+        const body = inner.slice(item.start - itemOffset, item.close - itemOffset)
+        const t = /<(?:ul|ol|div|section|article|main|p|pre|blockquote|h[1-6]|table)(?=[\s>])/i.test(body)
+          ? blockMd(body, depth + 1, true).replace(/\n{3,}/g, '\n\n').trim()
+          : inlineMd(body, depth + 1)
+        const prefix = tag === 'ol' ? `${idx++}. ` : '- '
+        const indent = ' '.repeat(prefix.length)
+        const lines = t.split('\n')
+        items.push(/^<(?:ul|ol)(?=[\s>])/i.test(body.trimStart())
+          ? prefix.trimEnd() + '\n' + lines.map(line => line ? indent + line : line).join('\n')
+          : prefix + lines.map((line, i) => i && line ? indent + line : line).join('\n'))
       }
-      if (items.length) out += `\n\n${items.join('\n')}`
+      if (items.length) out += `\n\n${items.join('\n')}\n\n`
     } else if (tag === 'li') {
       out += `\n- ${inlineMd(inner, depth + 1)}`
     } else if (tag === 'br') {
@@ -1061,7 +1134,7 @@ export function blockMd(html, depth = 0) {
       const t = inlineMd(m[0], depth + 1)
       if (t) out += t
     } else {
-      const t = blockMd(inner, depth + 1)
+      const t = blockMd(inner, depth + 1, escapeText)
       if (t) out += t
     }
   }
@@ -2197,6 +2270,7 @@ function readLinksTool(ctx, cfg) {
       const page = await fetchResource(ctx, url, signal, cfg, route)
       if (signal && signal.aborted) return { error: 'cancelled' }
       if (page.error) return { error: page.error }
+      if (page.kind === 'text') return { url: page.finalUrl || url, count: 0, links: [], spaHint: providerTextHint(page) }
       let html = typeof page.html === 'string' ? page.html : decodeBuffer(page.buffer, page.contentType).text
       let finalUrl = page.finalUrl || url
       // Same meta-refresh shell following as read_url: a link hop serves a
@@ -2422,6 +2496,14 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal, ctx) {
         if (depth > 0 && !sameHost(pageUrl, host)) {
           return { url, depth, error: `Redirected outside the site: ${pageUrl}` }
         }
+        if (page.kind === 'text') {
+          if (depth === 0) host = hostOf(pageUrl)
+          return {
+            url: pageUrl, depth, title: '', chars: html.length,
+            text: includeContent ? smartTruncate(html, perMax).text : undefined,
+            links: [], route, spaHint: providerTextHint(page),
+          }
+        }
         // Same shell-following as read_url: a meta-refresh stub would otherwise
         // be crawled AS the page (title-less hop text pollutes results and the
         // real content is never reached). Fails open — fetch problems keep the
@@ -2574,7 +2656,7 @@ export function apply(ctx, config) {
   const cfg = { ...DEFAULTS, ...(config || {}) }
   const clamp = (v, d, min, max) => {
     const n = Number(v)
-    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : d
+    return Number.isFinite(n) ? Math.floor(Math.min(max, Math.max(min, n))) : d
   }
   cfg.timeoutMs = clamp(cfg.timeoutMs, DEFAULTS.timeoutMs, 500, 120000)
   cfg.maxBytes = clamp(cfg.maxBytes, DEFAULTS.maxBytes, 65536, 16 * 1024 * 1024)

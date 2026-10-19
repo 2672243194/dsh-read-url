@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { win32 } from 'node:path'
+import { BlockList, isIP } from 'node:net'
 import { runInNewContext } from 'node:vm'
 
 export async function runProxyDesktopTests(sourceUrl = new URL('./proxy-fallback.js', import.meta.url)) {
@@ -17,12 +18,12 @@ export async function runProxyDesktopTests(sourceUrl = new URL('./proxy-fallback
     passed++
     console.log(`  ok - ${label}`)
   }
-  const fixture = ({ platform = 'win32', env = { SystemRoot: 'C:\\Windows', PATH: '' }, present = [powershell, curl], fail = false } = {}) => {
+  const fixture = ({ platform = 'win32', env = { SystemRoot: 'C:\\Windows', PATH: '' }, present = [powershell, curl], fail = false, body = 'Desktop proxy body', processError } = {}) => {
     const calls = []
     const available = name => present.includes(name)
     const missing = () => Object.assign(new Error('tool unavailable'), { code: 'ENOENT' })
     const subject = runInNewContext(`${source}\n;({ detectProxy, fetchViaCurlProxy })`, {
-      Buffer, Date, win32, process: { platform, env }, existsSync: available,
+      Buffer, Date, URL, win32, BlockList, isIP, process: { platform, env }, existsSync: available,
       execFileSync(name, args, options) {
         calls.push({ name, args, options })
         if (fail || !available(name)) throw missing()
@@ -31,7 +32,8 @@ export async function runProxyDesktopTests(sourceUrl = new URL('./proxy-fallback
       execFile(name, args, options, callback) {
         calls.push({ name, args, options })
         if (fail || !available(name)) return callback(missing())
-        callback(null, Buffer.from(`Desktop proxy body\n200 text/plain ${target}`))
+        if (processError) return callback(processError)
+        callback(null, Buffer.concat([Buffer.from(body), Buffer.from(`\n200 text/plain ${target}`)]))
       },
     }, { filename: 'proxy-desktop-fixture.js' })
     return { subject, calls }
@@ -90,6 +92,94 @@ export async function runProxyDesktopTests(sourceUrl = new URL('./proxy-fallback
       assert.equal((await subject.fetchViaCurlProxy(target, cfg, undefined, proxy))?.buffer.toString(), 'Desktop proxy body')
       assert.equal(calls[0].name, 'curl')
     }
+  })
+  await check('NO_PROXY skips exact domains and subdomains without matching lookalikes', async () => {
+    const { subject } = fixture({ env: { HTTPS_PROXY: proxy, NO_PROXY: 'example.com,.internal.test,*.suffix.test' } })
+    for (const url of ['https://example.com', 'https://www.example.com', 'https://EXAMPLE.com./', 'http://internal.test', 'http://sub.internal.test', 'http://sub.suffix.test']) {
+      assert.equal(await subject.detectProxy(url), '', url)
+    }
+    for (const url of ['https://notexample.com', 'https://example.com.evil.test', 'http://internal.test.evil', 'http://notsuffix.test', 'http://suffix.test']) {
+      assert.equal(await subject.detectProxy(url), proxy, url)
+    }
+    assert.equal(await subject.detectProxy(), proxy)
+  })
+  await check('NO_PROXY honors explicit and default ports', async () => {
+    const { subject } = fixture({ env: { HTTPS_PROXY: proxy, NO_PROXY: 'example.com:8080,secure.test:443,plain.test:80' } })
+    for (const url of ['http://example.com:8080', 'https://example.com:8080', 'https://secure.test', 'http://plain.test']) {
+      assert.equal(await subject.detectProxy(url), '', url)
+    }
+    for (const url of ['http://example.com', 'https://example.com', 'http://secure.test', 'https://plain.test']) {
+      assert.equal(await subject.detectProxy(url), proxy, url)
+    }
+  })
+  await check('NO_PROXY matches IPv4 and canonical IPv6 addresses without widening exclusions', async () => {
+    const { subject } = fixture({ env: { HTTPS_PROXY: proxy, NO_PROXY: '127.0.0.1,0:0:0:0:0:0:0:1,[2001:db8::1]:8080' } })
+    for (const url of ['http://127.0.0.1:9090', 'http://[::1]', 'http://[2001:db8::1]:8080']) {
+      assert.equal(await subject.detectProxy(url), '', url)
+    }
+    for (const url of ['http://127.0.0.2', 'http://127.0.0.1.example.com', 'http://[::2]', 'http://[2001:db8::1]:8081']) {
+      assert.equal(await subject.detectProxy(url), proxy, url)
+    }
+  })
+  await check('NO_PROXY supports curl CIDR address exclusions without DNS lookup', async () => {
+    const { subject } = fixture({ env: { HTTPS_PROXY: proxy, NO_PROXY: '192.168.0.0/16,2001:db8::/32,10.0.0.0/999,invalid/24' } })
+    for (const url of ['http://192.168.1.2', 'http://[2001:db8:1234::1]']) assert.equal(await subject.detectProxy(url), '', url)
+    for (const url of ['http://192.169.1.2', 'http://[2001:db9::1]', 'http://10.0.0.1', 'http://example.com']) {
+      assert.equal(await subject.detectProxy(url), proxy, url)
+    }
+  })
+  await check('Lowercase no_proxy takes precedence and wildcard skips registry discovery', async () => {
+    const { subject } = fixture({ env: { HTTPS_PROXY: proxy, no_proxy: 'lower.test', NO_PROXY: 'upper.test' } })
+    assert.equal(await subject.detectProxy('http://lower.test'), '')
+    assert.equal(await subject.detectProxy('http://upper.test'), proxy)
+    const wildcard = fixture({ env: { SystemRoot: 'C:\\Windows', NO_PROXY: ' * ' } })
+    assert.equal(await wildcard.subject.detectProxy(target), '')
+    assert.equal(wildcard.calls.length, 0)
+  })
+  await check('Excluded URLs never spawn curl even with an explicit proxy override', async () => {
+    const { subject, calls } = fixture({ env: { SystemRoot: 'C:\\Windows', NO_PROXY: 'desktop-proxy.invalid' } })
+    assert.equal(await subject.fetchViaCurlProxy(target, cfg, undefined, proxy), null)
+    assert.equal(calls.length, 0)
+  })
+  await check('Proxy URLs with brackets and braces are passed to curl without expansion', async () => {
+    const { subject, calls } = fixture()
+    for (const url of ['http://fixture.invalid/filter?fields[year]=2026', 'http://fixture.invalid/{first,second}']) {
+      assert.ok((await subject.fetchViaCurlProxy(url, cfg, undefined, proxy))?.buffer)
+      assert.equal(calls.at(-1).args.at(-1), url)
+      assert.ok(calls.at(-1).args.includes('--globoff'))
+    }
+    assert.equal(calls.length, 2)
+  })
+  await check('Proxy retrieval enables HTTP decompression and preserves returned text', async () => {
+    const { subject, calls } = fixture({ body: '压缩响应正文\nNext paragraph.' })
+    const result = await subject.fetchViaCurlProxy(target, cfg, undefined, proxy)
+    assert.equal(result.buffer.toString(), '压缩响应正文\nNext paragraph.')
+    assert.ok(calls[0].args.includes('--compressed'))
+    assert.equal(result.finalUrl, target)
+  })
+  await check('Decoded proxy body enforces its byte budget independently of metadata overhead', async () => {
+    for (const size of [cfg.maxBytes, cfg.maxBytes + 1]) {
+      const { subject } = fixture({ body: Buffer.alloc(size, 65) })
+      const result = await subject.fetchViaCurlProxy(target, cfg, undefined, proxy)
+      if (size === cfg.maxBytes) assert.equal(result.buffer.length, size)
+      else assert.equal(result.error, `Page exceeds ${cfg.maxBytes} bytes (via proxy)`)
+    }
+    const { subject } = fixture({ body: '一'.repeat(Math.floor(cfg.maxBytes / 3) + 1) })
+    assert.match((await subject.fetchViaCurlProxy(target, cfg, undefined, proxy)).error, /Page exceeds/)
+  })
+  await check('Curl and decoded stdout limits report size errors instead of proxy failure', async () => {
+    for (const processError of [
+      Object.assign(new Error('curl transfer exceeds limit'), { code: 63 }),
+      Object.assign(new Error('stdout maxBuffer length exceeded'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }),
+    ]) {
+      const { subject } = fixture({ processError })
+      const result = await subject.fetchViaCurlProxy(target, cfg, undefined, proxy)
+      assert.equal(result.error, `Page exceeds ${cfg.maxBytes} bytes (via proxy)`)
+    }
+  })
+  await check('Oversized curl diagnostics are not misreported as oversized page content', async () => {
+    const { subject } = fixture({ processError: Object.assign(new Error('stderr maxBuffer length exceeded'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }) })
+    assert.equal(await subject.fetchViaCurlProxy(target, cfg, undefined, proxy), null)
   })
   return passed
 }

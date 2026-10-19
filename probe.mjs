@@ -6,6 +6,7 @@ import {
 } from './index.js'
 const textOnly = (html) => extract(`<body>${html}</body>`, 'text').text
 import { looksBinary } from './proxy-fallback.js'
+import { looksLikeChallenge } from './spa.js'
 
 const pending = []
 let failures = 0
@@ -28,6 +29,12 @@ const t = (name, fn) => {
 }
 
 console.log('=== A. regex-backtracking candidates (each should finish < 300ms) ===')
+for (const n of [32000, 64000, 128000]) {
+  t(`challenge marker ${n} spaces without suffix`, () => {
+    if (looksLikeChallenge('Attention Required!' + ' '.repeat(n) + 'not a challenge')) throw new Error('Oversized gap must not match')
+    return 'not a challenge'
+  })
+}
 // quote-alternation inside the md walker's attribute group
 const QUOTE_ALT = `<a ${`'"`.repeat(20000)}>x</a>`
 t('blockMd 40k quote-alternation attrs', () => blockMd(QUOTE_ALT).length)
@@ -62,6 +69,18 @@ for (const n of [80000, 160000, 320000]) {
 // nested lists
 const LISTS = `<ul>${'<li><ul><li>'.repeat(2000)}x${'</li></ul></li>'.repeat(2000)}</ul>`
 t('blockMd 2000-deep nested lists', () => blockMd(LISTS).length)
+for (const n of [500, 2000]) {
+  t(`blockMd ${n}-deep valid nested lists`, () => {
+    const result = blockMd('<ul><li>'.repeat(n) + 'uniqueLeaf' + '</li></ul>'.repeat(n))
+    if (result.split('uniqueLeaf').length !== 2) throw new Error('Deep list body must appear exactly once')
+    return result.length
+  })
+}
+t('blockMd 4000 wide nested list items', () => {
+  const result = blockMd('<ul>' + '<li>Parent<ul><li>Child</li></ul></li>'.repeat(4000) + '</ul>')
+  if (result.split('Parent').length !== 4001 || result.split('Child').length !== 4001) throw new Error('List items must not be lost or duplicated')
+  return result.length
+})
 
 console.log('\n=== B. smartTruncate boundaries ===')
 t('giant single paragraph, no punctuation', () => smartTruncate('一'.repeat(500000), 6000).text.length)

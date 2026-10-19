@@ -28,7 +28,7 @@ export function looksLikeSpa(html) {
 // stabilizes while the challenge sits in "Verification successful. Waiting
 // for ... to respond" — the poll loop returned that transitional page and
 // the caller mistook it for an improvement over static extraction.
-const CHALLENGE_RE = /just a moment|performing security verification|verifying (you are|your) human|cf-chl|cf_chl|cdn-cgi\/challenge-platform|attention required!\s*[|·]?\s*cloudflare|enable javascript and cookies to continue/i
+const CHALLENGE_RE = /just a moment|performing security verification|verifying (you are|your) human|cf-chl|cf_chl|cdn-cgi\/challenge-platform|attention required!\s{0,1000}(?:[|·]\s{0,1000})?cloudflare|enable javascript and cookies to continue/i
 
 export function looksLikeChallenge(html) {
   return typeof html === 'string' && CHALLENGE_RE.test(html)

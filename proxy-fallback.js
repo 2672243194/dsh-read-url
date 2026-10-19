@@ -1,21 +1,17 @@
-// proxy-fallback.js — retry a failed direct fetch through the user's proxy
+// proxy-fallback.js — optional proxy channel for direct webpage retrieval
 //
-// Design: direct connect first, proxy only as fallback. When the direct
-// fetch fails with a CONNECTION-class error (blocked network, refused,
-// DNS miss, connect timeout), we look up the user's own proxy — first the
-// standard HTTP_PROXY/HTTPS_PROXY env vars, then the Windows system proxy
-// (registry) where proxy apps like Clash actually persist it — and retry
-// once through it via the system `curl` (ships with Windows 10+/macOS/Linux;
-// zero npm deps). The proxy URL is passed explicitly with `-x`, so we don't
-// depend on curl's env-var reading.
+// When the host web provider is absent, configured proxy retrieval races
+// native fetch and the first success wins. Proxy discovery uses standard
+// HTTP_PROXY/HTTPS_PROXY env vars, then the Windows system proxy registry.
+// NO_PROXY exclusions retain only the native fetch. Proxy requests use system
+// curl (Windows 10+/macOS/Linux; zero npm deps) with an explicit `-x` URL.
 //
-// Transparency: a successful proxied read returns exactly like a direct one
-// (the caller never knows); a failed proxied attempt returns null and the
-// caller reports the ORIGINAL direct-connect error with a clear note, so the
-// model/user can act (turn the proxy on, or accept the network boundary).
+// Successful proxy responses use the direct channel's body shape. HTTP and
+// content errors remain diagnostic; unavailable curl or proxies return null.
 import { execFile, execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { win32 } from 'node:path'
+import { BlockList, isIP } from 'node:net'
 
 // Desktop launches can inherit a reduced PATH. Prefer the Windows-shipped
 // utilities when present; other platforms and custom installations use PATH.
@@ -76,8 +72,7 @@ const SYS_PROXY_RETRY_MS = 60 * 1000
 
 // Windows system proxy from the registry (HKCU Internet Settings). PowerShell
 // is used because `reg.exe` is frequently blocked by security policy; the
-// read is synchronous and cached after the first call (it only runs after a
-// direct-connect failure, so the ~1s cost is invisible on the happy path).
+// read is synchronous and cached to avoid repeated discovery during reads.
 // A FAILED read is cached as '' but re-tried after 60s — an environment that
 // transiently blocks the PowerShell child (EDR, policy) should not starve
 // the whole session of the proxy.
@@ -107,8 +102,72 @@ function readWindowsSystemProxy() {
   }
 }
 
+// Match curl's domain/IP exclusions before starting a redundant direct curl
+// request. Port-qualified hosts and wildcard suffixes are also accepted.
+function bypassesProxy(url) {
+  const exclusions = process.env.no_proxy || process.env.NO_PROXY
+  if (!url || !exclusions) return false
+  let target
+  try { target = new URL(url) } catch { return false }
+  const hostname = target.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '')
+  const ipVersion = isIP(hostname)
+  const port = target.port || (target.protocol === 'https:' ? '443' : '80')
+  for (let entry of exclusions.split(',')) {
+    entry = entry.trim().toLowerCase()
+    if (!entry) continue
+    if (entry === '*') return true
+    const slash = entry.indexOf('/')
+    if (slash >= 0) {
+      const address = entry.slice(0, slash)
+      const prefix = entry.slice(slash + 1)
+      if (!ipVersion || isIP(address) !== ipVersion || !/^\d{1,3}$/.test(prefix)) continue
+      try {
+        const block = new BlockList()
+        const family = ipVersion === 6 ? 'ipv6' : 'ipv4'
+        block.addSubnet(address, Number(prefix), family)
+        if (block.check(hostname, family)) return true
+      } catch {}
+      continue
+    }
+    let entryPort = ''
+    if (entry.startsWith('[')) {
+      const end = entry.indexOf(']')
+      if (end < 0) continue
+      const tail = entry.slice(end + 1)
+      if (tail && !/^:\d{1,5}$/.test(tail)) continue
+      entryPort = tail.slice(1)
+      entry = entry.slice(1, end)
+    } else if (!isIP(entry) && entry.indexOf(':') >= 0) {
+      const colon = entry.lastIndexOf(':')
+      entryPort = entry.slice(colon + 1)
+      entry = entry.slice(0, colon)
+      if (entry.includes(':') || !/^\d{1,5}$/.test(entryPort)) continue
+    }
+    if (entryPort && Number(entryPort) !== Number(port)) continue
+    if (isIP(entry)) {
+      if (!ipVersion) continue
+      try {
+        const canonical = new URL(isIP(entry) === 6 ? `http://[${entry}]` : `http://${entry}`).hostname
+          .replace(/^\[|\]$/g, '')
+        if (canonical === hostname) return true
+      } catch {}
+      continue
+    }
+    if (ipVersion) continue
+    if (entry.startsWith('*.')) {
+      if (hostname.endsWith(entry.slice(1).replace(/\.$/, ''))) return true
+      continue
+    }
+    else if (entry.startsWith('.')) entry = entry.slice(1)
+    entry = entry.replace(/\.$/, '')
+    if (entry && (hostname === entry || hostname.endsWith(`.${entry}`))) return true
+  }
+  return false
+}
+
 // The user's proxy, in priority order: env vars, then Windows system proxy.
-export async function detectProxy() {
+export async function detectProxy(url) {
+  if (bypassesProxy(url)) return ''
   const env =
     process.env.HTTPS_PROXY ||
     process.env.https_proxy ||
@@ -125,11 +184,14 @@ export async function detectProxy() {
 // `proxyOverride` lets the caller pass an already-detected proxy (the race
 // path probes once up front) instead of re-detecting here.
 export async function fetchViaCurlProxy(url, cfg, externalSignal, proxyOverride) {
-  const proxy = proxyOverride || (await detectProxy())
+  if (bypassesProxy(url)) return null
+  const proxy = proxyOverride || (await detectProxy(url))
   if (!proxy) return null
   const maxSec = Math.max(10, Math.ceil(cfg.timeoutMs / 1000) + 5)
   const args = [
     '-sS',
+    '--globoff',
+    '--compressed', // request and decode supported HTTP content encodings
     '-L', // follow redirects, like the direct fetch path
     '--max-time', String(maxSec),
     '--max-filesize', String(cfg.maxBytes), // unit is BYTES, not KB
@@ -154,6 +216,9 @@ export async function fetchViaCurlProxy(url, cfg, externalSignal, proxyOverride)
     if (nl < 0) return null // no trailing metadata — abnormal response, treat as failure
     const meta = buf.subarray(nl + 1).toString('latin1').trim()
     const body = buf.subarray(0, nl)
+    // Older curl versions bound the compressed transfer, not the decoded
+    // body. Do not let the metadata allowance enlarge the content budget.
+    if (body.length > cfg.maxBytes) return { error: `Page exceeds ${cfg.maxBytes} bytes (via proxy)` }
     const parts = meta.split(' ')
     const codeStr = parts.shift()
     const finalUrlEff = parts.length > 1 ? parts.pop() : url
@@ -174,7 +239,9 @@ export async function fetchViaCurlProxy(url, cfg, externalSignal, proxyOverride)
   } catch (err) {
     // curl error 63 = exceeded --max-filesize (page too large, not a proxy
     // problem — report it as such instead of "proxy unreachable")
-    if (err && err.code === 63) return { error: `Page exceeds ${cfg.maxBytes} bytes (via proxy)` }
+    if (err && (err.code === 63 || (err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' && err.message.startsWith('stdout')))) {
+      return { error: `Page exceeds ${cfg.maxBytes} bytes (via proxy)` }
+    }
     // curl missing, proxy down, or cancelled — let the caller report the
     // original direct-connect error (the proxy attempt is best-effort)
     return null
