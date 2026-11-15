@@ -99,6 +99,7 @@ function allowedDirectUrl(url, origins) {
 
 const DIRECT_BOUNDARY_ERROR = 'Direct fetch stopped: target is outside directFetchOrigins or contains credentials'
 const DIRECT_SPA_HINT = '已配置直连仅支持静态读取，未启用浏览器渲染'
+const SOURCE_TRUNCATED_HINT = '提供方已截断原文，当前内容不是完整页面'
 
 function providerTextHint(page) {
   return '提供方返回纯文本，未扫描 HTML 链接或跳转' + (page.sourceTruncated ? '；提供方已截断原文，当前内容不是完整页面' : '')
@@ -1495,15 +1496,21 @@ export function smartTruncate(text, maxChars, offset = 0) {
   }
   let end = Math.min(total, start + maxChars)
   if (end < total && maxChars > 0) {
+    // Prefer useful prose boundaries; raw HTML permits earlier boundaries
+    // to avoid returning unparsed attributes.
+    const rawTag = /<\/?[a-z][a-z0-9:-]{0,63}(?=[\s/>])/i.test(text.slice(start, end))
+    const minEnd = start + (rawTag ? 1 : Math.ceil(maxChars / 2))
     const window = text.slice(start, end + 2)
     let boundary = window.lastIndexOf('\n\n', end - start)
     if (boundary >= 0) boundary += start
     while (boundary > start && text[boundary - 1] === '\n') boundary--
-    if (boundary > start) end = boundary
+    if (boundary >= minEnd) end = boundary
     else {
       // Prefer the last complete sentence inside the current window.
-      for (let i = end - 1; i >= start; i--) {
-        if ('.!?\n。！？'.includes(text[i])) {
+      for (let i = end - 1; i >= minEnd - 1; i--) {
+        const ch = text[i]
+        // Rejected paragraph separators are not sentence boundaries either.
+        if ('.!?。！？'.includes(ch) || (ch === '\n' && text[i - 1] !== '\n' && text[i + 1] !== '\n')) {
           end = i + 1
           break
         }
@@ -1974,7 +1981,7 @@ export async function readUrl(args, ctx, externalSignal, cfg = DEFAULTS) {
   if (externalSignal && externalSignal.aborted) return { error: 'cancelled' }
   if (payload.error) return failWith(payload.error)
   const resultUrl = payload.finalUrl || url
-  const truncatedHint = '提供方已截断原文，当前内容不是完整页面'
+  const truncatedHint = SOURCE_TRUNCATED_HINT
   let sourceHint = payload.sourceTruncated ? truncatedHint : ''
 
   if (payload.kind === 'text') {
@@ -2279,6 +2286,7 @@ function readLinksTool(ctx, cfg) {
       if (signal && signal.aborted) return { error: 'cancelled' }
       html = followed.html
       finalUrl = followed.finalUrl
+      let sourceTruncated = followed.sourceTruncated ?? page.sourceTruncated
       let links = extractLinks(html, limit, finalUrl)
       // SPA fallback: a JS-only page yields no links from its static HTML;
       // render it and re-extract when the static result looks empty. Any
@@ -2295,10 +2303,11 @@ function readLinksTool(ctx, cfg) {
           if (rl.length > links.length) {
             links = rl
             finalUrl = rr.finalUrl || finalUrl
+            sourceTruncated = false
           }
         }
       }
-      const spaHint = [route.hint, route.restricted && needsRender ? DIRECT_SPA_HINT : ''].filter(Boolean).join('；')
+      const spaHint = [sourceTruncated ? SOURCE_TRUNCATED_HINT : '', route.hint, route.restricted && needsRender ? DIRECT_SPA_HINT : ''].filter(Boolean).join('；')
       return { url: finalUrl, count: links.length, links, ...(spaHint ? { spaHint } : {}) }
     },
   }
@@ -2512,12 +2521,14 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal, ctx) {
         if (externalSignal && externalSignal.aborted) return null
         html = followed.html
         pageUrl = followed.finalUrl
+        const sourceTruncated = followed.sourceTruncated ?? page.sourceTruncated
         if (depth === 0) host = hostOf(pageUrl)
         else if (!sameHost(pageUrl, host)) {
           return { url, depth, error: `Redirected outside the site: ${pageUrl}` }
         }
         const ex = extract(html, 'text')
         const links = extractLinks(html, 100, pageUrl)
+        const spaHint = [sourceTruncated ? SOURCE_TRUNCATED_HINT : '', route.hint].filter(Boolean).join('；')
         return {
           url: pageUrl,
           depth,
@@ -2526,7 +2537,7 @@ async function crawlSite(entryUrl, cfg, opts, externalSignal, ctx) {
           text: includeContent ? smartTruncate(ex.text, perMax).text : undefined,
           links,
           route,
-          ...(route.hint ? { spaHint: route.hint } : {}),
+          ...(spaHint ? { spaHint } : {}),
         }
       }),
     )

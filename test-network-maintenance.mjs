@@ -76,6 +76,26 @@ export async function runNetworkMaintenanceTests(m) {
     })
     globalThis.fetch = async () => { throw new Error('Unexpected direct fetch') }
     for (const name of ['read_url_links', 'read_url_site']) {
+      for (const scenario of ['initial', 'refresh-truncated', 'refresh-complete', 'refresh-failed']) {
+        await check(`${name} preserves truncation metadata for the retained HTML in ${scenario}`, async () => {
+          const content = '<main><p>Visible partial provider body.</p><a href="/login">Visible link</a></main>'
+          const tools = registeredTools(async ({ url }) => {
+            if (url === requested) return { ...htmlResult(url, scenario === 'initial' ? content : shell), truncated: scenario !== 'refresh-truncated' }
+            if (scenario === 'refresh-failed') throw new Error('Controlled refresh failure')
+            return { ...htmlResult(url, content), truncated: scenario === 'refresh-truncated' }
+          })
+          const result = await tools[name].execute({ url: requested, maxPages: 2, maxDepth: 1 })
+          const hint = name === 'read_url_links' ? result.spaHint : result.pages[0].spaHint
+          const rendered = tools[name].output.render({}, result)[0].text
+          if (scenario === 'refresh-complete') {
+            assert.doesNotMatch(hint || '', /提供方已截断原文/)
+            assert.doesNotMatch(rendered, /提供方已截断原文/)
+          } else {
+            assert.match(hint, /提供方已截断原文/)
+            assert.match(rendered, /提供方已截断原文/)
+          }
+        })
+      }
       await check(`${name} rejects pre-cancelled calls without fetching`, async () => {
         const ctrl = new AbortController()
         ctrl.abort()

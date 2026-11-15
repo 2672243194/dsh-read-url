@@ -11,7 +11,7 @@ export async function runMarkdownTests(m) {
   ok('offset inside a short paragraph preserves the requested source position', () => {
     const text = 'abcdef\n\nghijkl\n\nmnopqr'
     const result = m.smartTruncate(text, 10, 3)
-    assert.equal(result.text, 'def')
+    assert.equal(result.text, 'def\n\nghijk')
     assert.equal(result.charsStart, 3)
     assert.equal(result.text, text.slice(result.charsStart, result.charsStart + result.charsReturned))
   })

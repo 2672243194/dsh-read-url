@@ -13,6 +13,7 @@ import { runNavigationTests } from './test-navigation.mjs'
 import { runProxyDesktopTests } from './test-proxy-desktop.mjs'
 import { runConfigBoundaryTests } from './test-config-boundaries.mjs'
 import { runProviderTextTests } from './test-provider-text.mjs'
+import { runTruncationMaintenanceTests } from './test-truncation-maintenance.mjs'
 const { decodeBuffer, extract, smartTruncate, blockMd, inlineMd, decodeTextEntities, raceFirstSuccess, metaRefreshTarget, findNextLink } = m
 
 let passed = 0
@@ -1887,6 +1888,7 @@ passed += await runNavigationTests(m)
 passed += await runProxyDesktopTests()
 passed += await runConfigBoundaryTests(m)
 passed += await runProviderTextTests(m)
+passed += await runTruncationMaintenanceTests(m)
 console.log(`\n${passed} assertions passed`)
 // All assertions are synchronous or top-level awaited; reaching here means every
 // one passed, so force a clean exit (avoids environment-specific exit-code noise).

@@ -92,9 +92,8 @@ function readWindowsSystemProxy() {
     )
     const [enable, server] = out.trim().split(/\r?\n/).map((s) => s.trim())
     if (enable !== '1' || !server) return sysProxyCache
-    // ProxyServer may be "host:port" or "http=...;https=host:port"
-    const httpsPart = server.split(';').map((s) => s.trim()).find((s) => /^https=/i.test(s))
-    sysProxyCache = (httpsPart ? httpsPart.replace(/^https=/i, '') : server) || ''
+    // Cache the complete map so HTTP and HTTPS share discovery, not selection.
+    sysProxyCache = server
     return sysProxyCache
   } catch {
     sysProxyCache = ''
@@ -168,13 +167,24 @@ function bypassesProxy(url) {
 // The user's proxy, in priority order: env vars, then Windows system proxy.
 export async function detectProxy(url) {
   if (bypassesProxy(url)) return ''
-  const env =
-    process.env.HTTPS_PROXY ||
-    process.env.https_proxy ||
-    process.env.HTTP_PROXY ||
-    process.env.http_proxy
+  let protocol = ''
+  try { protocol = new URL(url).protocol.slice(0, -1) } catch {}
+  const httpProxy = process.env.HTTP_PROXY || process.env.http_proxy
+  const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy
+  // Prefer the requested protocol; retain a sole configured proxy as fallback.
+  const env = protocol === 'http' ? httpProxy || httpsProxy : httpsProxy || httpProxy
   if (env) return env
-  if (process.platform === 'win32') return readWindowsSystemProxy()
+  if (process.platform === 'win32') {
+    const server = readWindowsSystemProxy()
+    const entries = server.split(';').map(entry => entry.trim())
+    if (!entries.some(entry => /^[a-z]{1,16}\s{0,16}=/i.test(entry))) return server
+    const proxies = new Map()
+    for (const entry of entries) {
+      const equal = entry.indexOf('=')
+      if (equal > 0) proxies.set(entry.slice(0, equal).trim().toLowerCase(), entry.slice(equal + 1).trim())
+    }
+    return protocol ? proxies.get(protocol) || '' : proxies.get('https') || proxies.get('http') || ''
+  }
   return ''
 }
 

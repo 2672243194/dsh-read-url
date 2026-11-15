@@ -18,7 +18,7 @@ export async function runProxyDesktopTests(sourceUrl = new URL('./proxy-fallback
     passed++
     console.log(`  ok - ${label}`)
   }
-  const fixture = ({ platform = 'win32', env = { SystemRoot: 'C:\\Windows', PATH: '' }, present = [powershell, curl], fail = false, body = 'Desktop proxy body', processError } = {}) => {
+  const fixture = ({ platform = 'win32', env = { SystemRoot: 'C:\\Windows', PATH: '' }, present = [powershell, curl], fail = false, body = 'Desktop proxy body', processError, registry = '127.0.0.1:12345' } = {}) => {
     const calls = []
     const available = name => present.includes(name)
     const missing = () => Object.assign(new Error('tool unavailable'), { code: 'ENOENT' })
@@ -27,7 +27,7 @@ export async function runProxyDesktopTests(sourceUrl = new URL('./proxy-fallback
       execFileSync(name, args, options) {
         calls.push({ name, args, options })
         if (fail || !available(name)) throw missing()
-        return '1\r\n127.0.0.1:12345\r\n'
+        return `1\r\n${registry}\r\n`
       },
       execFile(name, args, options, callback) {
         calls.push({ name, args, options })
@@ -84,6 +84,43 @@ export async function runProxyDesktopTests(sourceUrl = new URL('./proxy-fallback
     const { subject, calls } = fixture({ env: { HTTPS_PROXY: proxy, SystemRoot: 'C:\\Windows' } })
     assert.equal(await subject.detectProxy(), proxy)
     assert.equal(calls.length, 0)
+  })
+  await check('Protocol-specific environment proxies choose the matching request scheme', async () => {
+    for (const env of [
+      { HTTP_PROXY: 'http://plain.invalid:80', HTTPS_PROXY: 'http://secure.invalid:81' },
+      { http_proxy: 'http://plain.invalid:80', https_proxy: 'http://secure.invalid:81' },
+    ]) {
+      const { subject, calls } = fixture({ env })
+      assert.equal(await subject.detectProxy('http://example.test'), 'http://plain.invalid:80')
+      assert.equal(await subject.detectProxy('https://example.test'), 'http://secure.invalid:81')
+      assert.equal(await subject.detectProxy(), 'http://secure.invalid:81')
+      assert.equal(calls.length, 0)
+    }
+  })
+  await check('A sole environment proxy remains available across request schemes', async () => {
+    for (const env of [{ HTTP_PROXY: proxy }, { HTTPS_PROXY: proxy }]) {
+      const { subject } = fixture({ env })
+      assert.equal(await subject.detectProxy('http://example.test'), proxy)
+      assert.equal(await subject.detectProxy('https://example.test'), proxy)
+    }
+  })
+  await check('Windows proxy mappings select per request while sharing the registry cache', async () => {
+    const { subject, calls } = fixture({ registry: ' HTTP = plain.invalid:80 ; HTTPS = secure.invalid:81 ' })
+    assert.equal(await subject.detectProxy('http://example.test'), 'plain.invalid:80')
+    assert.equal(await subject.detectProxy('https://example.test'), 'secure.invalid:81')
+    assert.equal(await subject.detectProxy('http://example.test'), 'plain.invalid:80')
+    assert.equal(await subject.detectProxy(), 'secure.invalid:81')
+    assert.equal(calls.length, 1)
+  })
+  await check('Windows maps do not send an absent protocol to a different proxy', async () => {
+    for (const [registry, protocol] of [['http=plain.invalid:80', 'http'], ['https=secure.invalid:81', 'https']]) {
+      const { subject } = fixture({ registry })
+      assert.equal(await subject.detectProxy(`${protocol}://example.test`), registry.split('=')[1])
+      assert.equal(await subject.detectProxy(`${protocol === 'http' ? 'https' : 'http'}://example.test`), '')
+    }
+    const { subject } = fixture({ registry: proxy })
+    assert.equal(await subject.detectProxy('http://example.test'), proxy)
+    assert.equal(await subject.detectProxy('https://example.test'), proxy)
   })
   await check('Linux and macOS continue to resolve curl through PATH', async () => {
     for (const platform of ['linux', 'darwin']) {
